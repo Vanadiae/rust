@@ -6,7 +6,7 @@ pub mod memchr {
 
 // SAFETY: must be called only once during runtime initialization.
 // NOTE: this is not guaranteed to run, for example when Rust code is called externally.
-pub unsafe fn init(_argc: isize, _argv: *const *const u8) {}
+pub unsafe fn init(_argc: isize, _argv: *const *const u8, _sigpipe: u8) {}
 
 // SAFETY: must be called only once during runtime cleanup.
 // NOTE: this is not guaranteed to run, for example when the program aborts.
@@ -21,6 +21,10 @@ pub fn unsupported_err() -> std_io::Error {
         std_io::ErrorKind::Unsupported,
         "operation not supported on this platform",
     )
+}
+
+pub fn is_interrupted(_code: i32) -> bool {
+    false
 }
 
 pub fn decode_error_kind(_code: i32) -> crate::io::ErrorKind {

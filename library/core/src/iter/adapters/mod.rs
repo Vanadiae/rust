@@ -1,6 +1,7 @@
 use crate::iter::{InPlaceIterable, Iterator};
-use crate::ops::{ChangeOutputType, ControlFlow, FromResidual, NeverShortCircuit, Residual, Try};
+use crate::ops::{ChangeOutputType, ControlFlow, FromResidual, Residual, Try};
 
+mod array_chunks;
 mod by_ref_sized;
 mod chain;
 mod cloned;
@@ -15,6 +16,7 @@ mod inspect;
 mod intersperse;
 mod map;
 mod map_while;
+mod map_windows;
 mod peekable;
 mod rev;
 mod scan;
@@ -32,7 +34,11 @@ pub use self::{
     scan::Scan, skip::Skip, skip_while::SkipWhile, take::Take, take_while::TakeWhile, zip::Zip,
 };
 
-pub(crate) use self::by_ref_sized::ByRefSized;
+#[unstable(feature = "iter_array_chunks", reason = "recently added", issue = "100450")]
+pub use self::array_chunks::ArrayChunks;
+
+#[unstable(feature = "std_internals", issue = "none")]
+pub use self::by_ref_sized::ByRefSized;
 
 #[stable(feature = "iter_cloned", since = "1.1.0")]
 pub use self::cloned::Cloned;
@@ -51,6 +57,9 @@ pub use self::intersperse::{Intersperse, IntersperseWith};
 
 #[stable(feature = "iter_map_while", since = "1.57.0")]
 pub use self::map_while::MapWhile;
+
+#[unstable(feature = "iter_map_windows", reason = "recently added", issue = "87155")]
+pub use self::map_windows::MapWindows;
 
 #[unstable(feature = "trusted_random_access", issue = "none")]
 pub use self::zip::TrustedRandomAccess;
@@ -198,13 +207,7 @@ where
             .into_try()
     }
 
-    fn fold<B, F>(mut self, init: B, fold: F) -> B
-    where
-        Self: Sized,
-        F: FnMut(B, Self::Item) -> B,
-    {
-        self.try_fold(init, NeverShortCircuit::wrap_mut_2(fold)).0
-    }
+    impl_fold_via_try_fold! { fold -> try_fold }
 }
 
 #[unstable(issue = "none", feature = "inplace_iteration")]

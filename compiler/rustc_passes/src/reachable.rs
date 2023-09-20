@@ -5,16 +5,16 @@
 // makes all other generics or inline functions that it references
 // reachable as well.
 
-use rustc_data_structures::fx::FxHashSet;
+use hir::def_id::LocalDefIdSet;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::Node;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
-use rustc_middle::middle::privacy;
-use rustc_middle::ty::query::Providers;
-use rustc_middle::ty::{self, DefIdTree, TyCtxt};
+use rustc_middle::middle::privacy::{self, Level};
+use rustc_middle::query::Providers;
+use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::config::CrateType;
 use rustc_target::spec::abi::Abi;
 
@@ -29,7 +29,7 @@ fn item_might_be_inlined(tcx: TyCtxt<'_>, item: &hir::Item<'_>, attrs: &CodegenF
     match item.kind {
         hir::ItemKind::Fn(ref sig, ..) if sig.header.is_const() => true,
         hir::ItemKind::Impl { .. } | hir::ItemKind::Fn(..) => {
-            let generics = tcx.generics_of(item.def_id);
+            let generics = tcx.generics_of(item.owner_id);
             generics.requires_monomorphization(tcx)
         }
         _ => false,
@@ -42,7 +42,7 @@ fn method_might_be_inlined(
     impl_src: LocalDefId,
 ) -> bool {
     let codegen_fn_attrs = tcx.codegen_fn_attrs(impl_item.hir_id().owner.to_def_id());
-    let generics = tcx.generics_of(impl_item.def_id);
+    let generics = tcx.generics_of(impl_item.owner_id);
     if codegen_fn_attrs.requests_inline() || generics.requires_monomorphization(tcx) {
         return true;
     }
@@ -63,7 +63,7 @@ struct ReachableContext<'tcx> {
     tcx: TyCtxt<'tcx>,
     maybe_typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
     // The set of items which must be exported in the linkage sense.
-    reachable_symbols: FxHashSet<LocalDefId>,
+    reachable_symbols: LocalDefIdSet,
     // A worklist of item IDs. Each item ID in this worklist will be inlined
     // and will be scanned for further references.
     // FIXME(eddyb) benchmark if this would be faster as a `VecDeque`.
@@ -90,6 +90,10 @@ impl<'tcx> Visitor<'tcx> for ReachableContext<'tcx> {
                 .typeck_results()
                 .type_dependent_def(expr.hir_id)
                 .map(|(kind, def_id)| Res::Def(kind, def_id)),
+            hir::ExprKind::Closure(&hir::Closure { def_id, .. }) => {
+                self.reachable_symbols.insert(def_id);
+                None
+            }
             _ => None,
         };
 
@@ -98,15 +102,11 @@ impl<'tcx> Visitor<'tcx> for ReachableContext<'tcx> {
                 self.worklist.push(def_id);
             } else {
                 match res {
-                    // If this path leads to a constant, then we need to
-                    // recurse into the constant to continue finding
-                    // items that are reachable.
-                    Res::Def(DefKind::Const | DefKind::AssocConst, _) => {
+                    // Reachable constants and reachable statics can have their contents inlined
+                    // into other crates. Mark them as reachable and recurse into their body.
+                    Res::Def(DefKind::Const | DefKind::AssocConst | DefKind::Static(_), _) => {
                         self.worklist.push(def_id);
                     }
-
-                    // If this wasn't a static, then the destination is
-                    // surely reachable.
                     _ => {
                         self.reachable_symbols.insert(def_id);
                     }
@@ -115,6 +115,17 @@ impl<'tcx> Visitor<'tcx> for ReachableContext<'tcx> {
         }
 
         intravisit::walk_expr(self, expr)
+    }
+
+    fn visit_inline_asm(&mut self, asm: &'tcx hir::InlineAsm<'tcx>, id: hir::HirId) {
+        for (op, _) in asm.operands {
+            if let hir::InlineAsmOperand::SymStatic { def_id, .. } = op {
+                if let Some(def_id) = def_id.as_local() {
+                    self.reachable_symbols.insert(def_id);
+                }
+            }
+        }
+        intravisit::walk_inline_asm(self, asm, id);
     }
 }
 
@@ -153,9 +164,9 @@ impl<'tcx> ReachableContext<'tcx> {
                 hir::ImplItemKind::Fn(..) => {
                     let hir_id = self.tcx.hir().local_def_id_to_hir_id(def_id);
                     let impl_did = self.tcx.hir().get_parent_item(hir_id);
-                    method_might_be_inlined(self.tcx, impl_item, impl_did)
+                    method_might_be_inlined(self.tcx, impl_item, impl_did.def_id)
                 }
-                hir::ImplItemKind::TyAlias(_) => false,
+                hir::ImplItemKind::Type(_) => false,
             },
             Some(_) => false,
             None => false, // This will happen for default methods.
@@ -164,7 +175,7 @@ impl<'tcx> ReachableContext<'tcx> {
 
     // Step 2: Mark all symbols that the symbols on the worklist touch.
     fn propagate(&mut self) {
-        let mut scanned = FxHashSet::default();
+        let mut scanned = LocalDefIdSet::default();
         while let Some(search_item) = self.worklist.pop() {
             if !scanned.insert(search_item) {
                 continue;
@@ -216,7 +227,7 @@ impl<'tcx> ReachableContext<'tcx> {
                         if item_might_be_inlined(
                             self.tcx,
                             &item,
-                            self.tcx.codegen_fn_attrs(item.def_id),
+                            self.tcx.codegen_fn_attrs(item.owner_id),
                         ) {
                             self.visit_nested_body(body);
                         }
@@ -225,7 +236,7 @@ impl<'tcx> ReachableContext<'tcx> {
                     // Reachable constants will be inlined into other crates
                     // unconditionally, so we need to make sure that their
                     // contents are also reachable.
-                    hir::ItemKind::Const(_, init) | hir::ItemKind::Static(_, _, init) => {
+                    hir::ItemKind::Const(_, _, init) | hir::ItemKind::Static(_, _, init) => {
                         self.visit_nested_body(init);
                     }
 
@@ -271,9 +282,12 @@ impl<'tcx> ReachableContext<'tcx> {
                         self.visit_nested_body(body)
                     }
                 }
-                hir::ImplItemKind::TyAlias(_) => {}
+                hir::ImplItemKind::Type(_) => {}
             },
-            Node::Expr(&hir::Expr { kind: hir::ExprKind::Closure(.., body, _, _), .. }) => {
+            Node::Expr(&hir::Expr {
+                kind: hir::ExprKind::Closure(&hir::Closure { body, .. }),
+                ..
+            }) => {
                 self.visit_nested_body(body);
             }
             // Nothing to recurse on for these
@@ -300,42 +314,37 @@ fn check_item<'tcx>(
     tcx: TyCtxt<'tcx>,
     id: hir::ItemId,
     worklist: &mut Vec<LocalDefId>,
-    access_levels: &privacy::AccessLevels,
+    effective_visibilities: &privacy::EffectiveVisibilities,
 ) {
-    if has_custom_linkage(tcx, id.def_id) {
-        worklist.push(id.def_id);
+    if has_custom_linkage(tcx, id.owner_id.def_id) {
+        worklist.push(id.owner_id.def_id);
     }
 
-    if !matches!(tcx.def_kind(id.def_id), DefKind::Impl) {
+    if !matches!(tcx.def_kind(id.owner_id), DefKind::Impl { of_trait: true }) {
         return;
     }
 
     // We need only trait impls here, not inherent impls, and only non-exported ones
-    let item = tcx.hir().item(id);
-    if let hir::ItemKind::Impl(hir::Impl { of_trait: Some(ref trait_ref), ref items, .. }) =
-        item.kind
-    {
-        if !access_levels.is_reachable(item.def_id) {
-            // FIXME(#53488) remove `let`
-            let tcx = tcx;
-            worklist.extend(items.iter().map(|ii_ref| ii_ref.id.def_id));
-
-            let Res::Def(DefKind::Trait, trait_def_id) = trait_ref.path.res else {
-                unreachable!();
-            };
-
-            if !trait_def_id.is_local() {
-                return;
-            }
-
-            worklist.extend(
-                tcx.provided_trait_methods(trait_def_id).map(|assoc| assoc.def_id.expect_local()),
-            );
-        }
+    if effective_visibilities.is_reachable(id.owner_id.def_id) {
+        return;
     }
+
+    let items = tcx.associated_item_def_ids(id.owner_id);
+    worklist.extend(items.iter().map(|ii_ref| ii_ref.expect_local()));
+
+    let Some(trait_def_id) = tcx.trait_id_of_impl(id.owner_id.to_def_id()) else {
+        unreachable!();
+    };
+
+    if !trait_def_id.is_local() {
+        return;
+    }
+
+    worklist
+        .extend(tcx.provided_trait_methods(trait_def_id).map(|assoc| assoc.def_id.expect_local()));
 }
 
-fn has_custom_linkage<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
+fn has_custom_linkage(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
     // Anything which has custom linkage gets thrown on the worklist no
     // matter where it is in the crate, along with "special std symbols"
     // which are currently akin to allocator symbols.
@@ -352,13 +361,13 @@ fn has_custom_linkage<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> bool {
         || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER)
 }
 
-fn reachable_set<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> FxHashSet<LocalDefId> {
-    let access_levels = &tcx.privacy_access_levels(());
+fn reachable_set(tcx: TyCtxt<'_>, (): ()) -> LocalDefIdSet {
+    let effective_visibilities = &tcx.effective_visibilities(());
 
-    let any_library =
-        tcx.sess.crate_types().iter().any(|ty| {
-            *ty == CrateType::Rlib || *ty == CrateType::Dylib || *ty == CrateType::ProcMacro
-        });
+    let any_library = tcx
+        .crate_types()
+        .iter()
+        .any(|ty| *ty == CrateType::Rlib || *ty == CrateType::Dylib || *ty == CrateType::ProcMacro);
     let mut reachable_context = ReachableContext {
         tcx,
         maybe_typeck_results: None,
@@ -372,12 +381,16 @@ fn reachable_set<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> FxHashSet<LocalDefId> {
     //         If other crates link to us, they're going to expect to be able to
     //         use the lang items, so we need to be sure to mark them as
     //         exported.
-    reachable_context.worklist.extend(access_levels.map.keys());
-    for item in tcx.lang_items().items().iter() {
-        if let Some(def_id) = *item {
-            if let Some(def_id) = def_id.as_local() {
-                reachable_context.worklist.push(def_id);
-            }
+    reachable_context.worklist = effective_visibilities
+        .iter()
+        .filter_map(|(&id, effective_vis)| {
+            effective_vis.is_public_at_level(Level::ReachableThroughImplTrait).then_some(id)
+        })
+        .collect::<Vec<_>>();
+
+    for (_, def_id) in tcx.lang_items().iter() {
+        if let Some(def_id) = def_id.as_local() {
+            reachable_context.worklist.push(def_id);
         }
     }
     {
@@ -392,12 +405,12 @@ fn reachable_set<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> FxHashSet<LocalDefId> {
         let crate_items = tcx.hir_crate_items(());
 
         for id in crate_items.items() {
-            check_item(tcx, id, &mut reachable_context.worklist, access_levels);
+            check_item(tcx, id, &mut reachable_context.worklist, effective_visibilities);
         }
 
         for id in crate_items.impl_items() {
-            if has_custom_linkage(tcx, id.def_id) {
-                reachable_context.worklist.push(id.def_id);
+            if has_custom_linkage(tcx, id.owner_id.def_id) {
+                reachable_context.worklist.push(id.owner_id.def_id);
             }
         }
     }

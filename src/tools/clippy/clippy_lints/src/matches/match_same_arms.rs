@@ -1,18 +1,17 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet;
-use clippy_utils::{path_to_local, search_same, SpanlessEq, SpanlessHash};
+use clippy_utils::{is_lint_allowed, path_to_local, search_same, SpanlessEq, SpanlessHash};
 use core::cmp::Ordering;
-use core::iter;
-use core::slice;
+use core::{iter, slice};
 use rustc_arena::DroplessArena;
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::def_id::DefId;
-use rustc_hir::{Arm, Expr, ExprKind, HirId, HirIdMap, HirIdSet, Pat, PatKind, RangeEnd};
+use rustc_hir::{Arm, Expr, ExprKind, HirId, HirIdMap, HirIdMapEntry, HirIdSet, Pat, PatKind, RangeEnd};
+use rustc_lint::builtin::NON_EXHAUSTIVE_OMITTED_PATTERNS;
 use rustc_lint::LateContext;
 use rustc_middle::ty;
 use rustc_span::Symbol;
-use std::collections::hash_map::Entry;
 
 use super::MATCH_SAME_ARMS;
 
@@ -38,7 +37,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
             normalized_pats[i + 1..]
                 .iter()
                 .enumerate()
-                .find_map(|(j, other)| pat.has_overlapping_values(other).then(|| i + 1 + j))
+                .find_map(|(j, other)| pat.has_overlapping_values(other).then_some(i + 1 + j))
                 .unwrap_or(normalized_pats.len())
         })
         .collect();
@@ -55,7 +54,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                 .zip(forwards_blocking_idxs[..i].iter().copied().rev())
                 .skip_while(|&(_, forward_block)| forward_block > i)
                 .find_map(|((j, other), forward_block)| {
-                    (forward_block == i || pat.has_overlapping_values(other)).then(|| j)
+                    (forward_block == i || pat.has_overlapping_values(other)).then_some(j)
                 })
                 .unwrap_or(0)
         })
@@ -71,9 +70,9 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                 if let Some(a_id) = path_to_local(a);
                 if let Some(b_id) = path_to_local(b);
                 let entry = match local_map.entry(a_id) {
-                    Entry::Vacant(entry) => entry,
+                    HirIdMapEntry::Vacant(entry) => entry,
                     // check if using the same bindings as before
-                    Entry::Occupied(entry) => return *entry.get() == b_id,
+                    HirIdMapEntry::Occupied(entry) => return *entry.get() == b_id,
                 };
                 // the names technically don't have to match; this makes the lint more conservative
                 if cx.tcx.hir().name(a_id) == cx.tcx.hir().name(b_id);
@@ -104,22 +103,21 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
     let indexed_arms: Vec<(usize, &Arm<'_>)> = arms.iter().enumerate().collect();
     for (&(i, arm1), &(j, arm2)) in search_same(&indexed_arms, hash, eq) {
         if matches!(arm2.pat.kind, PatKind::Wild) {
-            span_lint_and_then(
-                cx,
-                MATCH_SAME_ARMS,
-                arm1.span,
-                "this match arm has an identical body to the `_` wildcard arm",
-                |diag| {
-                    diag.span_suggestion(
-                        arm1.span,
-                        "try removing the arm",
-                        String::new(),
-                        Applicability::MaybeIncorrect,
-                    )
-                    .help("or try changing either arm body")
-                    .span_note(arm2.span, "`_` wildcard arm here");
-                },
-            );
+            if !cx.tcx.features().non_exhaustive_omitted_patterns_lint
+                || is_lint_allowed(cx, NON_EXHAUSTIVE_OMITTED_PATTERNS, arm2.hir_id)
+            {
+                span_lint_and_then(
+                    cx,
+                    MATCH_SAME_ARMS,
+                    arm1.span,
+                    "this match arm has an identical body to the `_` wildcard arm",
+                    |diag| {
+                        diag.span_suggestion(arm1.span, "try removing the arm", "", Applicability::MaybeIncorrect)
+                            .help("or try changing either arm body")
+                            .span_note(arm2.span, "`_` wildcard arm here");
+                    },
+                );
+            }
         } else {
             let back_block = backwards_blocking_idxs[j];
             let (keep_arm, move_arm) = if back_block < i || (back_block == 0 && forwards_blocking_idxs[i] <= j) {
@@ -140,7 +138,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, arms: &'tcx [Arm<'_>]) {
                     diag.span_suggestion(
                         keep_arm.pat.span,
                         "try merging the arm patterns",
-                        format!("{} | {}", keep_pat_snip, move_pat_snip),
+                        format!("{keep_pat_snip} | {move_pat_snip}"),
                         Applicability::MaybeIncorrect,
                     )
                     .help("or try changing either arm body")
@@ -227,7 +225,6 @@ fn iter_matching_struct_fields<'a>(
 
 #[expect(clippy::similar_names)]
 impl<'a> NormalizedPat<'a> {
-    #[expect(clippy::too_many_lines)]
     fn from_pat(cx: &LateContext<'_>, arena: &'a DroplessArena, pat: &'a Pat<'_>) -> Self {
         match pat.kind {
             PatKind::Wild | PatKind::Binding(.., None) => Self::Wild,
@@ -241,9 +238,8 @@ impl<'a> NormalizedPat<'a> {
                 Self::Struct(cx.qpath_res(path, pat.hir_id).opt_def_id(), fields)
             },
             PatKind::TupleStruct(ref path, pats, wild_idx) => {
-                let adt = match cx.typeck_results().pat_ty(pat).ty_adt_def() {
-                    Some(x) => x,
-                    None => return Self::Wild,
+                let Some(adt) = cx.typeck_results().pat_ty(pat).ty_adt_def() else {
+                    return Self::Wild;
                 };
                 let (var_id, variant) = if adt.is_enum() {
                     match cx.qpath_res(path, pat.hir_id).opt_def_id() {
@@ -253,7 +249,7 @@ impl<'a> NormalizedPat<'a> {
                 } else {
                     (None, adt.non_enum_variant())
                 };
-                let (front, back) = match wild_idx {
+                let (front, back) = match wild_idx.as_opt_usize() {
                     Some(i) => pats.split_at(i),
                     None => (pats, [].as_slice()),
                 };
@@ -273,7 +269,7 @@ impl<'a> NormalizedPat<'a> {
                     ty::Tuple(subs) => subs.len(),
                     _ => return Self::Wild,
                 };
-                let (front, back) = match wild_idx {
+                let (front, back) = match wild_idx.as_opt_usize() {
                     Some(i) => pats.split_at(i),
                     None => (pats, [].as_slice()),
                 };
@@ -290,12 +286,12 @@ impl<'a> NormalizedPat<'a> {
                 // TODO: Handle negative integers. They're currently treated as a wild match.
                 ExprKind::Lit(lit) => match lit.node {
                     LitKind::Str(sym, _) => Self::LitStr(sym),
-                    LitKind::ByteStr(ref bytes) => Self::LitBytes(&**bytes),
+                    LitKind::ByteStr(ref bytes, _) | LitKind::CStr(ref bytes, _) => Self::LitBytes(bytes),
                     LitKind::Byte(val) => Self::LitInt(val.into()),
                     LitKind::Char(val) => Self::LitInt(val.into()),
                     LitKind::Int(val, _) => Self::LitInt(val),
                     LitKind::Bool(val) => Self::LitBool(val),
-                    LitKind::Float(..) | LitKind::Err(_) => Self::Wild,
+                    LitKind::Float(..) | LitKind::Err => Self::Wild,
                 },
                 _ => Self::Wild,
             },
@@ -370,7 +366,7 @@ impl<'a> NormalizedPat<'a> {
             (Self::Slice(pats, None), Self::Slice(front, Some(back)))
             | (Self::Slice(front, Some(back)), Self::Slice(pats, None)) => {
                 // Here `pats` is an exact size match. If the combined lengths of `front` and `back` are greater
-                // then the minium length required will be greater than the length of `pats`.
+                // then the minimum length required will be greater than the length of `pats`.
                 if pats.len() < front.len() + back.len() {
                     return false;
                 }

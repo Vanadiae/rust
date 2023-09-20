@@ -10,11 +10,13 @@ Otherwise, have a great day =^.^=
 <head>
     <meta charset="UTF-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <meta name="description" content="A collection of lints to catch common mistakes and improve your Rust code.">
 
     <title>Clippy Lints</title>
 
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/twitter-bootstrap/3.3.6/css/bootstrap.min.css"/>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/9.5.0/styles/github.min.css"/>
+    <link id="githubLightHighlight" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.6.0/styles/github.min.css" disabled="true" />
+    <link id="githubDarkHighlight" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.6.0/styles/github-dark.min.css" disabled="true" />
 
     <!-- The files are not copied over into the Clippy project since they use the MPL-2.0 License -->
     <link rel="stylesheet" href="https://rust-lang.github.io/mdBook/css/variables.css"/>
@@ -205,6 +207,26 @@ Otherwise, have a great day =^.^=
             background-color: #777777;
             margin: auto 5px;
             font-family: monospace;
+        }
+
+        details {
+            border-radius: 4px;
+            padding: .5em .5em 0;
+        }
+
+        code {
+            white-space: pre !important;
+        }
+
+        summary {
+            font-weight: bold;
+            margin: -.5em -.5em 0;
+            padding: .5em;
+            display: revert;
+        }
+
+        details[open] {
+            padding: .5em;
         }
     </style>
     <style>
@@ -421,6 +443,12 @@ Otherwise, have a great day =^.^=
                                     </label>
                                 </li>
                                 <li class="checkbox">
+                                    <label ng-click="resetGroupsToDefault()">
+                                        <input type="checkbox" class="invisible" />
+                                        Default
+                                    </label>
+                                </li>
+                                <li class="checkbox">
                                     <label ng-click="toggleGroups(false)">
                                         <input type="checkbox" class="invisible" />
                                         None
@@ -473,9 +501,11 @@ Otherwise, have a great day =^.^=
                     <div class="col-12 col-md-7 search-control">
                         <div class="input-group">
                             <label class="input-group-addon" id="filter-label" for="search-input">Filter:</label>
-                            <input type="text" class="form-control filter-input" placeholder="Keywords or search string" id="search-input" ng-model="search" ng-model-options="{debounce: 50}"/>
+                            <input type="text" class="form-control filter-input" placeholder="Keywords or search string" id="search-input"
+                                ng-model="search" ng-blur="updatePath()" ng-keyup="$event.keyCode == 13 && updatePath()"
+                                ng-model-options="{debounce: 50}" />
                             <span class="input-group-btn">
-                                <button class="filter-clear btn" type="button" ng-click="search = ''">
+                                <button class="filter-clear btn" type="button" ng-click="search = ''; updatePath();">
                                     Clear
                                 </button>
                             </span>
@@ -489,7 +519,8 @@ Otherwise, have a great day =^.^=
                     <h2 class="panel-title">
                         <div class="panel-title-name">
                             <span>{{lint.id}}</span>
-                            <a href="#{{lint.id}}" class="anchor label label-default" ng-click="open[lint.id] = true; $event.stopPropagation()">&para;</a>
+                            <a href="#{{lint.id}}" class="anchor label label-default"
+                                ng-click="openLint(lint); $event.preventDefault(); $event.stopPropagation()">&para;</a>
                             <a href="" id="clipboard-{{lint.id}}" class="anchor label label-default" ng-click="copyToClipboard(lint); $event.stopPropagation()">
                                 &#128203;
                             </a>
@@ -536,12 +567,12 @@ Otherwise, have a great day =^.^=
     </div>
 
     <a href="https://github.com/rust-lang/rust-clippy">
-        <img style="position: absolute; top: 0; right: 0; border: 0; clip-path: polygon(0% 0%, 100% 0%, 100% 100%);" src="https://s3.amazonaws.com/github/ribbons/forkme_right_darkblue_121621.png" alt="Fork me on Github"/>
+        <img style="position: absolute; top: 0; right: 0; border: 0; clip-path: polygon(0% 0%, 100% 0%, 100% 100%);" src="https://s3.amazonaws.com/github/ribbons/forkme_right_darkblue_121621.png" alt="Fork me on GitHub"/>
     </a>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/markdown-it/12.3.2/markdown-it.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/9.5.0/highlight.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/9.5.0/languages/rust.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.6.0/highlight.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.6.0/languages/rust.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/angular.js/1.4.12/angular.min.js"></script>
     <script src="script.js"></script>
 </body>

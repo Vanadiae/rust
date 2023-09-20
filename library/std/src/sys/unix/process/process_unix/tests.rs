@@ -3,7 +3,7 @@ use crate::panic::catch_unwind;
 use crate::process::Command;
 
 // Many of the other aspects of this situation, including heap alloc concurrency
-// safety etc., are tested in src/test/ui/process/process-panic-after-fork.rs
+// safety etc., are tested in tests/ui/process/process-panic-after-fork.rs
 
 #[test]
 fn exitstatus_display_tests() {
@@ -19,17 +19,17 @@ fn exitstatus_display_tests() {
     t(0x00000, "exit status: 0");
     t(0x0ff00, "exit status: 255");
 
-    // On MacOS, 0x0137f is WIFCONTINUED, not WIFSTOPPED.  Probably *BSD is similar.
+    // On MacOS, 0x0137f is WIFCONTINUED, not WIFSTOPPED. Probably *BSD is similar.
     //   https://github.com/rust-lang/rust/pull/82749#issuecomment-790525956
     // The purpose of this test is to test our string formatting, not our understanding of the wait
-    // status magic numbers.  So restrict these to Linux.
+    // status magic numbers. So restrict these to Linux.
     if cfg!(target_os = "linux") {
         t(0x0137f, "stopped (not terminated) by signal: 19 (SIGSTOP)");
         t(0x0ffff, "continued (WIFCONTINUED)");
     }
 
     // Testing "unrecognised wait status" is hard because the wait.h macros typically
-    // assume that the value came from wait and isn't mad.  With the glibc I have here
+    // assume that the value came from wait and isn't mad. With the glibc I have here
     // this works:
     if cfg!(all(target_os = "linux", target_env = "gnu")) {
         t(0x000ff, "unrecognised wait status: 255 0xff");
@@ -59,4 +59,29 @@ fn test_command_fork_no_unwind() {
             || signal == libc::SIGTRAP
             || signal == libc::SIGSEGV
     );
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_command_pidfd() {
+    use crate::os::fd::RawFd;
+    use crate::os::linux::process::{ChildExt, CommandExt};
+    use crate::process::Command;
+
+    let our_pid = crate::process::id();
+    let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, our_pid, 0) };
+    let pidfd_open_available = if pidfd >= 0 {
+        unsafe { libc::close(pidfd as RawFd) };
+        true
+    } else {
+        false
+    };
+
+    // always exercise creation attempts
+    let child = Command::new("echo").create_pidfd(true).spawn().unwrap();
+
+    // but only check if we know that the kernel supports pidfds
+    if pidfd_open_available {
+        assert!(child.pidfd().is_ok())
+    }
 }

@@ -1,20 +1,18 @@
-use crate::middle::resolve_lifetime::ObjectLifetimeDefault;
 use crate::ty;
-use crate::ty::subst::{Subst, SubstsRef};
-use crate::ty::EarlyBinder;
+use crate::ty::{EarlyBinder, GenericArgsRef};
 use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
-use rustc_span::symbol::Symbol;
+use rustc_span::symbol::{kw, Symbol};
 use rustc_span::Span;
 
-use super::{EarlyBoundRegion, InstantiatedPredicates, ParamConst, ParamTy, Predicate, TyCtxt};
+use super::{Clause, EarlyBoundRegion, InstantiatedPredicates, ParamConst, ParamTy, Ty, TyCtxt};
 
 #[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable)]
 pub enum GenericParamDefKind {
     Lifetime,
-    Type { has_default: bool, object_lifetime_default: ObjectLifetimeDefault, synthetic: bool },
-    Const { has_default: bool },
+    Type { has_default: bool, synthetic: bool },
+    Const { has_default: bool, is_host_effect: bool },
 }
 
 impl GenericParamDefKind {
@@ -28,8 +26,9 @@ impl GenericParamDefKind {
     pub fn to_ord(&self) -> ast::ParamKindOrd {
         match self {
             GenericParamDefKind::Lifetime => ast::ParamKindOrd::Lifetime,
-            GenericParamDefKind::Type { .. } => ast::ParamKindOrd::Type,
-            GenericParamDefKind::Const { .. } => ast::ParamKindOrd::Const,
+            GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } => {
+                ast::ParamKindOrd::TypeOrConst
+            }
         }
     }
 
@@ -37,6 +36,13 @@ impl GenericParamDefKind {
         match self {
             GenericParamDefKind::Lifetime => false,
             GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } => true,
+        }
+    }
+
+    pub fn is_synthetic(&self) -> bool {
+        match self {
+            GenericParamDefKind::Type { synthetic, .. } => *synthetic,
+            _ => false,
         }
     }
 }
@@ -64,11 +70,12 @@ impl GenericParamDef {
         }
     }
 
-    pub fn has_default(&self) -> bool {
+    pub fn is_anonymous_lifetime(&self) -> bool {
         match self.kind {
-            GenericParamDefKind::Type { has_default, .. }
-            | GenericParamDefKind::Const { has_default } => has_default,
-            GenericParamDefKind::Lifetime => false,
+            GenericParamDefKind::Lifetime => {
+                self.name == kw::UnderscoreLifetime || self.name == kw::Empty
+            }
+            _ => false,
         }
     }
 
@@ -78,12 +85,28 @@ impl GenericParamDef {
     ) -> Option<EarlyBinder<ty::GenericArg<'tcx>>> {
         match self.kind {
             GenericParamDefKind::Type { has_default, .. } if has_default => {
-                Some(EarlyBinder(tcx.type_of(self.def_id).into()))
+                Some(tcx.type_of(self.def_id).map_bound(|t| t.into()))
             }
-            GenericParamDefKind::Const { has_default } if has_default => {
-                Some(EarlyBinder(tcx.const_param_default(self.def_id).into()))
+            GenericParamDefKind::Const { has_default, .. } if has_default => {
+                Some(tcx.const_param_default(self.def_id).map_bound(|c| c.into()))
             }
             _ => None,
+        }
+    }
+
+    pub fn to_error<'tcx>(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        preceding_args: &[ty::GenericArg<'tcx>],
+    ) -> ty::GenericArg<'tcx> {
+        match &self.kind {
+            ty::GenericParamDefKind::Lifetime => ty::Region::new_error_misc(tcx).into(),
+            ty::GenericParamDefKind::Type { .. } => Ty::new_misc_error(tcx).into(),
+            ty::GenericParamDefKind::Const { .. } => ty::Const::new_misc_error(
+                tcx,
+                tcx.type_of(self.def_id).instantiate(tcx, preceding_args),
+            )
+            .into(),
         }
     }
 }
@@ -112,9 +135,27 @@ pub struct Generics {
 
     pub has_self: bool,
     pub has_late_bound_regions: Option<Span>,
+
+    // The index of the host effect when substituted. (i.e. might be index to parent args)
+    pub host_effect_index: Option<usize>,
 }
 
 impl<'tcx> Generics {
+    /// Looks through the generics and all parents to find the index of the
+    /// given param def-id. This is in comparison to the `param_def_id_to_index`
+    /// struct member, which only stores information about this item's own
+    /// generics.
+    pub fn param_def_id_to_index(&self, tcx: TyCtxt<'tcx>, def_id: DefId) -> Option<u32> {
+        if let Some(idx) = self.param_def_id_to_index.get(&def_id) {
+            Some(*idx)
+        } else if let Some(parent) = self.parent {
+            let parent = tcx.generics_of(parent);
+            parent.param_def_id_to_index(tcx, def_id)
+        } else {
+            None
+        }
+    }
+
     #[inline]
     pub fn count(&self) -> usize {
         self.parent_count + self.params.len()
@@ -146,7 +187,7 @@ impl<'tcx> Generics {
                 GenericParamDefKind::Type { has_default, .. } => {
                     own_defaults.types += has_default as usize;
                 }
-                GenericParamDefKind::Const { has_default } => {
+                GenericParamDefKind::Const { has_default, .. } => {
                     own_defaults.consts += has_default as usize;
                 }
             }
@@ -171,10 +212,12 @@ impl<'tcx> Generics {
     pub fn own_requires_monomorphization(&self) -> bool {
         for param in &self.params {
             match param.kind {
-                GenericParamDefKind::Type { .. } | GenericParamDefKind::Const { .. } => {
+                GenericParamDefKind::Type { .. }
+                | GenericParamDefKind::Const { is_host_effect: false, .. } => {
                     return true;
                 }
-                GenericParamDefKind::Lifetime => {}
+                GenericParamDefKind::Lifetime
+                | GenericParamDefKind::Const { is_host_effect: true, .. } => {}
             }
         }
         false
@@ -187,6 +230,15 @@ impl<'tcx> Generics {
         } else {
             tcx.generics_of(self.parent.expect("parent_count > 0 but no parent?"))
                 .param_at(param_index, tcx)
+        }
+    }
+
+    pub fn params_to(&'tcx self, param_index: usize, tcx: TyCtxt<'tcx>) -> &'tcx [GenericParamDef] {
+        if let Some(index) = param_index.checked_sub(self.parent_count) {
+            &self.params[..index]
+        } else {
+            tcx.generics_of(self.parent.expect("parent_count > 0 but no parent?"))
+                .params_to(param_index, tcx)
         }
     }
 
@@ -228,9 +280,48 @@ impl<'tcx> Generics {
         })
     }
 
-    /// Returns the substs corresponding to the generic parameters of this item, excluding `Self`.
-    pub fn own_substs(&'tcx self, substs: SubstsRef<'tcx>) -> &'tcx [ty::GenericArg<'tcx>] {
-        let own = &substs[self.parent_count..][..self.params.len()];
+    /// Returns the args corresponding to the generic parameters
+    /// of this item, excluding `Self`.
+    ///
+    /// **This should only be used for diagnostics purposes.**
+    pub fn own_args_no_defaults(
+        &'tcx self,
+        tcx: TyCtxt<'tcx>,
+        args: &'tcx [ty::GenericArg<'tcx>],
+    ) -> &'tcx [ty::GenericArg<'tcx>] {
+        let mut own_params = self.parent_count..self.count();
+        if self.has_self && self.parent.is_none() {
+            own_params.start = 1;
+        }
+
+        // Filter the default arguments.
+        //
+        // This currently uses structural equality instead
+        // of semantic equivalence. While not ideal, that's
+        // good enough for now as this should only be used
+        // for diagnostics anyways.
+        own_params.end -= self
+            .params
+            .iter()
+            .rev()
+            .take_while(|param| {
+                param.default_value(tcx).is_some_and(|default| {
+                    default.instantiate(tcx, args) == args[param.index as usize]
+                })
+            })
+            .count();
+
+        &args[own_params]
+    }
+
+    /// Returns the args corresponding to the generic parameters of this item, excluding `Self`.
+    ///
+    /// **This should only be used for diagnostics purposes.**
+    pub fn own_args(
+        &'tcx self,
+        args: &'tcx [ty::GenericArg<'tcx>],
+    ) -> &'tcx [ty::GenericArg<'tcx>] {
+        let own = &args[self.parent_count..][..self.params.len()];
         if self.has_self && self.parent.is_none() { &own[1..] } else { &own }
     }
 }
@@ -239,47 +330,41 @@ impl<'tcx> Generics {
 #[derive(Copy, Clone, Default, Debug, TyEncodable, TyDecodable, HashStable)]
 pub struct GenericPredicates<'tcx> {
     pub parent: Option<DefId>,
-    pub predicates: &'tcx [(Predicate<'tcx>, Span)],
+    pub predicates: &'tcx [(Clause<'tcx>, Span)],
 }
 
 impl<'tcx> GenericPredicates<'tcx> {
     pub fn instantiate(
         &self,
         tcx: TyCtxt<'tcx>,
-        substs: SubstsRef<'tcx>,
+        args: GenericArgsRef<'tcx>,
     ) -> InstantiatedPredicates<'tcx> {
         let mut instantiated = InstantiatedPredicates::empty();
-        self.instantiate_into(tcx, &mut instantiated, substs);
+        self.instantiate_into(tcx, &mut instantiated, args);
         instantiated
     }
 
     pub fn instantiate_own(
         &self,
         tcx: TyCtxt<'tcx>,
-        substs: SubstsRef<'tcx>,
-    ) -> InstantiatedPredicates<'tcx> {
-        InstantiatedPredicates {
-            predicates: self
-                .predicates
-                .iter()
-                .map(|(p, _)| EarlyBinder(*p).subst(tcx, substs))
-                .collect(),
-            spans: self.predicates.iter().map(|(_, sp)| *sp).collect(),
-        }
+        args: GenericArgsRef<'tcx>,
+    ) -> impl Iterator<Item = (Clause<'tcx>, Span)> + DoubleEndedIterator + ExactSizeIterator {
+        EarlyBinder::bind(self.predicates).iter_instantiated_copied(tcx, args)
     }
 
+    #[instrument(level = "debug", skip(self, tcx))]
     fn instantiate_into(
         &self,
         tcx: TyCtxt<'tcx>,
         instantiated: &mut InstantiatedPredicates<'tcx>,
-        substs: SubstsRef<'tcx>,
+        args: GenericArgsRef<'tcx>,
     ) {
         if let Some(def_id) = self.parent {
-            tcx.predicates_of(def_id).instantiate_into(tcx, instantiated, substs);
+            tcx.predicates_of(def_id).instantiate_into(tcx, instantiated, args);
         }
-        instantiated
-            .predicates
-            .extend(self.predicates.iter().map(|(p, _)| EarlyBinder(*p).subst(tcx, substs)));
+        instantiated.predicates.extend(
+            self.predicates.iter().map(|(p, _)| EarlyBinder::bind(*p).instantiate(tcx, args)),
+        );
         instantiated.spans.extend(self.predicates.iter().map(|(_, sp)| *sp));
     }
 

@@ -12,22 +12,24 @@ fn main() {
 
     // These should fail:
     let _ = a == b;
+    //~^ ERROR: comparing trait object pointers compares a non-unique vtable address
     let _ = a != b;
+    //~^ ERROR: comparing trait object pointers compares a non-unique vtable address
     let _ = a < b;
+    //~^ ERROR: comparing trait object pointers compares a non-unique vtable address
     let _ = a <= b;
+    //~^ ERROR: comparing trait object pointers compares a non-unique vtable address
     let _ = a > b;
+    //~^ ERROR: comparing trait object pointers compares a non-unique vtable address
     let _ = a >= b;
+    //~^ ERROR: comparing trait object pointers compares a non-unique vtable address
     ptr::eq(a, b);
+    //~^ ERROR: comparing trait object pointers compares a non-unique vtable address
 
     let a = &1 as &dyn Debug;
     let b = &1 as &dyn Debug;
     ptr::eq(a, b);
-
-    let a: Rc<dyn Debug> = Rc::new(1);
-    Rc::ptr_eq(&a, &a);
-
-    let a: Arc<dyn Debug> = Arc::new(1);
-    Arc::ptr_eq(&a, &a);
+    //~^ ERROR: comparing trait object pointers compares a non-unique vtable address
 
     // These should be fine:
     let a = &1;
@@ -37,6 +39,12 @@ fn main() {
     Rc::ptr_eq(&a, &a);
 
     let a = Arc::new(1);
+    Arc::ptr_eq(&a, &a);
+
+    let a: Rc<dyn Debug> = Rc::new(1);
+    Rc::ptr_eq(&a, &a);
+
+    let a: Arc<dyn Debug> = Arc::new(1);
     Arc::ptr_eq(&a, &a);
 
     let a: &[u8] = b"";

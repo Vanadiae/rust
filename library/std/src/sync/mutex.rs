@@ -5,16 +5,15 @@ use crate::cell::UnsafeCell;
 use crate::fmt;
 use crate::ops::{Deref, DerefMut};
 use crate::sync::{poison, LockResult, TryLockError, TryLockResult};
-use crate::sys_common::mutex as sys;
+use crate::sys::locks as sys;
 
 /// A mutual exclusion primitive useful for protecting shared data
 ///
 /// This mutex will block threads waiting for the lock to become available. The
-/// mutex can also be statically initialized or created via a [`new`]
-/// constructor. Each mutex has a type parameter which represents the data that
-/// it is protecting. The data can only be accessed through the RAII guards
-/// returned from [`lock`] and [`try_lock`], which guarantees that the data is only
-/// ever accessed when the mutex is locked.
+/// mutex can be created via a [`new`] constructor. Each mutex has a type parameter
+/// which represents the data that it is protecting. The data can only be accessed
+/// through the RAII guards returned from [`lock`] and [`try_lock`], which
+/// guarantees that the data is only ever accessed when the mutex is locked.
 ///
 /// # Poisoning
 ///
@@ -108,8 +107,8 @@ use crate::sys_common::mutex as sys;
 /// *guard += 1;
 /// ```
 ///
-/// It is sometimes necessary to manually drop the mutex guard to unlock it
-/// sooner than the end of the enclosing scope.
+/// To unlock a mutex guard sooner than the end of the enclosing scope,
+/// either create an inner scope or drop the guard manually.
 ///
 /// ```
 /// use std::sync::{Arc, Mutex};
@@ -126,11 +125,18 @@ use crate::sys_common::mutex as sys;
 ///     let res_mutex_clone = Arc::clone(&res_mutex);
 ///
 ///     threads.push(thread::spawn(move || {
-///         let mut data = data_mutex_clone.lock().unwrap();
-///         // This is the result of some important and long-ish work.
-///         let result = data.iter().fold(0, |acc, x| acc + x * 2);
-///         data.push(result);
-///         drop(data);
+///         // Here we use a block to limit the lifetime of the lock guard.
+///         let result = {
+///             let mut data = data_mutex_clone.lock().unwrap();
+///             // This is the result of some important and long-ish work.
+///             let result = data.iter().fold(0, |acc, x| acc + x * 2);
+///             data.push(result);
+///             result
+///             // The mutex guard gets dropped here, together with any other values
+///             // created in the critical section.
+///         };
+///         // The guard created here is a temporary dropped at the end of the statement, i.e.
+///         // the lock would not remain being held even if the thread did some additional work.
 ///         *res_mutex_clone.lock().unwrap() += result;
 ///     }));
 /// });
@@ -147,6 +153,8 @@ use crate::sys_common::mutex as sys;
 /// // It's even more important here than in the threads because we `.join` the
 /// // threads after that. If we had not dropped the mutex guard, a thread could
 /// // be waiting forever for it, causing a deadlock.
+/// // As in the threads, a block could have been used instead of calling the
+/// // `drop` function.
 /// drop(data);
 /// // Here the mutex guard is not assigned to a variable and so, even if the
 /// // scope does not end after this line, the mutex is still released: there is
@@ -161,10 +169,11 @@ use crate::sys_common::mutex as sys;
 ///
 /// assert_eq!(*res_mutex.lock().unwrap(), 800);
 /// ```
+///
 #[stable(feature = "rust1", since = "1.0.0")]
 #[cfg_attr(not(test), rustc_diagnostic_item = "Mutex")]
 pub struct Mutex<T: ?Sized> {
-    inner: sys::MovableMutex,
+    inner: sys::Mutex,
     poison: poison::Flag,
     data: UnsafeCell<T>,
 }
@@ -193,6 +202,7 @@ unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
                       and cause Futures to not implement `Send`"]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[clippy::has_significant_drop]
+#[cfg_attr(not(test), rustc_diagnostic_item = "MutexGuard")]
 pub struct MutexGuard<'a, T: ?Sized + 'a> {
     lock: &'a Mutex<T>,
     poison: poison::Guard,
@@ -214,12 +224,10 @@ impl<T> Mutex<T> {
     /// let mutex = Mutex::new(0);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    pub fn new(t: T) -> Mutex<T> {
-        Mutex {
-            inner: sys::MovableMutex::new(),
-            poison: poison::Flag::new(),
-            data: UnsafeCell::new(t),
-        }
+    #[rustc_const_stable(feature = "const_locks", since = "1.63.0")]
+    #[inline]
+    pub const fn new(t: T) -> Mutex<T> {
+        Mutex { inner: sys::Mutex::new(), poison: poison::Flag::new(), data: UnsafeCell::new(t) }
     }
 }
 
@@ -262,7 +270,7 @@ impl<T: ?Sized> Mutex<T> {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
         unsafe {
-            self.inner.raw_lock();
+            self.inner.lock();
             MutexGuard::new(self)
         }
     }
@@ -424,7 +432,7 @@ impl<T: ?Sized> Mutex<T> {
         T: Sized,
     {
         let data = self.data.into_inner();
-        poison::map_result(self.poison.borrow(), |_| data)
+        poison::map_result(self.poison.borrow(), |()| data)
     }
 
     /// Returns a mutable reference to the underlying data.
@@ -449,7 +457,7 @@ impl<T: ?Sized> Mutex<T> {
     #[stable(feature = "mutex_get_mut", since = "1.6.0")]
     pub fn get_mut(&mut self) -> LockResult<&mut T> {
         let data = self.data.get_mut();
-        poison::map_result(self.poison.borrow(), |_| data)
+        poison::map_result(self.poison.borrow(), |()| data)
     }
 }
 
@@ -482,13 +490,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
                 d.field("data", &&**err.get_ref());
             }
             Err(TryLockError::WouldBlock) => {
-                struct LockedPlaceholder;
-                impl fmt::Debug for LockedPlaceholder {
-                    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                        f.write_str("<locked>")
-                    }
-                }
-                d.field("data", &LockedPlaceholder);
+                d.field("data", &format_args!("<locked>"));
             }
         }
         d.field("poisoned", &self.poison.get());
@@ -498,7 +500,7 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
 
 impl<'mutex, T: ?Sized> MutexGuard<'mutex, T> {
     unsafe fn new(lock: &'mutex Mutex<T>) -> LockResult<MutexGuard<'mutex, T>> {
-        poison::map_result(lock.poison.borrow(), |guard| MutexGuard { lock, poison: guard })
+        poison::map_result(lock.poison.guard(), |guard| MutexGuard { lock, poison: guard })
     }
 }
 
@@ -524,7 +526,7 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         unsafe {
             self.lock.poison.done(&self.poison);
-            self.lock.inner.raw_unlock();
+            self.lock.inner.unlock();
         }
     }
 }
@@ -543,7 +545,7 @@ impl<T: ?Sized + fmt::Display> fmt::Display for MutexGuard<'_, T> {
     }
 }
 
-pub fn guard_lock<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a sys::MovableMutex {
+pub fn guard_lock<'a, T: ?Sized>(guard: &MutexGuard<'a, T>) -> &'a sys::Mutex {
     &guard.lock.inner
 }
 

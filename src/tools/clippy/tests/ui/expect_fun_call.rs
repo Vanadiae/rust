@@ -1,7 +1,9 @@
-// run-rustfix
-
 #![warn(clippy::expect_fun_call)]
-#![allow(clippy::to_string_in_format_args)]
+#![allow(
+    clippy::to_string_in_format_args,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_literal_unwrap
+)]
 
 /// Checks implementation of the `EXPECT_FUN_CALL` lint
 
@@ -101,4 +103,10 @@ fn main() {
         let opt_ref = &opt;
         opt_ref.expect(&format!("{:?}", opt_ref));
     }
+
+    let format_capture: Option<i32> = None;
+    format_capture.expect(&format!("{error_code}"));
+
+    let format_capture_and_value: Option<i32> = None;
+    format_capture_and_value.expect(&format!("{error_code}, {}", 1));
 }

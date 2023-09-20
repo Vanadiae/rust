@@ -1,6 +1,6 @@
-//! Functionality for ordering and comparison.
+//! Utilities for comparing and ordering values.
 //!
-//! This module contains various tools for ordering and comparing values. In
+//! This module contains various tools for comparing and ordering values. In
 //! summary:
 //!
 //! * [`Eq`] and [`PartialEq`] are traits that allow you to define total and
@@ -22,10 +22,12 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
+mod bytewise;
+pub(crate) use bytewise::BytewiseEq;
+
 use self::Ordering::*;
 
-/// Trait for equality comparisons which are [partial equivalence
-/// relations](https://en.wikipedia.org/wiki/Partial_equivalence_relation).
+/// Trait for equality comparisons.
 ///
 /// `x.eq(y)` can also be written `x == y`, and `x.ne(y)` can be written `x != y`.
 /// We use the easier-to-read infix notation in the remainder of this documentation.
@@ -33,11 +35,15 @@ use self::Ordering::*;
 /// This trait allows for partial equality, for types that do not have a full
 /// equivalence relation. For example, in floating point numbers `NaN != NaN`,
 /// so floating point types implement `PartialEq` but not [`trait@Eq`].
+/// Formally speaking, when `Rhs == Self`, this trait corresponds to a [partial equivalence
+/// relation](https://en.wikipedia.org/wiki/Partial_equivalence_relation).
 ///
 /// Implementations must ensure that `eq` and `ne` are consistent with each other:
 ///
-/// - `a != b` if and only if `!(a == b)`
-///   (ensured by the default implementation).
+/// - `a != b` if and only if `!(a == b)`.
+///
+/// The default implementation of `ne` provides this consistency and is almost
+/// always sufficient. It should not be overridden without very good reason.
 ///
 /// If [`PartialOrd`] or [`Ord`] are also implemented for `Self` and `Rhs`, their methods must also
 /// be consistent with `PartialEq` (see the documentation of those traits for the exact
@@ -57,12 +63,17 @@ use self::Ordering::*;
 /// (transitive) impls are not forced to exist, but these requirements apply
 /// whenever they do exist.
 ///
+/// Violating these requirements is a logic error. The behavior resulting from a logic error is not
+/// specified, but users of the trait must ensure that such logic errors do *not* result in
+/// undefined behavior. This means that `unsafe` code **must not** rely on the correctness of these
+/// methods.
+///
 /// ## Derivable
 ///
 /// This trait can be used with `#[derive]`. When `derive`d on structs, two
 /// instances are equal if all fields are equal, and not equal if any fields
-/// are not equal. When `derive`d on enums, each variant is equal to itself
-/// and not equal to the other variants.
+/// are not equal. When `derive`d on enums, two instances are equal if they
+/// are the same variant and all fields are equal.
 ///
 /// ## How can I implement `PartialEq`?
 ///
@@ -199,22 +210,11 @@ use self::Ordering::*;
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(alias = "==")]
 #[doc(alias = "!=")]
-#[cfg_attr(
-    bootstrap,
-    rustc_on_unimplemented(
-        message = "can't compare `{Self}` with `{Rhs}`",
-        label = "no implementation for `{Self} == {Rhs}`"
-    )
+#[rustc_on_unimplemented(
+    message = "can't compare `{Self}` with `{Rhs}`",
+    label = "no implementation for `{Self} == {Rhs}`",
+    append_const_msg
 )]
-#[cfg_attr(
-    not(bootstrap),
-    rustc_on_unimplemented(
-        message = "can't compare `{Self}` with `{Rhs}`",
-        label = "no implementation for `{Self} == {Rhs}`",
-        append_const_msg,
-    )
-)]
-#[cfg_attr(not(bootstrap), const_trait)]
 #[rustc_diagnostic_item = "PartialEq"]
 pub trait PartialEq<Rhs: ?Sized = Self> {
     /// This method tests for `self` and `other` values to be equal, and is used
@@ -223,17 +223,18 @@ pub trait PartialEq<Rhs: ?Sized = Self> {
     #[stable(feature = "rust1", since = "1.0.0")]
     fn eq(&self, other: &Rhs) -> bool;
 
-    /// This method tests for `!=`.
+    /// This method tests for `!=`. The default implementation is almost always
+    /// sufficient, and should not be overridden without very good reason.
     #[inline]
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg_attr(bootstrap, default_method_body_is_const)]
     fn ne(&self, other: &Rhs) -> bool {
         !self.eq(other)
     }
 }
 
-/// Derive macro generating an impl of the trait `PartialEq`.
+/// Derive macro generating an impl of the trait [`PartialEq`].
+/// The behavior of this macro is described in detail [here](PartialEq#derivable).
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics, structural_match)]
@@ -253,6 +254,11 @@ pub macro PartialEq($item:item) {
 ///
 /// This property cannot be checked by the compiler, and therefore `Eq` implies
 /// [`PartialEq`], and has no extra methods.
+///
+/// Violating this property is a logic error. The behavior resulting from a logic error is not
+/// specified, but users of the trait must ensure that such logic errors do *not* result in
+/// undefined behavior. This means that `unsafe` code **must not** rely on the correctness of these
+/// methods.
 ///
 /// ## Derivable
 ///
@@ -293,16 +299,19 @@ pub trait Eq: PartialEq<Self> {
     //
     // This should never be implemented by hand.
     #[doc(hidden)]
-    #[no_coverage] // rust-lang/rust#84605
+    #[cfg_attr(bootstrap, no_coverage)] // rust-lang/rust#84605
+    #[cfg_attr(not(bootstrap), coverage(off))] //
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn assert_receiver_is_total_eq(&self) {}
 }
 
-/// Derive macro generating an impl of the trait `Eq`.
+/// Derive macro generating an impl of the trait [`Eq`].
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
-#[allow_internal_unstable(core_intrinsics, derive_eq, structural_match, no_coverage)]
+#[allow_internal_unstable(core_intrinsics, derive_eq, structural_match)]
+#[cfg_attr(bootstrap, allow_internal_unstable(no_coverage))]
+#[cfg_attr(not(bootstrap), allow_internal_unstable(coverage_attribute))]
 pub macro Eq($item:item) {
     /* compiler built-in */
 }
@@ -325,16 +334,13 @@ pub struct AssertParamIsEq<T: Eq + ?Sized> {
 /// ```
 /// use std::cmp::Ordering;
 ///
-/// let result = 1.cmp(&2);
-/// assert_eq!(Ordering::Less, result);
+/// assert_eq!(1.cmp(&2), Ordering::Less);
 ///
-/// let result = 1.cmp(&1);
-/// assert_eq!(Ordering::Equal, result);
+/// assert_eq!(1.cmp(&1), Ordering::Equal);
 ///
-/// let result = 2.cmp(&1);
-/// assert_eq!(Ordering::Greater, result);
+/// assert_eq!(2.cmp(&1), Ordering::Greater);
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 #[stable(feature = "rust1", since = "1.0.0")]
 #[repr(i8)]
 pub enum Ordering {
@@ -663,6 +669,11 @@ impl<T: Clone> Clone for Reverse<T> {
 /// It's easy to accidentally make `cmp` and `partial_cmp` disagree by
 /// deriving some of the traits and manually implementing others.
 ///
+/// Violating these requirements is a logic error. The behavior resulting from a logic error is not
+/// specified, but users of the trait must ensure that such logic errors do *not* result in
+/// undefined behavior. This means that `unsafe` code **must not** rely on the correctness of these
+/// methods.
+///
 /// ## Corollaries
 ///
 /// From the above and the requirements of `PartialOrd`, it follows that `<` defines a strict total order.
@@ -788,8 +799,8 @@ pub trait Ord: Eq + PartialOrd<Self> {
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(2, 1.max(2));
-    /// assert_eq!(2, 2.max(2));
+    /// assert_eq!(1.max(2), 2);
+    /// assert_eq!(2.max(2), 2);
     /// ```
     #[stable(feature = "ord_max_min", since = "1.21.0")]
     #[inline]
@@ -808,8 +819,8 @@ pub trait Ord: Eq + PartialOrd<Self> {
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(1, 1.min(2));
-    /// assert_eq!(2, 2.min(2));
+    /// assert_eq!(1.min(2), 1);
+    /// assert_eq!(2.min(2), 2);
     /// ```
     #[stable(feature = "ord_max_min", since = "1.21.0")]
     #[inline]
@@ -833,15 +844,16 @@ pub trait Ord: Eq + PartialOrd<Self> {
     /// # Examples
     ///
     /// ```
-    /// assert!((-3).clamp(-2, 1) == -2);
-    /// assert!(0.clamp(-2, 1) == 0);
-    /// assert!(2.clamp(-2, 1) == 1);
+    /// assert_eq!((-3).clamp(-2, 1), -2);
+    /// assert_eq!(0.clamp(-2, 1), 0);
+    /// assert_eq!(2.clamp(-2, 1), 1);
     /// ```
     #[must_use]
     #[stable(feature = "clamp", since = "1.50.0")]
     fn clamp(self, min: Self, max: Self) -> Self
     where
         Self: Sized,
+        Self: PartialOrd,
     {
         assert!(min <= max);
         if self < min {
@@ -854,28 +866,13 @@ pub trait Ord: Eq + PartialOrd<Self> {
     }
 }
 
-/// Derive macro generating an impl of the trait `Ord`.
+/// Derive macro generating an impl of the trait [`Ord`].
+/// The behavior of this macro is described in detail [here](Ord#derivable).
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics)]
 pub macro Ord($item:item) {
     /* compiler built-in */
-}
-
-#[stable(feature = "rust1", since = "1.0.0")]
-impl Ord for Ordering {
-    #[inline]
-    fn cmp(&self, other: &Ordering) -> Ordering {
-        (*self as i32).cmp(&(*other as i32))
-    }
-}
-
-#[stable(feature = "rust1", since = "1.0.0")]
-impl PartialOrd for Ordering {
-    #[inline]
-    fn partial_cmp(&self, other: &Ordering) -> Option<Ordering> {
-        (*self as i32).partial_cmp(&(*other as i32))
-    }
 }
 
 /// Trait for types that form a [partial order](https://en.wikipedia.org/wiki/Partial_order).
@@ -909,6 +906,11 @@ impl PartialOrd for Ordering {
 /// Note that these requirements mean that the trait itself must be implemented symmetrically and
 /// transitively: if `T: PartialOrd<U>` and `U: PartialOrd<V>` then `U: PartialOrd<T>` and `T:
 /// PartialOrd<V>`.
+///
+/// Violating these requirements is a logic error. The behavior resulting from a logic error is not
+/// specified, but users of the trait must ensure that such logic errors do *not* result in
+/// undefined behavior. This means that `unsafe` code **must not** rely on the correctness of these
+/// methods.
 ///
 /// ## Corollaries
 ///
@@ -1039,22 +1041,11 @@ impl PartialOrd for Ordering {
 #[doc(alias = "<")]
 #[doc(alias = "<=")]
 #[doc(alias = ">=")]
-#[cfg_attr(
-    bootstrap,
-    rustc_on_unimplemented(
-        message = "can't compare `{Self}` with `{Rhs}`",
-        label = "no implementation for `{Self} < {Rhs}` and `{Self} > {Rhs}`",
-    )
+#[rustc_on_unimplemented(
+    message = "can't compare `{Self}` with `{Rhs}`",
+    label = "no implementation for `{Self} < {Rhs}` and `{Self} > {Rhs}`",
+    append_const_msg
 )]
-#[cfg_attr(
-    not(bootstrap),
-    rustc_on_unimplemented(
-        message = "can't compare `{Self}` with `{Rhs}`",
-        label = "no implementation for `{Self} < {Rhs}` and `{Self} > {Rhs}`",
-        append_const_msg,
-    )
-)]
-#[cfg_attr(not(bootstrap), const_trait)]
 #[rustc_diagnostic_item = "PartialOrd"]
 pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
     /// This method returns an ordering between `self` and `other` values if one exists.
@@ -1089,16 +1080,13 @@ pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
     /// # Examples
     ///
     /// ```
-    /// let result = 1.0 < 2.0;
-    /// assert_eq!(result, true);
-    ///
-    /// let result = 2.0 < 1.0;
-    /// assert_eq!(result, false);
+    /// assert_eq!(1.0 < 1.0, false);
+    /// assert_eq!(1.0 < 2.0, true);
+    /// assert_eq!(2.0 < 1.0, false);
     /// ```
     #[inline]
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg_attr(bootstrap, default_method_body_is_const)]
     fn lt(&self, other: &Rhs) -> bool {
         matches!(self.partial_cmp(other), Some(Less))
     }
@@ -1109,22 +1097,15 @@ pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
     /// # Examples
     ///
     /// ```
-    /// let result = 1.0 <= 2.0;
-    /// assert_eq!(result, true);
-    ///
-    /// let result = 2.0 <= 2.0;
-    /// assert_eq!(result, true);
+    /// assert_eq!(1.0 <= 1.0, true);
+    /// assert_eq!(1.0 <= 2.0, true);
+    /// assert_eq!(2.0 <= 1.0, false);
     /// ```
     #[inline]
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg_attr(bootstrap, default_method_body_is_const)]
     fn le(&self, other: &Rhs) -> bool {
-        // Pattern `Some(Less | Eq)` optimizes worse than negating `None | Some(Greater)`.
-        // FIXME: The root cause was fixed upstream in LLVM with:
-        // https://github.com/llvm/llvm-project/commit/9bad7de9a3fb844f1ca2965f35d0c2a3d1e11775
-        // Revert this workaround once support for LLVM 12 gets dropped.
-        !matches!(self.partial_cmp(other), None | Some(Greater))
+        matches!(self.partial_cmp(other), Some(Less | Equal))
     }
 
     /// This method tests greater than (for `self` and `other`) and is used by the `>` operator.
@@ -1132,16 +1113,13 @@ pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
     /// # Examples
     ///
     /// ```
-    /// let result = 1.0 > 2.0;
-    /// assert_eq!(result, false);
-    ///
-    /// let result = 2.0 > 2.0;
-    /// assert_eq!(result, false);
+    /// assert_eq!(1.0 > 1.0, false);
+    /// assert_eq!(1.0 > 2.0, false);
+    /// assert_eq!(2.0 > 1.0, true);
     /// ```
     #[inline]
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg_attr(bootstrap, default_method_body_is_const)]
     fn gt(&self, other: &Rhs) -> bool {
         matches!(self.partial_cmp(other), Some(Greater))
     }
@@ -1152,22 +1130,20 @@ pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
     /// # Examples
     ///
     /// ```
-    /// let result = 2.0 >= 1.0;
-    /// assert_eq!(result, true);
-    ///
-    /// let result = 2.0 >= 2.0;
-    /// assert_eq!(result, true);
+    /// assert_eq!(1.0 >= 1.0, true);
+    /// assert_eq!(1.0 >= 2.0, false);
+    /// assert_eq!(2.0 >= 1.0, true);
     /// ```
     #[inline]
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg_attr(bootstrap, default_method_body_is_const)]
     fn ge(&self, other: &Rhs) -> bool {
         matches!(self.partial_cmp(other), Some(Greater | Equal))
     }
 }
 
-/// Derive macro generating an impl of the trait `PartialOrd`.
+/// Derive macro generating an impl of the trait [`PartialOrd`].
+/// The behavior of this macro is described in detail [here](PartialOrd#derivable).
 #[rustc_builtin_macro]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics)]
@@ -1186,8 +1162,8 @@ pub macro PartialOrd($item:item) {
 /// ```
 /// use std::cmp;
 ///
-/// assert_eq!(1, cmp::min(1, 2));
-/// assert_eq!(2, cmp::min(2, 2));
+/// assert_eq!(cmp::min(1, 2), 1);
+/// assert_eq!(cmp::min(2, 2), 2);
 /// ```
 #[inline]
 #[must_use]
@@ -1206,8 +1182,11 @@ pub fn min<T: Ord>(v1: T, v2: T) -> T {
 /// ```
 /// use std::cmp;
 ///
-/// assert_eq!(cmp::min_by(-2, 1, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), 1);
-/// assert_eq!(cmp::min_by(-2, 2, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), -2);
+/// let result = cmp::min_by(-2, 1, |x: &i32, y: &i32| x.abs().cmp(&y.abs()));
+/// assert_eq!(result, 1);
+///
+/// let result = cmp::min_by(-2, 3, |x: &i32, y: &i32| x.abs().cmp(&y.abs()));
+/// assert_eq!(result, -2);
 /// ```
 #[inline]
 #[must_use]
@@ -1228,8 +1207,11 @@ pub fn min_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
 /// ```
 /// use std::cmp;
 ///
-/// assert_eq!(cmp::min_by_key(-2, 1, |x: &i32| x.abs()), 1);
-/// assert_eq!(cmp::min_by_key(-2, 2, |x: &i32| x.abs()), -2);
+/// let result = cmp::min_by_key(-2, 1, |x: &i32| x.abs());
+/// assert_eq!(result, 1);
+///
+/// let result = cmp::min_by_key(-2, 2, |x: &i32| x.abs());
+/// assert_eq!(result, -2);
 /// ```
 #[inline]
 #[must_use]
@@ -1249,8 +1231,8 @@ pub fn min_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
 /// ```
 /// use std::cmp;
 ///
-/// assert_eq!(2, cmp::max(1, 2));
-/// assert_eq!(2, cmp::max(2, 2));
+/// assert_eq!(cmp::max(1, 2), 2);
+/// assert_eq!(cmp::max(2, 2), 2);
 /// ```
 #[inline]
 #[must_use]
@@ -1269,8 +1251,11 @@ pub fn max<T: Ord>(v1: T, v2: T) -> T {
 /// ```
 /// use std::cmp;
 ///
-/// assert_eq!(cmp::max_by(-2, 1, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), -2);
-/// assert_eq!(cmp::max_by(-2, 2, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), 2);
+/// let result = cmp::max_by(-2, 1, |x: &i32, y: &i32| x.abs().cmp(&y.abs()));
+/// assert_eq!(result, -2);
+///
+/// let result = cmp::max_by(-2, 2, |x: &i32, y: &i32| x.abs().cmp(&y.abs())) ;
+/// assert_eq!(result, 2);
 /// ```
 #[inline]
 #[must_use]
@@ -1291,14 +1276,102 @@ pub fn max_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
 /// ```
 /// use std::cmp;
 ///
-/// assert_eq!(cmp::max_by_key(-2, 1, |x: &i32| x.abs()), -2);
-/// assert_eq!(cmp::max_by_key(-2, 2, |x: &i32| x.abs()), 2);
+/// let result = cmp::max_by_key(-2, 1, |x: &i32| x.abs());
+/// assert_eq!(result, -2);
+///
+/// let result = cmp::max_by_key(-2, 2, |x: &i32| x.abs());
+/// assert_eq!(result, 2);
 /// ```
 #[inline]
 #[must_use]
 #[stable(feature = "cmp_min_max_by", since = "1.53.0")]
 pub fn max_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
     max_by(v1, v2, |v1, v2| f(v1).cmp(&f(v2)))
+}
+
+/// Compares and sorts two values, returning minimum and maximum.
+///
+/// Returns `[v1, v2]` if the comparison determines them to be equal.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(cmp_minmax)]
+/// use std::cmp;
+///
+/// assert_eq!(cmp::minmax(1, 2), [1, 2]);
+/// assert_eq!(cmp::minmax(2, 2), [2, 2]);
+///
+/// // You can destructure the result using array patterns
+/// let [min, max] = cmp::minmax(42, 17);
+/// assert_eq!(min, 17);
+/// assert_eq!(max, 42);
+/// ```
+#[inline]
+#[must_use]
+#[unstable(feature = "cmp_minmax", issue = "115939")]
+pub fn minmax<T>(v1: T, v2: T) -> [T; 2]
+where
+    T: Ord,
+{
+    if v1 <= v2 { [v1, v2] } else { [v2, v1] }
+}
+
+/// Returns minimum and maximum values with respect to the specified comparison function.
+///
+/// Returns `[v1, v2]` if the comparison determines them to be equal.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(cmp_minmax)]
+/// use std::cmp;
+///
+/// assert_eq!(cmp::minmax_by(-2, 1, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), [1, -2]);
+/// assert_eq!(cmp::minmax_by(-2, 2, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), [-2, 2]);
+///
+/// // You can destructure the result using array patterns
+/// let [min, max] = cmp::minmax_by(-42, 17, |x: &i32, y: &i32| x.abs().cmp(&y.abs()));
+/// assert_eq!(min, 17);
+/// assert_eq!(max, -42);
+/// ```
+#[inline]
+#[must_use]
+#[unstable(feature = "cmp_minmax", issue = "115939")]
+pub fn minmax_by<T, F>(v1: T, v2: T, compare: F) -> [T; 2]
+where
+    F: FnOnce(&T, &T) -> Ordering,
+{
+    if compare(&v1, &v2).is_le() { [v1, v2] } else { [v2, v1] }
+}
+
+/// Returns minimum and maximum values with respect to the specified key function.
+///
+/// Returns `[v1, v2]` if the comparison determines them to be equal.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(cmp_minmax)]
+/// use std::cmp;
+///
+/// assert_eq!(cmp::minmax_by_key(-2, 1, |x: &i32| x.abs()), [1, -2]);
+/// assert_eq!(cmp::minmax_by_key(-2, 2, |x: &i32| x.abs()), [-2, 2]);
+///
+/// // You can destructure the result using array patterns
+/// let [min, max] = cmp::minmax_by_key(-42, 17, |x: &i32| x.abs());
+/// assert_eq!(min, 17);
+/// assert_eq!(max, -42);
+/// ```
+#[inline]
+#[must_use]
+#[unstable(feature = "cmp_minmax", issue = "115939")]
+pub fn minmax_by_key<T, F, K>(v1: T, v2: T, mut f: F) -> [T; 2]
+where
+    F: FnMut(&T) -> K,
+    K: Ord,
+{
+    minmax_by(v1, v2, |v1, v2| f(v1).cmp(&f(v2)))
 }
 
 // Implementation of PartialEq, Eq, PartialOrd and Ord for primitive types
@@ -1349,20 +1422,20 @@ mod impls {
             impl PartialOrd for $t {
                 #[inline]
                 fn partial_cmp(&self, other: &$t) -> Option<Ordering> {
-                    match (self <= other, self >= other) {
+                    match (*self <= *other, *self >= *other) {
                         (false, false) => None,
                         (false, true) => Some(Greater),
                         (true, false) => Some(Less),
                         (true, true) => Some(Equal),
                     }
                 }
-                #[inline]
+                #[inline(always)]
                 fn lt(&self, other: &$t) -> bool { (*self) < (*other) }
-                #[inline]
+                #[inline(always)]
                 fn le(&self, other: &$t) -> bool { (*self) <= (*other) }
-                #[inline]
+                #[inline(always)]
                 fn ge(&self, other: &$t) -> bool { (*self) >= (*other) }
-                #[inline]
+                #[inline(always)]
                 fn gt(&self, other: &$t) -> bool { (*self) > (*other) }
             }
         )*)
@@ -1394,13 +1467,13 @@ mod impls {
                 fn partial_cmp(&self, other: &$t) -> Option<Ordering> {
                     Some(self.cmp(other))
                 }
-                #[inline]
+                #[inline(always)]
                 fn lt(&self, other: &$t) -> bool { (*self) < (*other) }
-                #[inline]
+                #[inline(always)]
                 fn le(&self, other: &$t) -> bool { (*self) <= (*other) }
-                #[inline]
+                #[inline(always)]
                 fn ge(&self, other: &$t) -> bool { (*self) >= (*other) }
-                #[inline]
+                #[inline(always)]
                 fn gt(&self, other: &$t) -> bool { (*self) > (*other) }
             }
 
@@ -1441,12 +1514,29 @@ mod impls {
                 _ => unsafe { unreachable_unchecked() },
             }
         }
+
+        #[inline]
+        fn min(self, other: bool) -> bool {
+            self & other
+        }
+
+        #[inline]
+        fn max(self, other: bool) -> bool {
+            self | other
+        }
+
+        #[inline]
+        fn clamp(self, min: bool, max: bool) -> bool {
+            assert!(min <= max);
+            self.max(min).min(max)
+        }
     }
 
     ord_impl! { char usize u8 u16 u32 u64 u128 isize i8 i16 i32 i64 i128 }
 
     #[unstable(feature = "never_type", issue = "35121")]
     impl PartialEq for ! {
+        #[inline]
         fn eq(&self, _: &!) -> bool {
             *self
         }
@@ -1457,6 +1547,7 @@ mod impls {
 
     #[unstable(feature = "never_type", issue = "35121")]
     impl PartialOrd for ! {
+        #[inline]
         fn partial_cmp(&self, _: &!) -> Option<Ordering> {
             *self
         }
@@ -1464,6 +1555,7 @@ mod impls {
 
     #[unstable(feature = "never_type", issue = "35121")]
     impl Ord for ! {
+        #[inline]
         fn cmp(&self, _: &!) -> Ordering {
             *self
         }

@@ -1,4 +1,5 @@
-use clippy_utils::{diagnostics::span_lint_and_sugg, peel_blocks};
+use clippy_utils::diagnostics::span_lint_and_sugg;
+use clippy_utils::peel_blocks;
 use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir::{Body, ExprKind, Impl, ImplItemKind, Item, ItemKind, Node};
@@ -26,7 +27,7 @@ declare_clippy_lint! {
     /// ```rust
     /// struct S;
     /// ```
-    #[clippy::version = "1.61.0"]
+    #[clippy::version = "1.62.0"]
     pub EMPTY_DROP,
     restriction,
     "empty `Drop` implementations"

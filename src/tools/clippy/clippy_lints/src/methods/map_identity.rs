@@ -4,7 +4,8 @@ use clippy_utils::{is_expr_identity_function, is_trait_method};
 use rustc_errors::Applicability;
 use rustc_hir as hir;
 use rustc_lint::LateContext;
-use rustc_span::{source_map::Span, sym};
+use rustc_span::source_map::Span;
+use rustc_span::sym;
 
 use super::MAP_IDENTITY;
 
@@ -30,7 +31,7 @@ pub(super) fn check(
                 MAP_IDENTITY,
                 sugg_span,
                 "unnecessary map of the identity function",
-                &format!("remove the call to `{}`", name),
+                &format!("remove the call to `{name}`"),
                 String::new(),
                 Applicability::MachineApplicable,
             )

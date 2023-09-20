@@ -1,4 +1,4 @@
-//! Constants specific to the `f64` double-precision floating point type.
+//! Constants for the `f64` double-precision floating point type.
 //!
 //! *[See also the `f64` primitive type][f64].*
 //!
@@ -277,6 +277,14 @@ pub mod consts {
     #[stable(feature = "tau_constant", since = "1.47.0")]
     pub const TAU: f64 = 6.28318530717958647692528676655900577_f64;
 
+    /// The golden ratio (φ)
+    #[unstable(feature = "more_float_constants", issue = "103883")]
+    pub const PHI: f64 = 1.618033988749894848204586834365638118_f64;
+
+    /// The Euler-Mascheroni constant (γ)
+    #[unstable(feature = "more_float_constants", issue = "103883")]
+    pub const EGAMMA: f64 = 0.577215664901532860606512090082402431_f64;
+
     /// π/2
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const FRAC_PI_2: f64 = 1.57079632679489661923132169163975144_f64;
@@ -301,6 +309,10 @@ pub mod consts {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const FRAC_1_PI: f64 = 0.318309886183790671537767526745028724_f64;
 
+    /// 1/sqrt(π)
+    #[unstable(feature = "more_float_constants", issue = "103883")]
+    pub const FRAC_1_SQRT_PI: f64 = 0.564189583547756286948079451560772586_f64;
+
     /// 2/π
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const FRAC_2_PI: f64 = 0.636619772367581343075535053490057448_f64;
@@ -316,6 +328,14 @@ pub mod consts {
     /// 1/sqrt(2)
     #[stable(feature = "rust1", since = "1.0.0")]
     pub const FRAC_1_SQRT_2: f64 = 0.707106781186547524400844362104849039_f64;
+
+    /// sqrt(3)
+    #[unstable(feature = "more_float_constants", issue = "103883")]
+    pub const SQRT_3: f64 = 1.732050807568877293527446341505872367_f64;
+
+    /// 1/sqrt(3)
+    #[unstable(feature = "more_float_constants", issue = "103883")]
+    pub const FRAC_1_SQRT_3: f64 = 0.577350269189625764509148780501957456_f64;
 
     /// Euler's number (e)
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -393,7 +413,7 @@ impl f64 {
 
     /// Not a Number (NaN).
     ///
-    /// Note that IEEE-745 doesn't define just a single NaN value;
+    /// Note that IEEE 754 doesn't define just a single NaN value;
     /// a plethora of bit patterns are considered to be NaN.
     /// Furthermore, the standard makes a difference
     /// between a "signaling" and a "quiet" NaN,
@@ -401,6 +421,7 @@ impl f64 {
     /// This constant isn't guaranteed to equal to any specific NaN bitpattern,
     /// and the stability of its representation over Rust versions
     /// and target platforms isn't guaranteed.
+    #[rustc_diagnostic_item = "f64_nan"]
     #[stable(feature = "assoc_int_consts", since = "1.43.0")]
     pub const NAN: f64 = 0.0_f64 / 0.0_f64;
     /// Infinity (∞).
@@ -427,7 +448,7 @@ impl f64 {
         self != self
     }
 
-    // FIXME(#50145): `abs` is publicly unavailable in libcore due to
+    // FIXME(#50145): `abs` is publicly unavailable in core due to
     // concerns about portability, so this implementation is for
     // private use internally.
     #[inline]
@@ -624,7 +645,7 @@ impl f64 {
     }
 
     /// Returns `true` if `self` has a positive sign, including `+0.0`, NaNs with
-    /// positive sign bit and positive infinity. Note that IEEE-745 doesn't assign any
+    /// positive sign bit and positive infinity. Note that IEEE 754 doesn't assign any
     /// meaning to the sign bit in case of a NaN, and as Rust doesn't guarantee that
     /// the bit pattern of NaNs are conserved over arithmetic operations, the result of
     /// `is_sign_positive` on a NaN might produce an unexpected result in some cases.
@@ -655,7 +676,7 @@ impl f64 {
     }
 
     /// Returns `true` if `self` has a negative sign, including `-0.0`, NaNs with
-    /// negative sign bit and negative infinity. Note that IEEE-745 doesn't assign any
+    /// negative sign bit and negative infinity. Note that IEEE 754 doesn't assign any
     /// meaning to the sign bit in case of a NaN, and as Rust doesn't guarantee that
     /// the bit pattern of NaNs are conserved over arithmetic operations, the result of
     /// `is_sign_negative` on a NaN might produce an unexpected result in some cases.
@@ -686,6 +707,106 @@ impl f64 {
     #[doc(hidden)]
     pub fn is_negative(self) -> bool {
         self.is_sign_negative()
+    }
+
+    /// Returns the least number greater than `self`.
+    ///
+    /// Let `TINY` be the smallest representable positive `f64`. Then,
+    ///  - if `self.is_nan()`, this returns `self`;
+    ///  - if `self` is [`NEG_INFINITY`], this returns [`MIN`];
+    ///  - if `self` is `-TINY`, this returns -0.0;
+    ///  - if `self` is -0.0 or +0.0, this returns `TINY`;
+    ///  - if `self` is [`MAX`] or [`INFINITY`], this returns [`INFINITY`];
+    ///  - otherwise the unique least value greater than `self` is returned.
+    ///
+    /// The identity `x.next_up() == -(-x).next_down()` holds for all non-NaN `x`. When `x`
+    /// is finite `x == x.next_up().next_down()` also holds.
+    ///
+    /// ```rust
+    /// #![feature(float_next_up_down)]
+    /// // f64::EPSILON is the difference between 1.0 and the next number up.
+    /// assert_eq!(1.0f64.next_up(), 1.0 + f64::EPSILON);
+    /// // But not for most numbers.
+    /// assert!(0.1f64.next_up() < 0.1 + f64::EPSILON);
+    /// assert_eq!(9007199254740992f64.next_up(), 9007199254740994.0);
+    /// ```
+    ///
+    /// [`NEG_INFINITY`]: Self::NEG_INFINITY
+    /// [`INFINITY`]: Self::INFINITY
+    /// [`MIN`]: Self::MIN
+    /// [`MAX`]: Self::MAX
+    #[unstable(feature = "float_next_up_down", issue = "91399")]
+    #[rustc_const_unstable(feature = "float_next_up_down", issue = "91399")]
+    pub const fn next_up(self) -> Self {
+        // We must use strictly integer arithmetic to prevent denormals from
+        // flushing to zero after an arithmetic operation on some platforms.
+        const TINY_BITS: u64 = 0x1; // Smallest positive f64.
+        const CLEAR_SIGN_MASK: u64 = 0x7fff_ffff_ffff_ffff;
+
+        let bits = self.to_bits();
+        if self.is_nan() || bits == Self::INFINITY.to_bits() {
+            return self;
+        }
+
+        let abs = bits & CLEAR_SIGN_MASK;
+        let next_bits = if abs == 0 {
+            TINY_BITS
+        } else if bits == abs {
+            bits + 1
+        } else {
+            bits - 1
+        };
+        Self::from_bits(next_bits)
+    }
+
+    /// Returns the greatest number less than `self`.
+    ///
+    /// Let `TINY` be the smallest representable positive `f64`. Then,
+    ///  - if `self.is_nan()`, this returns `self`;
+    ///  - if `self` is [`INFINITY`], this returns [`MAX`];
+    ///  - if `self` is `TINY`, this returns 0.0;
+    ///  - if `self` is -0.0 or +0.0, this returns `-TINY`;
+    ///  - if `self` is [`MIN`] or [`NEG_INFINITY`], this returns [`NEG_INFINITY`];
+    ///  - otherwise the unique greatest value less than `self` is returned.
+    ///
+    /// The identity `x.next_down() == -(-x).next_up()` holds for all non-NaN `x`. When `x`
+    /// is finite `x == x.next_down().next_up()` also holds.
+    ///
+    /// ```rust
+    /// #![feature(float_next_up_down)]
+    /// let x = 1.0f64;
+    /// // Clamp value into range [0, 1).
+    /// let clamped = x.clamp(0.0, 1.0f64.next_down());
+    /// assert!(clamped < 1.0);
+    /// assert_eq!(clamped.next_up(), 1.0);
+    /// ```
+    ///
+    /// [`NEG_INFINITY`]: Self::NEG_INFINITY
+    /// [`INFINITY`]: Self::INFINITY
+    /// [`MIN`]: Self::MIN
+    /// [`MAX`]: Self::MAX
+    #[unstable(feature = "float_next_up_down", issue = "91399")]
+    #[rustc_const_unstable(feature = "float_next_up_down", issue = "91399")]
+    pub const fn next_down(self) -> Self {
+        // We must use strictly integer arithmetic to prevent denormals from
+        // flushing to zero after an arithmetic operation on some platforms.
+        const NEG_TINY_BITS: u64 = 0x8000_0000_0000_0001; // Smallest (in magnitude) negative f64.
+        const CLEAR_SIGN_MASK: u64 = 0x7fff_ffff_ffff_ffff;
+
+        let bits = self.to_bits();
+        if self.is_nan() || bits == Self::NEG_INFINITY.to_bits() {
+            return self;
+        }
+
+        let abs = bits & CLEAR_SIGN_MASK;
+        let next_bits = if abs == 0 {
+            NEG_TINY_BITS
+        } else if bits == abs {
+            bits - 1
+        } else {
+            bits + 1
+        };
+        Self::from_bits(next_bits)
     }
 
     /// Takes the reciprocal (inverse) of a number, `1/x`.
@@ -744,7 +865,7 @@ impl f64 {
     /// Returns the maximum of the two numbers, ignoring NaN.
     ///
     /// If one of the arguments is NaN, then the other argument is returned.
-    /// This follows the IEEE-754 2008 semantics for maxNum, except for handling of signaling NaNs;
+    /// This follows the IEEE 754-2008 semantics for maxNum, except for handling of signaling NaNs;
     /// this function handles all NaNs the same way and avoids maxNum's problems with associativity.
     /// This also matches the behavior of libm’s fmax.
     ///
@@ -764,7 +885,7 @@ impl f64 {
     /// Returns the minimum of the two numbers, ignoring NaN.
     ///
     /// If one of the arguments is NaN, then the other argument is returned.
-    /// This follows the IEEE-754 2008 semantics for minNum, except for handling of signaling NaNs;
+    /// This follows the IEEE 754-2008 semantics for minNum, except for handling of signaling NaNs;
     /// this function handles all NaNs the same way and avoids minNum's problems with associativity.
     /// This also matches the behavior of libm’s fmin.
     ///
@@ -847,7 +968,44 @@ impl f64 {
         } else if self == other {
             if self.is_sign_negative() && other.is_sign_positive() { self } else { other }
         } else {
+            // At least one input is NaN. Use `+` to perform NaN propagation and quieting.
             self + other
+        }
+    }
+
+    /// Calculates the middle point of `self` and `rhs`.
+    ///
+    /// This returns NaN when *either* argument is NaN or if a combination of
+    /// +inf and -inf is provided as arguments.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(num_midpoint)]
+    /// assert_eq!(1f64.midpoint(4.0), 2.5);
+    /// assert_eq!((-5.5f64).midpoint(8.0), 1.25);
+    /// ```
+    #[unstable(feature = "num_midpoint", issue = "110840")]
+    pub fn midpoint(self, other: f64) -> f64 {
+        const LO: f64 = f64::MIN_POSITIVE * 2.;
+        const HI: f64 = f64::MAX / 2.;
+
+        let (a, b) = (self, other);
+        let abs_a = a.abs_private();
+        let abs_b = b.abs_private();
+
+        if abs_a <= HI && abs_b <= HI {
+            // Overflow is impossible
+            (a + b) / 2.
+        } else if abs_a < LO {
+            // Not safe to halve a
+            a + (b / 2.)
+        } else if abs_b < LO {
+            // Not safe to halve b
+            (a / 2.) + b
+        } else {
+            // Not safe to halve a and b
+            (a / 2.) + (b / 2.)
         }
     }
 
@@ -926,10 +1084,14 @@ impl f64 {
                 }
             }
         }
-        // SAFETY: `u64` is a plain old datatype so we can always... uh...
-        // ...look, just pretend you forgot what you just read.
-        // Stability concerns.
-        let rt_f64_to_u64 = |rt| unsafe { mem::transmute::<f64, u64>(rt) };
+
+        #[inline(always)] // See https://github.com/rust-lang/compiler-builtins/issues/491
+        fn rt_f64_to_u64(rt: f64) -> u64 {
+            // SAFETY: `u64` is a plain old datatype so we can always... uh...
+            // ...look, just pretend you forgot what you just read.
+            // Stability concerns.
+            unsafe { mem::transmute::<f64, u64>(rt) }
+        }
         // SAFETY: We use internal implementations that either always work or fail at compile time.
         unsafe { intrinsics::const_eval_select((self,), ct_f64_to_u64, rt_f64_to_u64) }
     }
@@ -940,9 +1102,9 @@ impl f64 {
     /// It turns out this is incredibly portable, for two reasons:
     ///
     /// * Floats and Ints have the same endianness on all supported platforms.
-    /// * IEEE-754 very precisely specifies the bit layout of floats.
+    /// * IEEE 754 very precisely specifies the bit layout of floats.
     ///
-    /// However there is one caveat: prior to the 2008 version of IEEE-754, how
+    /// However there is one caveat: prior to the 2008 version of IEEE 754, how
     /// to interpret the NaN signaling bit wasn't actually specified. Most platforms
     /// (notably x86 and ARM) picked the interpretation that was ultimately
     /// standardized in 2008, but some didn't (notably MIPS). As a result, all
@@ -1019,10 +1181,14 @@ impl f64 {
                 }
             }
         }
-        // SAFETY: `u64` is a plain old datatype so we can always... uh...
-        // ...look, just pretend you forgot what you just read.
-        // Stability concerns.
-        let rt_u64_to_f64 = |rt| unsafe { mem::transmute::<u64, f64>(rt) };
+
+        #[inline(always)] // See https://github.com/rust-lang/compiler-builtins/issues/491
+        fn rt_u64_to_f64(rt: u64) -> f64 {
+            // SAFETY: `u64` is a plain old datatype so we can always... uh...
+            // ...look, just pretend you forgot what you just read.
+            // Stability concerns.
+            unsafe { mem::transmute::<u64, f64>(rt) }
+        }
         // SAFETY: We use internal implementations that either always work or fail at compile time.
         unsafe { intrinsics::const_eval_select((v,), ct_u64_to_f64, rt_u64_to_f64) }
     }
@@ -1280,15 +1446,14 @@ impl f64 {
     #[must_use = "method returns a new number and does not mutate the original value"]
     #[stable(feature = "clamp", since = "1.50.0")]
     #[inline]
-    pub fn clamp(self, min: f64, max: f64) -> f64 {
-        assert!(min <= max);
-        let mut x = self;
-        if x < min {
-            x = min;
+    pub fn clamp(mut self, min: f64, max: f64) -> f64 {
+        assert!(min <= max, "min > max, or either was NaN. min = {min:?}, max = {max:?}");
+        if self < min {
+            self = min;
         }
-        if x > max {
-            x = max;
+        if self > max {
+            self = max;
         }
-        x
+        self
     }
 }

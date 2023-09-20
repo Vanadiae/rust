@@ -24,8 +24,8 @@ pub(super) fn check<'tcx>(
                 "transmute from a pointer to a pointer",
                 |diag| {
                     if let Some(arg) = sugg::Sugg::hir_opt(cx, arg) {
-                        let sugg = arg.as_ty(cx.tcx.mk_ptr(*to_ty));
-                        diag.span_suggestion(e.span, "try", sugg.to_string(), Applicability::Unspecified);
+                        let sugg = arg.as_ty(Ty::new_ptr(cx.tcx, *to_ty));
+                        diag.span_suggestion(e.span, "try", sugg, Applicability::Unspecified);
                     }
                 },
             );

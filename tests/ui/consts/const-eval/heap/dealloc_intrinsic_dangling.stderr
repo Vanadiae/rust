@@ -1,0 +1,15 @@
+error[E0080]: evaluation of constant value failed
+  --> $DIR/dealloc_intrinsic_dangling.rs:10:5
+   |
+LL |     &*ptr
+   |     ^^^^^ dereferencing pointer failed: alloc2 has been freed, so this pointer is dangling
+
+error[E0080]: evaluation of constant value failed
+  --> $DIR/dealloc_intrinsic_dangling.rs:18:5
+   |
+LL |     *reference
+   |     ^^^^^^^^^^ dereferencing pointer failed: alloc4 has been freed, so this pointer is dangling
+
+error: aborting due to 2 previous errors
+
+For more information about this error, try `rustc --explain E0080`.

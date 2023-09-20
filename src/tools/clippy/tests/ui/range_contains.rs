@@ -1,10 +1,11 @@
-// run-rustfix
+#![warn(clippy::manual_range_contains)]
+#![allow(unused)]
+#![allow(clippy::no_effect)]
+#![allow(clippy::short_circuit_statement)]
+#![allow(clippy::unnecessary_operation)]
+#![allow(clippy::impossible_comparisons)]
+#![allow(clippy::redundant_comparisons)]
 
-#[warn(clippy::manual_range_contains)]
-#[allow(unused)]
-#[allow(clippy::no_effect)]
-#[allow(clippy::short_circuit_statement)]
-#[allow(clippy::unnecessary_operation)]
 fn main() {
     let x = 9_i32;
 
@@ -49,9 +50,28 @@ fn main() {
     x >= 10 && x <= -10;
     y >= -3. && y <= 3.;
     y >= 3. && y <= -3.;
+
+    // Fix #8745
+    let z = 42;
+    (x >= 0) && (x <= 10) && (z >= 0) && (z <= 10);
+    (x < 0) || (x >= 10) || (z < 0) || (z >= 10);
+    // Make sure operators in parens don't give a breaking suggestion
+    ((x % 2 == 0) || (x < 0)) || (x >= 10);
 }
 
 // Fix #6373
 pub const fn in_range(a: i32) -> bool {
     3 <= a && a <= 20
+}
+
+#[clippy::msrv = "1.34"]
+fn msrv_1_34() {
+    let x = 5;
+    x >= 8 && x < 34;
+}
+
+#[clippy::msrv = "1.35"]
+fn msrv_1_35() {
+    let x = 5;
+    x >= 8 && x < 35;
 }

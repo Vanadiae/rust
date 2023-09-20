@@ -10,19 +10,23 @@
 // FIXME: spec the JSON output properly.
 
 use rustc_span::source_map::{FilePathMapping, SourceMap};
+use termcolor::{ColorSpec, WriteColor};
 
-use crate::emitter::{Emitter, HumanReadableErrorType};
+use crate::emitter::{should_show_source_code, Emitter, HumanReadableErrorType};
 use crate::registry::Registry;
+use crate::translation::{to_fluent_args, Translate};
 use crate::DiagnosticId;
 use crate::{
     CodeSuggestion, FluentBundle, LazyFallbackBundle, MultiSpan, SpanLabel, SubDiagnostic,
+    TerminalUrl,
 };
 use rustc_lint_defs::Applicability;
 
-use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::sync::{IntoDynSyncSend, Lrc};
 use rustc_error_messages::FluentArgs;
 use rustc_span::hygiene::ExpnData;
 use rustc_span::Span;
+use std::error::Report;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -34,16 +38,19 @@ use serde::Serialize;
 mod tests;
 
 pub struct JsonEmitter {
-    dst: Box<dyn Write + Send>,
+    dst: IntoDynSyncSend<Box<dyn Write + Send>>,
     registry: Option<Registry>,
     sm: Lrc<SourceMap>,
     fluent_bundle: Option<Lrc<FluentBundle>>,
     fallback_bundle: LazyFallbackBundle,
     pretty: bool,
     ui_testing: bool,
+    ignored_directories_in_source_blocks: Vec<String>,
     json_rendered: HumanReadableErrorType,
-    terminal_width: Option<usize>,
+    diagnostic_width: Option<usize>,
     macro_backtrace: bool,
+    track_diagnostics: bool,
+    terminal_url: TerminalUrl,
 }
 
 impl JsonEmitter {
@@ -54,20 +61,25 @@ impl JsonEmitter {
         fallback_bundle: LazyFallbackBundle,
         pretty: bool,
         json_rendered: HumanReadableErrorType,
-        terminal_width: Option<usize>,
+        diagnostic_width: Option<usize>,
         macro_backtrace: bool,
+        track_diagnostics: bool,
+        terminal_url: TerminalUrl,
     ) -> JsonEmitter {
         JsonEmitter {
-            dst: Box::new(io::BufWriter::new(io::stderr())),
+            dst: IntoDynSyncSend(Box::new(io::BufWriter::new(io::stderr()))),
             registry,
             sm: source_map,
             fluent_bundle,
             fallback_bundle,
             pretty,
             ui_testing: false,
+            ignored_directories_in_source_blocks: Vec::new(),
             json_rendered,
-            terminal_width,
+            diagnostic_width,
             macro_backtrace,
+            track_diagnostics,
+            terminal_url,
         }
     }
 
@@ -76,8 +88,10 @@ impl JsonEmitter {
         json_rendered: HumanReadableErrorType,
         fluent_bundle: Option<Lrc<FluentBundle>>,
         fallback_bundle: LazyFallbackBundle,
-        terminal_width: Option<usize>,
+        diagnostic_width: Option<usize>,
         macro_backtrace: bool,
+        track_diagnostics: bool,
+        terminal_url: TerminalUrl,
     ) -> JsonEmitter {
         let file_path_mapping = FilePathMapping::empty();
         JsonEmitter::stderr(
@@ -87,8 +101,10 @@ impl JsonEmitter {
             fallback_bundle,
             pretty,
             json_rendered,
-            terminal_width,
+            diagnostic_width,
             macro_backtrace,
+            track_diagnostics,
+            terminal_url,
         )
     }
 
@@ -100,25 +116,44 @@ impl JsonEmitter {
         fallback_bundle: LazyFallbackBundle,
         pretty: bool,
         json_rendered: HumanReadableErrorType,
-        terminal_width: Option<usize>,
+        diagnostic_width: Option<usize>,
         macro_backtrace: bool,
+        track_diagnostics: bool,
+        terminal_url: TerminalUrl,
     ) -> JsonEmitter {
         JsonEmitter {
-            dst,
+            dst: IntoDynSyncSend(dst),
             registry,
             sm: source_map,
             fluent_bundle,
             fallback_bundle,
             pretty,
             ui_testing: false,
+            ignored_directories_in_source_blocks: Vec::new(),
             json_rendered,
-            terminal_width,
+            diagnostic_width,
             macro_backtrace,
+            track_diagnostics,
+            terminal_url,
         }
     }
 
     pub fn ui_testing(self, ui_testing: bool) -> Self {
         Self { ui_testing, ..self }
+    }
+
+    pub fn ignored_directories_in_source_blocks(self, value: Vec<String>) -> Self {
+        Self { ignored_directories_in_source_blocks: value, ..self }
+    }
+}
+
+impl Translate for JsonEmitter {
+    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
+        self.fluent_bundle.as_ref()
+    }
+
+    fn fallback_fluent_bundle(&self) -> &FluentBundle {
+        &self.fallback_bundle
     }
 }
 
@@ -132,7 +167,7 @@ impl Emitter for JsonEmitter {
         }
         .and_then(|_| self.dst.flush());
         if let Err(e) = result {
-            panic!("failed to print diagnostics: {:?}", e);
+            panic!("failed to print diagnostics: {e:?}");
         }
     }
 
@@ -145,7 +180,7 @@ impl Emitter for JsonEmitter {
         }
         .and_then(|_| self.dst.flush());
         if let Err(e) = result {
-            panic!("failed to print notification: {:?}", e);
+            panic!("failed to print notification: {e:?}");
         }
     }
 
@@ -154,7 +189,7 @@ impl Emitter for JsonEmitter {
             .into_iter()
             .map(|mut diag| {
                 if diag.level == crate::Level::Allow {
-                    diag.level = crate::Level::Warning;
+                    diag.level = crate::Level::Warning(None);
                 }
                 FutureBreakageItem { diagnostic: Diagnostic::from_errors_diagnostic(&diag, self) }
             })
@@ -167,7 +202,7 @@ impl Emitter for JsonEmitter {
         }
         .and_then(|_| self.dst.flush());
         if let Err(e) = result {
-            panic!("failed to print future breakage report: {:?}", e);
+            panic!("failed to print future breakage report: {e:?}");
         }
     }
 
@@ -181,20 +216,12 @@ impl Emitter for JsonEmitter {
         }
         .and_then(|_| self.dst.flush());
         if let Err(e) = result {
-            panic!("failed to print unused externs: {:?}", e);
+            panic!("failed to print unused externs: {e:?}");
         }
     }
 
     fn source_map(&self) -> Option<&Lrc<SourceMap>> {
         Some(&self.sm)
-    }
-
-    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
-        self.fluent_bundle.as_ref()
-    }
-
-    fn fallback_fluent_bundle(&self) -> &FluentBundle {
-        &**self.fallback_bundle
     }
 
     fn should_show_explain(&self) -> bool {
@@ -309,9 +336,10 @@ struct UnusedExterns<'a, 'b, 'c> {
 
 impl Diagnostic {
     fn from_errors_diagnostic(diag: &crate::Diagnostic, je: &JsonEmitter) -> Diagnostic {
-        let args = je.to_fluent_args(diag.args());
+        let args = to_fluent_args(diag.args());
         let sugg = diag.suggestions.iter().flatten().map(|sugg| {
-            let translated_message = je.translate_message(&sugg.msg, &args);
+            let translated_message =
+                je.translate_message(&sugg.msg, &args).map_err(Report::new).unwrap();
             Diagnostic {
                 message: translated_message.to_string(),
                 code: None,
@@ -336,19 +364,31 @@ impl Diagnostic {
                 self.0.lock().unwrap().flush()
             }
         }
+        impl WriteColor for BufWriter {
+            fn supports_color(&self) -> bool {
+                false
+            }
+
+            fn set_color(&mut self, _spec: &ColorSpec) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn reset(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
         let buf = BufWriter::default();
         let output = buf.clone();
         je.json_rendered
-            .new_emitter(
-                Box::new(buf),
-                Some(je.sm.clone()),
-                je.fluent_bundle.clone(),
-                je.fallback_bundle.clone(),
-                false,
-                je.terminal_width,
-                je.macro_backtrace,
-            )
+            .new_emitter(Box::new(buf), je.fallback_bundle.clone())
+            .sm(Some(je.sm.clone()))
+            .fluent_bundle(je.fluent_bundle.clone())
+            .diagnostic_width(je.diagnostic_width)
+            .macro_backtrace(je.macro_backtrace)
+            .track_diagnostics(je.track_diagnostics)
+            .terminal_url(je.terminal_url)
             .ui_testing(je.ui_testing)
+            .ignored_directories_in_source_blocks(je.ignored_directories_in_source_blocks.clone())
             .emit_diagnostic(diag);
         let output = Arc::try_unwrap(output.0).unwrap().into_inner().unwrap();
         let output = String::from_utf8(output).unwrap();
@@ -400,7 +440,10 @@ impl DiagnosticSpan {
         Self::from_span_etc(
             span.span,
             span.is_primary,
-            span.label.as_ref().map(|m| je.translate_message(m, args)).map(|m| m.to_string()),
+            span.label
+                .as_ref()
+                .map(|m| je.translate_message(m, args).unwrap())
+                .map(|m| m.to_string()),
             suggestion,
             je,
         )
@@ -523,7 +566,11 @@ impl DiagnosticSpanLine {
             .span_to_lines(span)
             .map(|lines| {
                 // We can't get any lines if the source is unavailable.
-                if !je.sm.ensure_source_file_source_present(lines.file.clone()) {
+                if !should_show_source_code(
+                    &je.ignored_directories_in_source_blocks,
+                    &je.sm,
+                    &lines.file,
+                ) {
                     return vec![];
                 }
 
@@ -555,7 +602,7 @@ impl DiagnosticCode {
             let je_result =
                 je.registry.as_ref().map(|registry| registry.try_find_description(&s)).unwrap();
 
-            DiagnosticCode { code: s, explanation: je_result.unwrap_or(None) }
+            DiagnosticCode { code: s, explanation: je_result.ok() }
         })
     }
 }

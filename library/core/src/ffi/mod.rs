@@ -14,7 +14,7 @@ use crate::marker::PhantomData;
 use crate::num::*;
 use crate::ops::{Deref, DerefMut};
 
-#[unstable(feature = "core_c_str", issue = "94079")]
+#[stable(feature = "core_c_str", since = "1.64.0")]
 pub use self::c_str::{CStr, FromBytesUntilNulError, FromBytesWithNulError};
 
 mod c_str;
@@ -26,7 +26,7 @@ macro_rules! type_alias_no_nz {
     } => {
         #[doc = include_str!($Docfile)]
         $( $Cfg )*
-        #[unstable(feature = "core_ffi_c", issue = "94501")]
+        #[stable(feature = "core_ffi_c", since = "1.64.0")]
         pub type $Alias = $Real;
     }
 }
@@ -52,11 +52,6 @@ macro_rules! type_alias {
 }
 
 type_alias! { "c_char.md", c_char = c_char_definition::c_char, NonZero_c_char = c_char_definition::NonZero_c_char;
-// Make this type alias appear cfg-dependent so that Clippy does not suggest
-// replacing `0 as c_char` with `0_i8`/`0_u8`. This #[cfg(all())] can be removed
-// after the false positive in https://github.com/rust-lang/rust-clippy/issues/8093
-// is fixed.
-#[cfg(all())]
 #[doc(cfg(all()))] }
 
 type_alias! { "c_schar.md", c_schar = i8, NonZero_c_schar = NonZeroI8; }
@@ -115,7 +110,8 @@ mod c_char_definition {
                     target_arch = "powerpc64",
                     target_arch = "s390x",
                     target_arch = "riscv64",
-                    target_arch = "riscv32"
+                    target_arch = "riscv32",
+                    target_arch = "csky"
                 )
             ),
             all(target_os = "android", any(target_arch = "aarch64", target_arch = "arm")),
@@ -132,7 +128,12 @@ mod c_char_definition {
             ),
             all(
                 target_os = "netbsd",
-                any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc")
+                any(
+                    target_arch = "aarch64",
+                    target_arch = "arm",
+                    target_arch = "powerpc",
+                    target_arch = "riscv64"
+                )
             ),
             all(
                 target_os = "vxworks",
@@ -143,7 +144,12 @@ mod c_char_definition {
                     target_arch = "powerpc"
                 )
             ),
-            all(target_os = "fuchsia", target_arch = "aarch64")
+            all(
+                target_os = "fuchsia",
+                any(target_arch = "aarch64", target_arch = "riscv64")
+            ),
+            all(target_os = "nto", target_arch = "aarch64"),
+            target_os = "horizon"
         ))] {
             pub type c_char = u8;
             pub type NonZero_c_char = crate::num::NonZeroU8;
@@ -197,7 +203,8 @@ mod c_long_definition {
 //     would be uninhabited and at least dereferencing such pointers would
 //     be UB.
 #[doc = include_str!("c_void.md")]
-#[repr(u8)]
+#[lang = "c_void"]
+#[cfg_attr(not(doc), repr(u8))] // work around https://github.com/rust-lang/rust/issues/90435
 #[stable(feature = "core_c_void", since = "1.30.0")]
 pub enum c_void {
     #[unstable(
@@ -226,13 +233,19 @@ impl fmt::Debug for c_void {
 /// Basic implementation of a `va_list`.
 // The name is WIP, using `VaListImpl` for now.
 #[cfg(any(
-    all(not(target_arch = "aarch64"), not(target_arch = "powerpc"), not(target_arch = "x86_64")),
-    all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")),
+    all(
+        not(target_arch = "aarch64"),
+        not(target_arch = "powerpc"),
+        not(target_arch = "s390x"),
+        not(target_arch = "x86_64")
+    ),
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios", target_os = "tvos")),
     target_family = "wasm",
     target_arch = "asmjs",
-    windows
+    target_os = "uefi",
+    windows,
 ))]
-#[repr(transparent)]
+#[cfg_attr(not(doc), repr(transparent))] // work around https://github.com/rust-lang/rust/issues/90435
 #[unstable(
     feature = "c_variadic",
     reason = "the `c_variadic` feature has not been properly tested on \
@@ -249,11 +262,17 @@ pub struct VaListImpl<'f> {
 }
 
 #[cfg(any(
-    all(not(target_arch = "aarch64"), not(target_arch = "powerpc"), not(target_arch = "x86_64")),
-    all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")),
+    all(
+        not(target_arch = "aarch64"),
+        not(target_arch = "powerpc"),
+        not(target_arch = "s390x"),
+        not(target_arch = "x86_64")
+    ),
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios", target_os = "tvos")),
     target_family = "wasm",
     target_arch = "asmjs",
-    windows
+    target_os = "uefi",
+    windows,
 ))]
 #[unstable(
     feature = "c_variadic",
@@ -274,10 +293,11 @@ impl<'f> fmt::Debug for VaListImpl<'f> {
 /// http://infocenter.arm.com/help/topic/com.arm.doc.ihi0055b/IHI0055B_aapcs64.pdf
 #[cfg(all(
     target_arch = "aarch64",
-    not(any(target_os = "macos", target_os = "ios")),
-    not(windows)
+    not(any(target_os = "macos", target_os = "ios", target_os = "tvos")),
+    not(target_os = "uefi"),
+    not(windows),
 ))]
-#[repr(C)]
+#[cfg_attr(not(doc), repr(C))] // work around https://github.com/rust-lang/rust/issues/66401
 #[derive(Debug)]
 #[unstable(
     feature = "c_variadic",
@@ -296,8 +316,8 @@ pub struct VaListImpl<'f> {
 }
 
 /// PowerPC ABI implementation of a `va_list`.
-#[cfg(all(target_arch = "powerpc", not(windows)))]
-#[repr(C)]
+#[cfg(all(target_arch = "powerpc", not(target_os = "uefi"), not(windows)))]
+#[cfg_attr(not(doc), repr(C))] // work around https://github.com/rust-lang/rust/issues/66401
 #[derive(Debug)]
 #[unstable(
     feature = "c_variadic",
@@ -315,9 +335,28 @@ pub struct VaListImpl<'f> {
     _marker: PhantomData<&'f mut &'f c_void>,
 }
 
+/// s390x ABI implementation of a `va_list`.
+#[cfg(target_arch = "s390x")]
+#[cfg_attr(not(doc), repr(C))] // work around https://github.com/rust-lang/rust/issues/66401
+#[derive(Debug)]
+#[unstable(
+    feature = "c_variadic",
+    reason = "the `c_variadic` feature has not been properly tested on \
+              all supported platforms",
+    issue = "44930"
+)]
+#[lang = "va_list"]
+pub struct VaListImpl<'f> {
+    gpr: i64,
+    fpr: i64,
+    overflow_arg_area: *mut c_void,
+    reg_save_area: *mut c_void,
+    _marker: PhantomData<&'f mut &'f c_void>,
+}
+
 /// x86_64 ABI implementation of a `va_list`.
-#[cfg(all(target_arch = "x86_64", not(windows)))]
-#[repr(C)]
+#[cfg(all(target_arch = "x86_64", not(target_os = "uefi"), not(windows)))]
+#[cfg_attr(not(doc), repr(C))] // work around https://github.com/rust-lang/rust/issues/66401
 #[derive(Debug)]
 #[unstable(
     feature = "c_variadic",
@@ -335,7 +374,7 @@ pub struct VaListImpl<'f> {
 }
 
 /// A wrapper for a `va_list`
-#[repr(transparent)]
+#[cfg_attr(not(doc), repr(transparent))] // work around https://github.com/rust-lang/rust/issues/90435
 #[derive(Debug)]
 #[unstable(
     feature = "c_variadic",
@@ -348,21 +387,35 @@ pub struct VaList<'a, 'f: 'a> {
         all(
             not(target_arch = "aarch64"),
             not(target_arch = "powerpc"),
+            not(target_arch = "s390x"),
             not(target_arch = "x86_64")
         ),
-        all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")),
+        all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "ios", target_os = "tvos")
+        ),
         target_family = "wasm",
         target_arch = "asmjs",
-        windows
+        target_os = "uefi",
+        windows,
     ))]
     inner: VaListImpl<'f>,
 
     #[cfg(all(
-        any(target_arch = "aarch64", target_arch = "powerpc", target_arch = "x86_64"),
-        any(not(target_arch = "aarch64"), not(any(target_os = "macos", target_os = "ios"))),
+        any(
+            target_arch = "aarch64",
+            target_arch = "powerpc",
+            target_arch = "s390x",
+            target_arch = "x86_64"
+        ),
+        any(
+            not(target_arch = "aarch64"),
+            not(any(target_os = "macos", target_os = "ios", target_os = "tvos"))
+        ),
         not(target_family = "wasm"),
         not(target_arch = "asmjs"),
-        not(windows)
+        not(target_os = "uefi"),
+        not(windows),
     ))]
     inner: &'a mut VaListImpl<'f>,
 
@@ -370,11 +423,17 @@ pub struct VaList<'a, 'f: 'a> {
 }
 
 #[cfg(any(
-    all(not(target_arch = "aarch64"), not(target_arch = "powerpc"), not(target_arch = "x86_64")),
-    all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")),
+    all(
+        not(target_arch = "aarch64"),
+        not(target_arch = "powerpc"),
+        not(target_arch = "s390x"),
+        not(target_arch = "x86_64")
+    ),
+    all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios", target_os = "tvos")),
     target_family = "wasm",
     target_arch = "asmjs",
-    windows
+    target_os = "uefi",
+    windows,
 ))]
 #[unstable(
     feature = "c_variadic",
@@ -391,11 +450,20 @@ impl<'f> VaListImpl<'f> {
 }
 
 #[cfg(all(
-    any(target_arch = "aarch64", target_arch = "powerpc", target_arch = "x86_64"),
-    any(not(target_arch = "aarch64"), not(any(target_os = "macos", target_os = "ios"))),
+    any(
+        target_arch = "aarch64",
+        target_arch = "powerpc",
+        target_arch = "s390x",
+        target_arch = "x86_64"
+    ),
+    any(
+        not(target_arch = "aarch64"),
+        not(any(target_os = "macos", target_os = "ios", target_os = "tvos"))
+    ),
     not(target_family = "wasm"),
     not(target_arch = "asmjs"),
-    not(windows)
+    not(target_os = "uefi"),
+    not(windows),
 ))]
 #[unstable(
     feature = "c_variadic",
@@ -561,12 +629,15 @@ impl<'f> Drop for VaListImpl<'f> {
 extern "rust-intrinsic" {
     /// Destroy the arglist `ap` after initialization with `va_start` or
     /// `va_copy`.
+    #[rustc_nounwind]
     fn va_end(ap: &mut VaListImpl<'_>);
 
     /// Copies the current location of arglist `src` to the arglist `dst`.
+    #[rustc_nounwind]
     fn va_copy<'f>(dest: *mut VaListImpl<'f>, src: &VaListImpl<'f>);
 
     /// Loads an argument of type `T` from the `va_list` `ap` and increment the
     /// argument `ap` points to.
+    #[rustc_nounwind]
     fn va_arg<T: sealed_trait::VaArgSafe>(ap: &mut VaListImpl<'_>) -> T;
 }

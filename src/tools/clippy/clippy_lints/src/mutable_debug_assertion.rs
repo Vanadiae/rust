@@ -22,9 +22,12 @@ declare_clippy_lint! {
     /// ### Example
     /// ```rust,ignore
     /// debug_assert_eq!(vec![3].pop(), Some(3));
+    ///
     /// // or
-    /// fn take_a_mut_parameter(_: &mut u32) -> bool { unimplemented!() }
-    /// debug_assert!(take_a_mut_parameter(&mut 5));
+    ///
+    /// # let mut x = 5;
+    /// # fn takes_a_mut_parameter(_: &mut u32) -> bool { unimplemented!() }
+    /// debug_assert!(takes_a_mut_parameter(&mut x));
     /// ```
     #[clippy::version = "1.40.0"]
     pub DEBUG_ASSERT_WITH_MUT_CALL,
@@ -36,7 +39,9 @@ declare_lint_pass!(DebugAssertWithMutCall => [DEBUG_ASSERT_WITH_MUT_CALL]);
 
 impl<'tcx> LateLintPass<'tcx> for DebugAssertWithMutCall {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx Expr<'_>) {
-        let Some(macro_call) = root_macro_call_first_node(cx, e) else { return };
+        let Some(macro_call) = root_macro_call_first_node(cx, e) else {
+            return;
+        };
         let macro_name = cx.tcx.item_name(macro_call.def_id);
         if !matches!(
             macro_name.as_str(),
@@ -44,7 +49,9 @@ impl<'tcx> LateLintPass<'tcx> for DebugAssertWithMutCall {
         ) {
             return;
         }
-        let Some((lhs, rhs, _)) = find_assert_eq_args(cx, e, macro_call.expn) else { return };
+        let Some((lhs, rhs, _)) = find_assert_eq_args(cx, e, macro_call.expn) else {
+            return;
+        };
         for arg in [lhs, rhs] {
             let mut visitor = MutArgVisitor::new(cx);
             visitor.visit_expr(arg);
@@ -53,10 +60,7 @@ impl<'tcx> LateLintPass<'tcx> for DebugAssertWithMutCall {
                     cx,
                     DEBUG_ASSERT_WITH_MUT_CALL,
                     span,
-                    &format!(
-                        "do not call a function with mutable arguments inside of `{}!`",
-                        macro_name
-                    ),
+                    &format!("do not call a function with mutable arguments inside of `{macro_name}!`"),
                 );
             }
         }

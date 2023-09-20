@@ -13,7 +13,7 @@ use rustc_lint::LateContext;
 use rustc_span::{sym, symbol, Span};
 
 /// The essential nodes of a desugared for loop as well as the entire span:
-/// `for pat in arg { body }` becomes `(pat, arg, body)`. Return `(pat, arg, body, span)`.
+/// `for pat in arg { body }` becomes `(pat, arg, body)`. Returns `(pat, arg, body, span)`.
 pub struct ForLoop<'tcx> {
     /// `for` loop item
     pub pat: &'tcx hir::Pat<'tcx>,
@@ -35,7 +35,7 @@ impl<'tcx> ForLoop<'tcx> {
             if let hir::ExprKind::Match(iterexpr, [arm], hir::MatchSource::ForLoopDesugar) = e.kind;
             if let hir::ExprKind::Call(_, [arg]) = iterexpr.kind;
             if let hir::ExprKind::Loop(block, ..) = arm.body.kind;
-            if let [stmt] = &*block.stmts;
+            if let [stmt] = block.stmts;
             if let hir::StmtKind::Expr(e) = stmt.kind;
             if let hir::ExprKind::Match(_, [_, some_arm], _) = e.kind;
             if let hir::PatKind::Struct(_, [field], _) = some_arm.pat.kind;
@@ -138,6 +138,7 @@ impl<'hir> IfLet<'hir> {
 }
 
 /// An `if let` or `match` expression. Useful for lints that trigger on one or the other.
+#[derive(Debug)]
 pub enum IfLetOrMatch<'hir> {
     /// Any `match` expression
     Match(&'hir Expr<'hir>, &'hir [Arm<'hir>], MatchSource),
@@ -264,7 +265,7 @@ impl<'a> Range<'a> {
     }
 }
 
-/// Represent the pre-expansion arguments of a `vec!` invocation.
+/// Represents the pre-expansion arguments of a `vec!` invocation.
 pub enum VecArgs<'a> {
     /// `vec![elem; len]`
     Repeat(&'a hir::Expr<'a>, &'a hir::Expr<'a>),
@@ -287,15 +288,12 @@ impl<'a> VecArgs<'a> {
                     Some(VecArgs::Repeat(&args[0], &args[1]))
                 } else if match_def_path(cx, fun_def_id, &paths::SLICE_INTO_VEC) && args.len() == 1 {
                     // `vec![a, b, c]` case
-                    if_chain! {
-                        if let hir::ExprKind::Box(boxed) = args[0].kind;
-                        if let hir::ExprKind::Array(args) = boxed.kind;
-                        then {
-                            return Some(VecArgs::Vec(args));
-                        }
+                    if let hir::ExprKind::Call(_, [arg]) = &args[0].kind
+                        && let hir::ExprKind::Array(args) = arg.kind {
+                        Some(VecArgs::Vec(args))
+                    } else {
+                        None
                     }
-
-                    None
                 } else if match_def_path(cx, fun_def_id, &paths::VEC_NEW) && args.is_empty() {
                     Some(VecArgs::Vec(&[]))
                 } else {
@@ -314,6 +312,8 @@ pub struct While<'hir> {
     pub condition: &'hir Expr<'hir>,
     /// `while` loop body
     pub body: &'hir Expr<'hir>,
+    /// Span of the loop header
+    pub span: Span,
 }
 
 impl<'hir> While<'hir> {
@@ -339,10 +339,10 @@ impl<'hir> While<'hir> {
             },
             _,
             LoopSource::While,
-            _,
+            span,
         ) = expr.kind
         {
-            return Some(Self { condition, body });
+            return Some(Self { condition, body, span });
         }
         None
     }
@@ -399,7 +399,7 @@ impl<'hir> WhileLet<'hir> {
     }
 }
 
-/// Converts a hir binary operator to the corresponding `ast` type.
+/// Converts a `hir` binary operator to the corresponding `ast` type.
 #[must_use]
 pub fn binop(op: hir::BinOpKind) -> ast::BinOpKind {
     match op {
@@ -437,7 +437,7 @@ pub enum VecInitKind {
     WithExprCapacity(HirId),
 }
 
-/// Checks if given expression is an initialization of `Vec` and returns its kind.
+/// Checks if the given expression is an initialization of `Vec` and returns its kind.
 pub fn get_vec_init_kind<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> Option<VecInitKind> {
     if let ExprKind::Call(func, args) = expr.kind {
         match func.kind {

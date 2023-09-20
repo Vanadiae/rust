@@ -6,8 +6,7 @@ use if_chain::if_chain;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefIdMap;
 use rustc_hir::intravisit::{walk_expr, Visitor};
-use rustc_hir::HirIdSet;
-use rustc_hir::{Expr, ExprKind, QPath};
+use rustc_hir::{Expr, ExprKind, HirIdSet, QPath};
 use rustc_lint::LateContext;
 
 pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, cond: &'tcx Expr<'_>, expr: &'tcx Expr<'_>) {
@@ -35,7 +34,7 @@ pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, cond: &'tcx Expr<'_>, expr: &'
         } else {
             return;
         };
-    let mutable_static_in_cond = var_visitor.def_ids.iter().any(|(_, v)| *v);
+    let mutable_static_in_cond = var_visitor.def_ids.items().any(|(_, v)| *v);
 
     let mut has_break_or_return_visitor = HasBreakOrReturnVisitor {
         has_break_or_return: false,

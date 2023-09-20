@@ -1,10 +1,9 @@
 use crate::stable_hasher::{HashStable, StableHasher};
 use std::cmp::Ordering;
+use std::fmt::{self, Debug};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::ptr;
-
-use crate::fingerprint::Fingerprint;
 
 mod private {
     #[derive(Clone, Copy, Debug)]
@@ -22,7 +21,6 @@ mod private {
 /// The `PrivateZst` field means you can pattern match with `Interned(v, _)`
 /// but you can only construct a `Interned` with `new_unchecked`, and not
 /// directly.
-#[derive(Debug)]
 #[rustc_pass_by_value]
 pub struct Interned<'a, T>(pub &'a T, pub private::PrivateZst);
 
@@ -72,7 +70,7 @@ impl<'a, T: PartialOrd> PartialOrd for Interned<'a, T> {
         if ptr::eq(self.0, other.0) {
             Some(Ordering::Equal)
         } else {
-            let res = self.0.partial_cmp(&other.0);
+            let res = self.0.partial_cmp(other.0);
             debug_assert_ne!(res, Some(Ordering::Equal));
             res
         }
@@ -86,7 +84,7 @@ impl<'a, T: Ord> Ord for Interned<'a, T> {
         if ptr::eq(self.0, other.0) {
             Ordering::Equal
         } else {
-            let res = self.0.cmp(&other.0);
+            let res = self.0.cmp(other.0);
             debug_assert_ne!(res, Ordering::Equal);
             res
         }
@@ -110,85 +108,9 @@ where
     }
 }
 
-/// A helper trait so that `Interned` things can cache stable hashes reproducibly.
-pub trait InternedHashingContext {
-    fn with_def_path_and_no_spans(&mut self, f: impl FnOnce(&mut Self));
-}
-
-/// A helper type that you can wrap round your own type in order to automatically
-/// cache the stable hash on creation and not recompute it whenever the stable hash
-/// of the type is computed.
-/// This is only done in incremental mode. You can also opt out of caching by using
-/// StableHash::ZERO for the hash, in which case the hash gets computed each time.
-/// This is useful if you have values that you intern but never (can?) use for stable
-/// hashing.
-#[derive(Copy, Clone)]
-pub struct WithStableHash<T> {
-    pub internee: T,
-    pub stable_hash: Fingerprint,
-}
-
-impl<T: PartialEq> PartialEq for WithStableHash<T> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.internee.eq(&other.internee)
-    }
-}
-
-impl<T: Eq> Eq for WithStableHash<T> {}
-
-impl<T: Ord> PartialOrd for WithStableHash<T> {
-    fn partial_cmp(&self, other: &WithStableHash<T>) -> Option<Ordering> {
-        Some(self.internee.cmp(&other.internee))
-    }
-}
-
-impl<T: Ord> Ord for WithStableHash<T> {
-    fn cmp(&self, other: &WithStableHash<T>) -> Ordering {
-        self.internee.cmp(&other.internee)
-    }
-}
-
-impl<T> Deref for WithStableHash<T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &T {
-        &self.internee
-    }
-}
-
-impl<T: Hash> Hash for WithStableHash<T> {
-    #[inline]
-    fn hash<H: Hasher>(&self, s: &mut H) {
-        self.internee.hash(s)
-    }
-}
-
-impl<T: HashStable<CTX>, CTX: InternedHashingContext> HashStable<CTX> for WithStableHash<T> {
-    fn hash_stable(&self, hcx: &mut CTX, hasher: &mut StableHasher) {
-        if self.stable_hash == Fingerprint::ZERO || cfg!(debug_assertions) {
-            // No cached hash available. This can only mean that incremental is disabled.
-            // We don't cache stable hashes in non-incremental mode, because they are used
-            // so rarely that the performance actually suffers.
-
-            // We need to build the hash as if we cached it and then hash that hash, as
-            // otherwise the hashes will differ between cached and non-cached mode.
-            let stable_hash: Fingerprint = {
-                let mut hasher = StableHasher::new();
-                hcx.with_def_path_and_no_spans(|hcx| self.internee.hash_stable(hcx, &mut hasher));
-                hasher.finish()
-            };
-            if cfg!(debug_assertions) && self.stable_hash != Fingerprint::ZERO {
-                assert_eq!(
-                    stable_hash, self.stable_hash,
-                    "cached stable hash does not match freshly computed stable hash"
-                );
-            }
-            stable_hash.hash_stable(hcx, hasher);
-        } else {
-            self.stable_hash.hash_stable(hcx, hasher);
-        }
+impl<T: Debug> Debug for Interned<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 

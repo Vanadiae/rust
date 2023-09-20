@@ -41,15 +41,15 @@ There are a number of supported commands:
   `PATH` is relative to the output directory. It can be given as `-`
   which repeats the most recently used `PATH`.
 
-* `@has PATH PATTERN` and `@matches PATH PATTERN` checks for
-  the occurrence of the given pattern `PATTERN` in the specified file.
+* `@hasraw PATH PATTERN` and `@matchesraw PATH PATTERN` checks
+  for the occurrence of the given pattern `PATTERN` in the specified file.
   Only one occurrence of the pattern is enough.
 
-  For `@has`, `PATTERN` is a whitespace-normalized (every consecutive
+  For `@hasraw`, `PATTERN` is a whitespace-normalized (every consecutive
   whitespace being replaced by one single space character) string.
   The entire file is also whitespace-normalized including newlines.
 
-  For `@matches`, `PATTERN` is a Python-supported regular expression.
+  For `@matchesraw`, `PATTERN` is a Python-supported regular expression.
   The file remains intact but the regexp is matched without the `MULTILINE`
   and `IGNORECASE` options. You can still use a prefix `(?m)` or `(?i)`
   to override them, and `\A` and `\Z` for definitely matching
@@ -94,6 +94,10 @@ There are a number of supported commands:
   in the specified file. The number of occurrences must match the given
   count.
 
+* `@count PATH XPATH TEXT COUNT` checks for the occurrence of the given XPath
+  with the given text in the specified file. The number of occurrences must
+  match the given count.
+
 * `@snapshot NAME PATH XPATH` creates a snapshot test named NAME.
   A snapshot test captures a subtree of the DOM, at the location
   determined by the XPath, and compares it to a pre-recorded value
@@ -105,6 +109,9 @@ There are a number of supported commands:
   compiletest's `--bless` flag is forwarded to htmldocck.
 
 * `@has-dir PATH` checks for the existence of the given directory.
+
+* `@files FOLDER_PATH [ENTRIES]`, checks that `FOLDER_PATH` contains exactly
+  `[ENTRIES]`.
 
 All conditions can be negated with `!`. `@!has foo/type.NoSuch.html`
 checks if the given file does not exist, for example.
@@ -140,7 +147,7 @@ VOID_ELEMENTS = {'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'ke
 
 # Python 2 -> 3 compatibility
 try:
-    unichr
+    unichr # noqa: B018 FIXME: py2
 except NameError:
     unichr = chr
 
@@ -267,6 +274,8 @@ def get_commands(template):
                 args = shlex.split(args)
             except UnicodeEncodeError:
                 args = [arg.decode('utf-8') for arg in shlex.split(args.encode('utf-8'))]
+            except Exception as exc:
+                raise Exception("line {}: {}".format(lineno + 1, exc)) from None
             yield Command(negated=negated, cmd=cmd, args=args, lineno=lineno+1, context=line)
 
 
@@ -317,12 +326,15 @@ class CachedFiles(object):
         else:
             return self.last_path
 
+    def get_absolute_path(self, path):
+        return os.path.join(self.root, path)
+
     def get_file(self, path):
         path = self.resolve_path(path)
         if path in self.files:
             return self.files[path]
 
-        abspath = os.path.join(self.root, path)
+        abspath = self.get_absolute_path(path)
         if not(os.path.exists(abspath) and os.path.isfile(abspath)):
             raise FailedCheck('File does not exist {!r}'.format(path))
 
@@ -336,7 +348,7 @@ class CachedFiles(object):
         if path in self.trees:
             return self.trees[path]
 
-        abspath = os.path.join(self.root, path)
+        abspath = self.get_absolute_path(path)
         if not(os.path.exists(abspath) and os.path.isfile(abspath)):
             raise FailedCheck('File does not exist {!r}'.format(path))
 
@@ -344,13 +356,15 @@ class CachedFiles(object):
             try:
                 tree = ET.fromstringlist(f.readlines(), CustomHTMLParser())
             except Exception as e:
-                raise RuntimeError('Cannot parse an HTML file {!r}: {}'.format(path, e))
+                raise RuntimeError( # noqa: B904 FIXME: py2
+                    'Cannot parse an HTML file {!r}: {}'.format(path, e)
+                )
             self.trees[path] = tree
             return self.trees[path]
 
     def get_dir(self, path):
         path = self.resolve_path(path)
-        abspath = os.path.join(self.root, path)
+        abspath = self.get_absolute_path(path)
         if not(os.path.exists(abspath) and os.path.isdir(abspath)):
             raise FailedCheck('Directory does not exist {!r}'.format(path))
 
@@ -382,9 +396,10 @@ def check_tree_attr(tree, path, attr, pat, regexp):
     return ret
 
 
-def check_tree_text(tree, path, pat, regexp):
+# Returns the number of occurrences matching the regex (`regexp`) and the text (`pat`).
+def check_tree_text(tree, path, pat, regexp, stop_at_first):
     path = normalize_xpath(path)
-    ret = False
+    match_count = 0
     try:
         for e in tree.findall(path):
             try:
@@ -392,13 +407,14 @@ def check_tree_text(tree, path, pat, regexp):
             except KeyError:
                 continue
             else:
-                ret = check_string(value, pat, regexp)
-                if ret:
-                    break
+                if check_string(value, pat, regexp):
+                    match_count += 1
+                    if stop_at_first:
+                        break
     except Exception:
         print('Failed to get path "{}"'.format(path))
         raise
-    return ret
+    return match_count
 
 
 def get_tree_count(tree, path):
@@ -411,19 +427,17 @@ def check_snapshot(snapshot_name, actual_tree, normalize_to_text):
     snapshot_path = '{}.{}.{}'.format(rust_test_path[:-3], snapshot_name, 'html')
     try:
         with open(snapshot_path, 'r') as snapshot_file:
-            expected_str = snapshot_file.read()
+            expected_str = snapshot_file.read().replace("{{channel}}", channel)
     except FileNotFoundError:
         if bless:
             expected_str = None
         else:
-            raise FailedCheck('No saved snapshot value')
+            raise FailedCheck('No saved snapshot value') # noqa: B904 FIXME: py2
 
     if not normalize_to_text:
         actual_str = ET.tostring(actual_tree).decode('utf-8')
     else:
         actual_str = flatten(actual_tree)
-
-    expected_str = expected_str.replace("{{channel}}", channel)
 
     # Conditions:
     #  1. Is --bless
@@ -436,6 +450,7 @@ def check_snapshot(snapshot_name, actual_tree, normalize_to_text):
 
         if bless:
             with open(snapshot_path, 'w') as snapshot_file:
+                actual_str = actual_str.replace(channel, "{{channel}}")
                 snapshot_file.write(actual_str)
         else:
             print('--- expected ---\n')
@@ -518,38 +533,88 @@ def print_err(lineno, context, err, message=None):
         stderr("\t{}".format(context))
 
 
+def get_nb_matching_elements(cache, c, regexp, stop_at_first):
+    tree = cache.get_tree(c.args[0])
+    pat, sep, attr = c.args[1].partition('/@')
+    if sep:  # attribute
+        tree = cache.get_tree(c.args[0])
+        return check_tree_attr(tree, pat, attr, c.args[2], False)
+    else:  # normalized text
+        pat = c.args[1]
+        if pat.endswith('/text()'):
+            pat = pat[:-7]
+        return check_tree_text(cache.get_tree(c.args[0]), pat, c.args[2], regexp, stop_at_first)
+
+
+def check_files_in_folder(c, cache, folder, files):
+    files = files.strip()
+    if not files.startswith('[') or not files.endswith(']'):
+        raise InvalidCheck("Expected list as second argument of @{} (ie '[]')".format(c.cmd))
+
+    folder = cache.get_absolute_path(folder)
+
+    # First we create a set of files to check if there are duplicates.
+    files = shlex.split(files[1:-1].replace(",", ""))
+    files_set = set()
+    for file in files:
+        if file in files_set:
+            raise InvalidCheck("Duplicated file `{}` in @{}".format(file, c.cmd))
+        files_set.add(file)
+    folder_set = set([f for f in os.listdir(folder) if f != "." and f != ".."])
+
+    # Then we remove entries from both sets (we clone `folder_set` so we can iterate it while
+    # removing its elements).
+    for entry in set(folder_set):
+        if entry in files_set:
+            files_set.remove(entry)
+            folder_set.remove(entry)
+
+    error = 0
+    if len(files_set) != 0:
+        print_err(c.lineno, c.context, "Entries not found in folder `{}`: `{}`".format(
+            folder, files_set))
+        error += 1
+    if len(folder_set) != 0:
+        print_err(c.lineno, c.context, "Extra entries in folder `{}`: `{}`".format(
+            folder, folder_set))
+        error += 1
+    return error == 0
+
+
 ERR_COUNT = 0
 
 
 def check_command(c, cache):
     try:
         cerr = ""
-        if c.cmd == 'has' or c.cmd == 'matches':  # string test
-            regexp = (c.cmd == 'matches')
-            if len(c.args) == 1 and not regexp:  # @has <path> = file existence
+        if c.cmd in ['has', 'hasraw', 'matches', 'matchesraw']:  # string test
+            regexp = c.cmd.startswith('matches')
+
+            # @has <path> = file existence
+            if len(c.args) == 1 and not regexp and 'raw' not in c.cmd:
                 try:
                     cache.get_file(c.args[0])
                     ret = True
                 except FailedCheck as err:
                     cerr = str(err)
                     ret = False
-            elif len(c.args) == 2:  # @has/matches <path> <pat> = string test
+            # @hasraw/matchesraw <path> <pat> = string test
+            elif len(c.args) == 2 and 'raw' in c.cmd:
                 cerr = "`PATTERN` did not match"
                 ret = check_string(cache.get_file(c.args[0]), c.args[1], regexp)
-            elif len(c.args) == 3:  # @has/matches <path> <pat> <match> = XML tree test
+            # @has/matches <path> <pat> <match> = XML tree test
+            elif len(c.args) == 3 and 'raw' not in c.cmd:
                 cerr = "`XPATH PATTERN` did not match"
-                tree = cache.get_tree(c.args[0])
-                pat, sep, attr = c.args[1].partition('/@')
-                if sep:  # attribute
-                    tree = cache.get_tree(c.args[0])
-                    ret = check_tree_attr(tree, pat, attr, c.args[2], regexp)
-                else:  # normalized text
-                    pat = c.args[1]
-                    if pat.endswith('/text()'):
-                        pat = pat[:-7]
-                    ret = check_tree_text(cache.get_tree(c.args[0]), pat, c.args[2], regexp)
+                ret = get_nb_matching_elements(cache, c, regexp, True) != 0
             else:
                 raise InvalidCheck('Invalid number of @{} arguments'.format(c.cmd))
+
+        elif c.cmd == 'files': # check files in given folder
+            if len(c.args) != 2: # @files <folder path> <file list>
+                raise InvalidCheck("Invalid number of @{} arguments".format(c.cmd))
+            elif c.negated:
+                raise InvalidCheck("@{} doesn't support negative check".format(c.cmd))
+            ret = check_files_in_folder(c, cache, c.args[0], c.args[1])
 
         elif c.cmd == 'count':  # count test
             if len(c.args) == 3:  # @count <path> <pat> <count> = count test
@@ -557,6 +622,11 @@ def check_command(c, cache):
                 found = get_tree_count(cache.get_tree(c.args[0]), c.args[1])
                 cerr = "Expected {} occurrences but found {}".format(expected, found)
                 ret = expected == found
+            elif len(c.args) == 4:  # @count <path> <pat> <text> <count> = count test
+                expected = int(c.args[3])
+                found = get_nb_matching_elements(cache, c, False, False)
+                cerr = "Expected {} occurrences but found {}".format(expected, found)
+                ret = found == expected
             else:
                 raise InvalidCheck('Invalid number of @{} arguments'.format(c.cmd))
 

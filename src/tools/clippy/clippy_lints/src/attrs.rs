@@ -1,24 +1,27 @@
 //! checks for attributes
 
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help, span_lint_and_sugg, span_lint_and_then};
+use clippy_utils::is_from_proc_macro;
 use clippy_utils::macros::{is_panic, macro_backtrace};
-use clippy_utils::msrvs;
+use clippy_utils::msrvs::{self, Msrv};
 use clippy_utils::source::{first_line_of_span, is_present_in_source, snippet_opt, without_block_comments};
-use clippy_utils::{extract_msrv_attr, meets_msrv};
 use if_chain::if_chain;
-use rustc_ast::{AttrKind, AttrStyle, Attribute, Lit, LitKind, MetaItemKind, NestedMetaItem};
+use rustc_ast::token::{Token, TokenKind};
+use rustc_ast::tokenstream::TokenTree;
+use rustc_ast::{
+    AttrArgs, AttrArgsEq, AttrKind, AttrStyle, Attribute, LitKind, MetaItemKind, MetaItemLit, NestedMetaItem,
+};
 use rustc_errors::Applicability;
 use rustc_hir::{
     Block, Expr, ExprKind, ImplItem, ImplItemKind, Item, ItemKind, StmtKind, TraitFn, TraitItem, TraitItemKind,
 };
-use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext};
+use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, Level, LintContext};
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty;
-use rustc_semver::RustcVersion;
 use rustc_session::{declare_lint_pass, declare_tool_lint, impl_lint_pass};
 use rustc_span::source_map::Span;
-use rustc_span::sym;
 use rustc_span::symbol::Symbol;
+use rustc_span::{sym, DUMMY_SP};
 use semver::Version;
 
 static UNIX_SYSTEMS: &[&str] = &[
@@ -78,10 +81,17 @@ declare_clippy_lint! {
     /// Checks for `extern crate` and `use` items annotated with
     /// lint attributes.
     ///
-    /// This lint permits `#[allow(unused_imports)]`, `#[allow(deprecated)]`,
-    /// `#[allow(unreachable_pub)]`, `#[allow(clippy::wildcard_imports)]` and
-    /// `#[allow(clippy::enum_glob_use)]` on `use` items and `#[allow(unused_imports)]` on
-    /// `extern crate` items with a `#[macro_use]` attribute.
+    /// This lint permits lint attributes for lints emitted on the items themself.
+    /// For `use` items these lints are:
+    /// * deprecated
+    /// * unreachable_pub
+    /// * unused_imports
+    /// * clippy::enum_glob_use
+    /// * clippy::macro_use_imports
+    /// * clippy::wildcard_imports
+    ///
+    /// For `extern crate` items these lints are:
+    /// * `unused_imports` on items with `#[macro_use]`
     ///
     /// ### Why is this bad?
     /// Lint attributes have no effect on crate imports. Most
@@ -89,13 +99,14 @@ declare_clippy_lint! {
     ///
     /// ### Example
     /// ```ignore
-    /// // Bad
     /// #[deny(dead_code)]
     /// extern crate foo;
     /// #[forbid(dead_code)]
     /// use foo::bar;
+    /// ```
     ///
-    /// // Ok
+    /// Use instead:
+    /// ```rust,ignore
     /// #[allow(unused_imports)]
     /// use foo::baz;
     /// #[allow(unused_imports)]
@@ -146,15 +157,19 @@ declare_clippy_lint! {
     ///
     /// ### Example
     /// ```rust
+    /// #[allow(dead_code)]
+    ///
+    /// fn not_quite_good_code() { }
+    /// ```
+    ///
+    /// Use instead:
+    /// ```rust
     /// // Good (as inner attribute)
     /// #![allow(dead_code)]
     ///
     /// fn this_is_fine() { }
     ///
-    /// // Bad
-    /// #[allow(dead_code)]
-    ///
-    /// fn not_quite_good_code() { }
+    /// // or
     ///
     /// // Good (as outer attribute)
     /// #[allow(dead_code)]
@@ -168,6 +183,52 @@ declare_clippy_lint! {
 
 declare_clippy_lint! {
     /// ### What it does
+    /// Checks for empty lines after documenation comments.
+    ///
+    /// ### Why is this bad?
+    /// The documentation comment was most likely meant to be an inner attribute or regular comment.
+    /// If it was intended to be a documentation comment, then the empty line should be removed to
+    /// be more idiomatic.
+    ///
+    /// ### Known problems
+    /// Only detects empty lines immediately following the documentation. If the doc comment is followed
+    /// by an attribute and then an empty line, this lint will not trigger. Use `empty_line_after_outer_attr`
+    /// in combination with this lint to detect both cases.
+    ///
+    /// Does not detect empty lines after doc attributes (e.g. `#[doc = ""]`).
+    ///
+    /// ### Example
+    /// ```rust
+    /// /// Some doc comment with a blank line after it.
+    ///
+    /// fn not_quite_good_code() { }
+    /// ```
+    ///
+    /// Use instead:
+    /// ```rust
+    /// /// Good (no blank line)
+    /// fn this_is_fine() { }
+    /// ```
+    ///
+    /// ```rust
+    /// // Good (convert to a regular comment)
+    ///
+    /// fn this_is_fine_too() { }
+    /// ```
+    ///
+    /// ```rust
+    /// //! Good (convert to a comment on an inner attribute)
+    ///
+    /// fn this_is_fine_as_well() { }
+    /// ```
+    #[clippy::version = "1.70.0"]
+    pub EMPTY_LINE_AFTER_DOC_COMMENTS,
+    nursery,
+    "empty line after documentation comments"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
     /// Checks for `warn`/`deny`/`forbid` attributes targeting the whole clippy::restriction category.
     ///
     /// ### Why is this bad?
@@ -175,12 +236,11 @@ declare_clippy_lint! {
     /// These lints should only be enabled on a lint-by-lint basis and with careful consideration.
     ///
     /// ### Example
-    /// Bad:
     /// ```rust
     /// #![deny(clippy::restriction)]
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust
     /// #![deny(clippy::as_conversions)]
     /// ```
@@ -205,13 +265,12 @@ declare_clippy_lint! {
     /// [#3123](https://github.com/rust-lang/rust-clippy/pull/3123#issuecomment-422321765)
     ///
     /// ### Example
-    /// Bad:
     /// ```rust
     /// #[cfg_attr(rustfmt, rustfmt_skip)]
     /// fn main() { }
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust
     /// #[rustfmt::skip]
     /// fn main() { }
@@ -231,20 +290,20 @@ declare_clippy_lint! {
     /// by the conditional compilation engine.
     ///
     /// ### Example
-    /// Bad:
     /// ```rust
     /// #[cfg(linux)]
     /// fn conditional() { }
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust
+    /// # mod hidden {
     /// #[cfg(target_os = "linux")]
     /// fn conditional() { }
-    /// ```
+    /// # }
     ///
-    /// Or:
-    /// ```rust
+    /// // or
+    ///
     /// #[cfg(unix)]
     /// fn conditional() { }
     /// ```
@@ -266,14 +325,13 @@ declare_clippy_lint! {
     /// ensure that others understand the reasoning
     ///
     /// ### Example
-    /// Bad:
     /// ```rust
     /// #![feature(lint_reasons)]
     ///
     /// #![allow(clippy::some_lint)]
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust
     /// #![feature(lint_reasons)]
     ///
@@ -285,15 +343,121 @@ declare_clippy_lint! {
     "ensures that all `allow` and `expect` attributes have a reason"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for `#[should_panic]` attributes without specifying the expected panic message.
+    ///
+    /// ### Why is this bad?
+    /// The expected panic message should be specified to ensure that the test is actually
+    /// panicking with the expected message, and not another unrelated panic.
+    ///
+    /// ### Example
+    /// ```rust
+    /// fn random() -> i32 { 0 }
+    ///
+    /// #[should_panic]
+    /// #[test]
+    /// fn my_test() {
+    ///     let _ = 1 / random();
+    /// }
+    /// ```
+    ///
+    /// Use instead:
+    /// ```rust
+    /// fn random() -> i32 { 0 }
+    ///
+    /// #[should_panic = "attempt to divide by zero"]
+    /// #[test]
+    /// fn my_test() {
+    ///     let _ = 1 / random();
+    /// }
+    /// ```
+    #[clippy::version = "1.73.0"]
+    pub SHOULD_PANIC_WITHOUT_EXPECT,
+    pedantic,
+    "ensures that all `should_panic` attributes specify its expected panic message"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for `any` and `all` combinators in `cfg` with only one condition.
+    ///
+    /// ### Why is this bad?
+    /// If there is only one condition, no need to wrap it into `any` or `all` combinators.
+    ///
+    /// ### Example
+    /// ```rust
+    /// #[cfg(any(unix))]
+    /// pub struct Bar;
+    /// ```
+    ///
+    /// Use instead:
+    /// ```rust
+    /// #[cfg(unix)]
+    /// pub struct Bar;
+    /// ```
+    #[clippy::version = "1.71.0"]
+    pub NON_MINIMAL_CFG,
+    style,
+    "ensure that all `cfg(any())` and `cfg(all())` have more than one condition"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for `#[cfg(features = "...")]` and suggests to replace it with
+    /// `#[cfg(feature = "...")]`.
+    ///
+    /// ### Why is this bad?
+    /// Misspelling `feature` as `features` can be sometimes hard to spot. It
+    /// may cause conditional compilation not work quitely.
+    ///
+    /// ### Example
+    /// ```rust
+    /// #[cfg(features = "some-feature")]
+    /// fn conditional() { }
+    /// ```
+    ///
+    /// Use instead:
+    /// ```rust
+    /// #[cfg(feature = "some-feature")]
+    /// fn conditional() { }
+    /// ```
+    #[clippy::version = "1.69.0"]
+    pub MAYBE_MISUSED_CFG,
+    suspicious,
+    "prevent from misusing the wrong attr name"
+}
+
 declare_lint_pass!(Attributes => [
     ALLOW_ATTRIBUTES_WITHOUT_REASON,
     INLINE_ALWAYS,
     DEPRECATED_SEMVER,
     USELESS_ATTRIBUTE,
     BLANKET_CLIPPY_RESTRICTION_LINTS,
+    SHOULD_PANIC_WITHOUT_EXPECT,
 ]);
 
 impl<'tcx> LateLintPass<'tcx> for Attributes {
+    fn check_crate(&mut self, cx: &LateContext<'tcx>) {
+        for (name, level) in &cx.sess().opts.lint_opts {
+            if name == "clippy::restriction" && *level > Level::Allow {
+                span_lint_and_then(
+                    cx,
+                    BLANKET_CLIPPY_RESTRICTION_LINTS,
+                    DUMMY_SP,
+                    "`clippy::restriction` is not meant to be enabled as a group",
+                    |diag| {
+                        diag.note(format!(
+                            "because of the command line `--{} clippy::restriction`",
+                            level.as_str()
+                        ));
+                        diag.help("enable the restriction lints you need individually");
+                    },
+                );
+            }
+        }
+    }
+
     fn check_attribute(&mut self, cx: &LateContext<'tcx>, attr: &'tcx Attribute) {
         if let Some(items) = &attr.meta_item_list() {
             if let Some(ident) = attr.ident() {
@@ -318,6 +482,9 @@ impl<'tcx> LateLintPass<'tcx> for Attributes {
                 }
             }
         }
+        if attr.has_name(sym::should_panic) {
+            check_should_panic_reason(cx, attr);
+        }
     }
 
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'_>) {
@@ -338,14 +505,20 @@ impl<'tcx> LateLintPass<'tcx> for Attributes {
                             for lint in lint_list {
                                 match item.kind {
                                     ItemKind::Use(..) => {
-                                        if is_word(lint, sym!(unused_imports))
+                                        if is_word(lint, sym::unused_imports)
                                             || is_word(lint, sym::deprecated)
                                             || is_word(lint, sym!(unreachable_pub))
                                             || is_word(lint, sym!(unused))
                                             || extract_clippy_lint(lint).map_or(false, |s| {
                                                 matches!(
                                                     s.as_str(),
-                                                    "wildcard_imports" | "enum_glob_use" | "redundant_pub_crate",
+                                                    "wildcard_imports"
+                                                        | "enum_glob_use"
+                                                        | "redundant_pub_crate"
+                                                        | "macro_use_imports"
+                                                        | "unsafe_removed_from_name"
+                                                        | "module_name_repetitions"
+                                                        | "single_component_path_imports"
                                                 )
                                             })
                                         {
@@ -353,7 +526,7 @@ impl<'tcx> LateLintPass<'tcx> for Attributes {
                                         }
                                     },
                                     ItemKind::ExternCrate(..) => {
-                                        if is_word(lint, sym!(unused_imports)) && skip_unused_imports {
+                                        if is_word(lint, sym::unused_imports) && skip_unused_imports {
                                             return;
                                         }
                                         if is_word(lint, sym!(unused_extern_crates)) {
@@ -420,6 +593,35 @@ fn extract_clippy_lint(lint: &NestedMetaItem) -> Option<Symbol> {
     None
 }
 
+fn check_should_panic_reason(cx: &LateContext<'_>, attr: &Attribute) {
+    if let AttrKind::Normal(normal_attr) = &attr.kind {
+        if let AttrArgs::Eq(_, AttrArgsEq::Hir(_)) = &normal_attr.item.args {
+            // `#[should_panic = ".."]` found, good
+            return;
+        }
+
+        if let AttrArgs::Delimited(args) = &normal_attr.item.args
+            && let mut tt_iter = args.tokens.trees()
+            && let Some(TokenTree::Token(Token { kind: TokenKind::Ident(sym::expected, _), .. }, _)) = tt_iter.next()
+            && let Some(TokenTree::Token(Token { kind: TokenKind::Eq, .. }, _)) = tt_iter.next()
+            && let Some(TokenTree::Token(Token { kind: TokenKind::Literal(_), .. }, _)) = tt_iter.next()
+        {
+            // `#[should_panic(expected = "..")]` found, good
+            return;
+        }
+
+        span_lint_and_sugg(
+            cx,
+            SHOULD_PANIC_WITHOUT_EXPECT,
+            attr.span,
+            "#[should_panic] attribute without a reason",
+            "consider specifying the expected panic",
+            r#"#[should_panic(expected = /* panic message */)]"#.into(),
+            Applicability::HasPlaceholders,
+        );
+    }
+}
+
 fn check_clippy_lint_names(cx: &LateContext<'_>, name: Symbol, items: &[NestedMetaItem]) {
     for lint in items {
         if let Some(lint_name) = extract_clippy_lint(lint) {
@@ -428,18 +630,18 @@ fn check_clippy_lint_names(cx: &LateContext<'_>, name: Symbol, items: &[NestedMe
                     cx,
                     BLANKET_CLIPPY_RESTRICTION_LINTS,
                     lint.span(),
-                    "restriction lints are not meant to be all enabled",
+                    "`clippy::restriction` is not meant to be enabled as a group",
                     None,
-                    "try enabling only the lints you really need",
+                    "enable the restriction lints you need individually",
                 );
             }
         }
     }
 }
 
-fn check_lint_reason(cx: &LateContext<'_>, name: Symbol, items: &[NestedMetaItem], attr: &'_ Attribute) {
+fn check_lint_reason<'cx>(cx: &LateContext<'cx>, name: Symbol, items: &[NestedMetaItem], attr: &'cx Attribute) {
     // Check for the feature
-    if !cx.tcx.sess.features_untracked().lint_reasons {
+    if !cx.tcx.features().lint_reasons {
         return;
     }
 
@@ -448,6 +650,11 @@ fn check_lint_reason(cx: &LateContext<'_>, name: Symbol, items: &[NestedMetaItem
         && let MetaItemKind::NameValue(_) = &item.kind
         && item.path == sym::reason
     {
+        return;
+    }
+
+    // Check if the attribute is in an external macro and therefore out of the developer's control
+    if in_external_macro(cx.sess(), attr.span) || is_from_proc_macro(cx, &attr) {
         return;
     }
 
@@ -463,7 +670,7 @@ fn check_lint_reason(cx: &LateContext<'_>, name: Symbol, items: &[NestedMetaItem
 
 fn is_relevant_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
     if let ItemKind::Fn(_, _, eid) = item.kind {
-        is_relevant_expr(cx, cx.tcx.typeck_body(eid), &cx.tcx.hir().body(eid).value)
+        is_relevant_expr(cx, cx.tcx.typeck_body(eid), cx.tcx.hir().body(eid).value)
     } else {
         true
     }
@@ -471,7 +678,7 @@ fn is_relevant_item(cx: &LateContext<'_>, item: &Item<'_>) -> bool {
 
 fn is_relevant_impl(cx: &LateContext<'_>, item: &ImplItem<'_>) -> bool {
     match item.kind {
-        ImplItemKind::Fn(_, eid) => is_relevant_expr(cx, cx.tcx.typeck_body(eid), &cx.tcx.hir().body(eid).value),
+        ImplItemKind::Fn(_, eid) => is_relevant_expr(cx, cx.tcx.typeck_body(eid), cx.tcx.hir().body(eid).value),
         _ => false,
     }
 }
@@ -480,7 +687,7 @@ fn is_relevant_trait(cx: &LateContext<'_>, item: &TraitItem<'_>) -> bool {
     match item.kind {
         TraitItemKind::Fn(_, TraitFn::Required(_)) => true,
         TraitItemKind::Fn(_, TraitFn::Provided(eid)) => {
-            is_relevant_expr(cx, cx.tcx.typeck_body(eid), &cx.tcx.hir().body(eid).value)
+            is_relevant_expr(cx, cx.tcx.typeck_body(eid), cx.tcx.hir().body(eid).value)
         },
         _ => false,
     }
@@ -529,17 +736,14 @@ fn check_attrs(cx: &LateContext<'_>, span: Span, name: Symbol, attrs: &[Attribut
                     cx,
                     INLINE_ALWAYS,
                     attr.span,
-                    &format!(
-                        "you have declared `#[inline(always)]` on `{}`. This is usually a bad idea",
-                        name
-                    ),
+                    &format!("you have declared `#[inline(always)]` on `{name}`. This is usually a bad idea"),
                 );
             }
         }
     }
 }
 
-fn check_semver(cx: &LateContext<'_>, span: Span, lit: &Lit) {
+fn check_semver(cx: &LateContext<'_>, span: Span, lit: &MetaItemLit) {
     if let LitKind::Str(is, _) = lit.kind {
         if Version::parse(is.as_str()).is_ok() {
             return;
@@ -562,13 +766,16 @@ fn is_word(nmi: &NestedMetaItem, expected: Symbol) -> bool {
 }
 
 pub struct EarlyAttributes {
-    pub msrv: Option<RustcVersion>,
+    pub msrv: Msrv,
 }
 
 impl_lint_pass!(EarlyAttributes => [
     DEPRECATED_CFG_ATTR,
     MISMATCHED_TARGET_OS,
     EMPTY_LINE_AFTER_OUTER_ATTR,
+    EMPTY_LINE_AFTER_DOC_COMMENTS,
+    NON_MINIMAL_CFG,
+    MAYBE_MISUSED_CFG,
 ]);
 
 impl EarlyLintPass for EarlyAttributes {
@@ -577,43 +784,64 @@ impl EarlyLintPass for EarlyAttributes {
     }
 
     fn check_attribute(&mut self, cx: &EarlyContext<'_>, attr: &Attribute) {
-        check_deprecated_cfg_attr(cx, attr, self.msrv);
+        check_deprecated_cfg_attr(cx, attr, &self.msrv);
         check_mismatched_target_os(cx, attr);
+        check_minimal_cfg_condition(cx, attr);
+        check_misused_cfg(cx, attr);
     }
 
     extract_msrv_attr!(EarlyContext);
 }
 
+/// Check for empty lines after outer attributes.
+///
+/// Attributes and documenation comments are both considered outer attributes
+/// by the AST. However, the average user likely considers them to be different.
+/// Checking for empty lines after each of these attributes is split into two different
+/// lints but can share the same logic.
 fn check_empty_line_after_outer_attr(cx: &EarlyContext<'_>, item: &rustc_ast::Item) {
-    for attr in &item.attrs {
-        if matches!(attr.kind, AttrKind::Normal(..))
+    let mut iter = item.attrs.iter().peekable();
+    while let Some(attr) = iter.next() {
+        if (matches!(attr.kind, AttrKind::Normal(..)) || matches!(attr.kind, AttrKind::DocComment(..)))
             && attr.style == AttrStyle::Outer
             && is_present_in_source(cx, attr.span)
         {
             let begin_of_attr_to_item = Span::new(attr.span.lo(), item.span.lo(), item.span.ctxt(), item.span.parent());
-            let end_of_attr_to_item = Span::new(attr.span.hi(), item.span.lo(), item.span.ctxt(), item.span.parent());
+            let end_of_attr_to_next_attr_or_item = Span::new(
+                attr.span.hi(),
+                iter.peek().map_or(item.span.lo(), |next_attr| next_attr.span.lo()),
+                item.span.ctxt(),
+                item.span.parent(),
+            );
 
-            if let Some(snippet) = snippet_opt(cx, end_of_attr_to_item) {
+            if let Some(snippet) = snippet_opt(cx, end_of_attr_to_next_attr_or_item) {
                 let lines = snippet.split('\n').collect::<Vec<_>>();
                 let lines = without_block_comments(lines);
 
                 if lines.iter().filter(|l| l.trim().is_empty()).count() > 2 {
-                    span_lint(
-                        cx,
-                        EMPTY_LINE_AFTER_OUTER_ATTR,
-                        begin_of_attr_to_item,
-                        "found an empty line after an outer attribute. \
-                        Perhaps you forgot to add a `!` to make it an inner attribute?",
-                    );
+                    let (lint_msg, lint_type) = match attr.kind {
+                        AttrKind::DocComment(..) => (
+                            "found an empty line after a doc comment. \
+                            Perhaps you need to use `//!` to make a comment on a module, remove the empty line, or make a regular comment with `//`?",
+                            EMPTY_LINE_AFTER_DOC_COMMENTS,
+                        ),
+                        AttrKind::Normal(..) => (
+                            "found an empty line after an outer attribute. \
+                            Perhaps you forgot to add a `!` to make it an inner attribute?",
+                            EMPTY_LINE_AFTER_OUTER_ATTR,
+                        ),
+                    };
+
+                    span_lint(cx, lint_type, begin_of_attr_to_item, lint_msg);
                 }
             }
         }
     }
 }
 
-fn check_deprecated_cfg_attr(cx: &EarlyContext<'_>, attr: &Attribute, msrv: Option<RustcVersion>) {
+fn check_deprecated_cfg_attr(cx: &EarlyContext<'_>, attr: &Attribute, msrv: &Msrv) {
     if_chain! {
-        if meets_msrv(msrv, msrvs::TOOL_ATTRIBUTES);
+        if msrv.meets(msrvs::TOOL_ATTRIBUTES);
         // check cfg_attr
         if attr.has_name(sym::cfg_attr);
         if let Some(items) = attr.meta_item_list();
@@ -623,8 +851,15 @@ fn check_deprecated_cfg_attr(cx: &EarlyContext<'_>, attr: &Attribute, msrv: Opti
         if feature_item.has_name(sym::rustfmt);
         // check for `rustfmt_skip` and `rustfmt::skip`
         if let Some(skip_item) = &items[1].meta_item();
-        if skip_item.has_name(sym!(rustfmt_skip)) ||
-            skip_item.path.segments.last().expect("empty path in attribute").ident.name == sym::skip;
+        if skip_item.has_name(sym!(rustfmt_skip))
+            || skip_item
+                .path
+                .segments
+                .last()
+                .expect("empty path in attribute")
+                .ident
+                .name
+                == sym::skip;
         // Only lint outer attributes, because custom inner attributes are unstable
         // Tracking issue: https://github.com/rust-lang/rust/issues/54726
         if attr.style == AttrStyle::Outer;
@@ -639,6 +874,77 @@ fn check_deprecated_cfg_attr(cx: &EarlyContext<'_>, attr: &Attribute, msrv: Opti
                 Applicability::MachineApplicable,
             );
         }
+    }
+}
+
+fn check_nested_cfg(cx: &EarlyContext<'_>, items: &[NestedMetaItem]) {
+    for item in items {
+        if let NestedMetaItem::MetaItem(meta) = item {
+            if !meta.has_name(sym::any) && !meta.has_name(sym::all) {
+                continue;
+            }
+            if let MetaItemKind::List(list) = &meta.kind {
+                check_nested_cfg(cx, list);
+                if list.len() == 1 {
+                    span_lint_and_then(
+                        cx,
+                        NON_MINIMAL_CFG,
+                        meta.span,
+                        "unneeded sub `cfg` when there is only one condition",
+                        |diag| {
+                            if let Some(snippet) = snippet_opt(cx, list[0].span()) {
+                                diag.span_suggestion(meta.span, "try", snippet, Applicability::MaybeIncorrect);
+                            }
+                        },
+                    );
+                } else if list.is_empty() && meta.has_name(sym::all) {
+                    span_lint_and_then(
+                        cx,
+                        NON_MINIMAL_CFG,
+                        meta.span,
+                        "unneeded sub `cfg` when there is no condition",
+                        |_| {},
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn check_nested_misused_cfg(cx: &EarlyContext<'_>, items: &[NestedMetaItem]) {
+    for item in items {
+        if let NestedMetaItem::MetaItem(meta) = item {
+            if meta.has_name(sym!(features)) && let Some(val) = meta.value_str() {
+                span_lint_and_sugg(
+                    cx,
+                    MAYBE_MISUSED_CFG,
+                    meta.span,
+                    "feature may misspelled as features",
+                    "use",
+                    format!("feature = \"{val}\""),
+                    Applicability::MaybeIncorrect,
+                );
+            }
+            if let MetaItemKind::List(list) = &meta.kind {
+                check_nested_misused_cfg(cx, list);
+            }
+        }
+    }
+}
+
+fn check_minimal_cfg_condition(cx: &EarlyContext<'_>, attr: &Attribute) {
+    if attr.has_name(sym::cfg) &&
+        let Some(items) = attr.meta_item_list()
+    {
+        check_nested_cfg(cx, &items);
+    }
+}
+
+fn check_misused_cfg(cx: &EarlyContext<'_>, attr: &Attribute) {
+    if attr.has_name(sym::cfg) &&
+        let Some(items) = attr.meta_item_list()
+    {
+        check_nested_misused_cfg(cx, &items);
     }
 }
 
@@ -695,7 +1001,7 @@ fn check_mismatched_target_os(cx: &EarlyContext<'_>, attr: &Attribute) {
                 let mut unix_suggested = false;
 
                 for (os, span) in mismatched {
-                    let sugg = format!("target_os = \"{}\"", os);
+                    let sugg = format!("target_os = \"{os}\"");
                     diag.span_suggestion(span, "try", sugg, Applicability::MaybeIncorrect);
 
                     if !unix_suggested && is_unix(os) {

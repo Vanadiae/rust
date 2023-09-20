@@ -40,12 +40,12 @@ impl<'a, 'tcx: 'a> MonoItemExt<'a, 'tcx> for MonoItem<'tcx> {
                         .iter()
                         .map(|(op, op_sp)| match *op {
                             hir::InlineAsmOperand::Const { ref anon_const } => {
-                                let anon_const_def_id =
-                                    cx.tcx().hir().local_def_id(anon_const.hir_id).to_def_id();
-                                let const_value =
-                                    cx.tcx().const_eval_poly(anon_const_def_id).unwrap_or_else(
-                                        |_| span_bug!(*op_sp, "asm const cannot be resolved"),
-                                    );
+                                let const_value = cx
+                                    .tcx()
+                                    .const_eval_poly(anon_const.def_id.to_def_id())
+                                    .unwrap_or_else(|_| {
+                                        span_bug!(*op_sp, "asm const cannot be resolved")
+                                    });
                                 let ty = cx
                                     .tcx()
                                     .typeck_body(anon_const.body)
@@ -64,7 +64,7 @@ impl<'a, 'tcx: 'a> MonoItemExt<'a, 'tcx> for MonoItem<'tcx> {
                                     .typeck_body(anon_const.body)
                                     .node_type(anon_const.hir_id);
                                 let instance = match ty.kind() {
-                                    &ty::FnDef(def_id, substs) => Instance::new(def_id, substs),
+                                    &ty::FnDef(def_id, args) => Instance::new(def_id, args),
                                     _ => span_bug!(*op_sp, "asm sym is not a function"),
                                 };
 
@@ -138,10 +138,10 @@ impl<'a, 'tcx: 'a> MonoItemExt<'a, 'tcx> for MonoItem<'tcx> {
     fn to_raw_string(&self) -> String {
         match *self {
             MonoItem::Fn(instance) => {
-                format!("Fn({:?}, {})", instance.def, instance.substs.as_ptr().addr())
+                format!("Fn({:?}, {})", instance.def, instance.args.as_ptr().addr())
             }
-            MonoItem::Static(id) => format!("Static({:?})", id),
-            MonoItem::GlobalAsm(id) => format!("GlobalAsm({:?})", id),
+            MonoItem::Static(id) => format!("Static({id:?})"),
+            MonoItem::GlobalAsm(id) => format!("GlobalAsm({id:?})"),
         }
     }
 }

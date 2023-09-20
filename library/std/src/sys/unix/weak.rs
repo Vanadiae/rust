@@ -1,9 +1,8 @@
 //! Support for "weak linkage" to symbols on Unix
 //!
-//! Some I/O operations we do in libstd require newer versions of OSes but we
-//! need to maintain binary compatibility with older releases for now. In order
-//! to use the new functionality when available we use this module for
-//! detection.
+//! Some I/O operations we do in std require newer versions of OSes but we need
+//! to maintain binary compatibility with older releases for now. In order to
+//! use the new functionality when available we use this module for detection.
 //!
 //! One option to use here is weak linkage, but that is unfortunately only
 //! really workable with ELF. Otherwise, use dlsym to get the symbol value at
@@ -29,13 +28,13 @@ use crate::ptr;
 use crate::sync::atomic::{self, AtomicPtr, Ordering};
 
 // We can use true weak linkage on ELF targets.
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
 pub(crate) macro weak {
     (fn $name:ident($($t:ty),*) -> $ret:ty) => (
         let ref $name: ExternWeak<unsafe extern "C" fn($($t),*) -> $ret> = {
             extern "C" {
                 #[linkage = "extern_weak"]
-                static $name: *const libc::c_void;
+                static $name: Option<unsafe extern "C" fn($($t),*) -> $ret>;
             }
             #[allow(unused_unsafe)]
             ExternWeak::new(unsafe { $name })
@@ -44,31 +43,22 @@ pub(crate) macro weak {
 }
 
 // On non-ELF targets, use the dlsym approximation of weak linkage.
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
 pub(crate) use self::dlsym as weak;
 
-pub(crate) struct ExternWeak<F> {
-    weak_ptr: *const libc::c_void,
-    _marker: PhantomData<F>,
+pub(crate) struct ExternWeak<F: Copy> {
+    weak_ptr: Option<F>,
 }
 
-impl<F> ExternWeak<F> {
+impl<F: Copy> ExternWeak<F> {
     #[inline]
-    pub(crate) fn new(weak_ptr: *const libc::c_void) -> Self {
-        ExternWeak { weak_ptr, _marker: PhantomData }
+    pub(crate) fn new(weak_ptr: Option<F>) -> Self {
+        ExternWeak { weak_ptr }
     }
-}
 
-impl<F> ExternWeak<F> {
     #[inline]
     pub(crate) fn get(&self) -> Option<F> {
-        unsafe {
-            if self.weak_ptr.is_null() {
-                None
-            } else {
-                Some(mem::transmute_copy::<*const libc::c_void, F>(&self.weak_ptr))
-            }
-        }
+        self.weak_ptr
     }
 }
 

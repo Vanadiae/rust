@@ -1,5 +1,23 @@
+//@aux-build:proc_macro_derive.rs
+
 #![warn(clippy::shadow_same, clippy::shadow_reuse, clippy::shadow_unrelated)]
-#![allow(clippy::let_unit_value)]
+#![allow(
+    clippy::let_unit_value,
+    clippy::needless_if,
+    clippy::redundant_guards,
+    clippy::redundant_locals
+)]
+
+extern crate proc_macro_derive;
+
+#[derive(proc_macro_derive::ShadowDerive)]
+pub struct Nothing;
+
+macro_rules! reuse {
+    ($v:ident) => {
+        let $v = $v + 1;
+    };
+}
 
 fn shadow_same() {
     let x = 1;
@@ -24,6 +42,12 @@ fn shadow_reuse() -> Option<()> {
         _ => 3,
     };
     None
+}
+
+fn shadow_reuse_macro() {
+    let x = 1;
+    // this should not warn
+    reuse!(x);
 }
 
 fn shadow_unrelated() {
@@ -86,6 +110,13 @@ pub async fn foo1(_a: i32) {}
 
 pub async fn foo2(_a: i32, _b: i64) {
     let _b = _a;
+}
+
+fn ice_8748() {
+    let _ = [0; {
+        let x = 1;
+        if let Some(x) = Some(1) { x } else { 1 }
+    }];
 }
 
 fn main() {}

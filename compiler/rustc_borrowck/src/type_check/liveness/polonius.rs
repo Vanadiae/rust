@@ -2,7 +2,7 @@ use crate::def_use::{self, DefUse};
 use crate::location::{LocationIndex, LocationTable};
 use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{Body, Local, Location, Place};
-use rustc_middle::ty::subst::GenericArg;
+use rustc_middle::ty::GenericArg;
 use rustc_mir_dataflow::move_paths::{LookupResult, MoveData, MovePathIndex};
 
 use super::TypeChecker;
@@ -20,7 +20,7 @@ struct UseFactsExtractor<'me, 'tcx> {
 }
 
 // A Visitor to walk through the MIR and extract point-wise facts
-impl UseFactsExtractor<'_, '_> {
+impl<'tcx> UseFactsExtractor<'_, 'tcx> {
     fn location_to_index(&self, location: Location) -> LocationIndex {
         self.location_table.mid_index(location)
     }
@@ -45,7 +45,7 @@ impl UseFactsExtractor<'_, '_> {
         self.path_accessed_at_base.push((path, self.location_to_index(location)));
     }
 
-    fn place_to_mpi(&self, place: &Place<'_>) -> Option<MovePathIndex> {
+    fn place_to_mpi(&self, place: &Place<'tcx>) -> Option<MovePathIndex> {
         match self.move_data.rev_lookup.find(place.as_ref()) {
             LookupResult::Exact(mpi) => Some(mpi),
             LookupResult::Parent(mmpi) => mmpi,
@@ -54,7 +54,7 @@ impl UseFactsExtractor<'_, '_> {
 }
 
 impl<'a, 'tcx> Visitor<'tcx> for UseFactsExtractor<'a, 'tcx> {
-    fn visit_local(&mut self, &local: &Local, context: PlaceContext, location: Location) {
+    fn visit_local(&mut self, local: Local, context: PlaceContext, location: Location) {
         match def_use::categorize(context) {
             Some(DefUse::Def) => self.insert_def(local, location),
             Some(DefUse::Use) => self.insert_use(local, location),
@@ -121,8 +121,8 @@ pub(super) fn populate_access_facts<'a, 'tcx>(
     }
 }
 
-// For every potentially drop()-touched region `region` in `local`'s type
-// (`kind`), emit a Polonius `use_of_var_derefs_origin(local, origin)` fact.
+/// For every potentially drop()-touched region `region` in `local`'s type
+/// (`kind`), emit a Polonius `use_of_var_derefs_origin(local, origin)` fact.
 pub(super) fn add_drop_of_var_derefs_origin<'tcx>(
     typeck: &mut TypeChecker<'_, 'tcx>,
     local: Local,

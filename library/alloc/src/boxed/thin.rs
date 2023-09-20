@@ -2,9 +2,12 @@
 // https://github.com/matthieu-m/rfc2580/blob/b58d1d3cba0d4b5e859d3617ea2d0943aaa31329/examples/thin.rs
 // by matthieu-m
 use crate::alloc::{self, Layout, LayoutError};
+use core::error::Error;
 use core::fmt::{self, Debug, Display, Formatter};
-use core::marker::{PhantomData, Unsize};
-use core::mem;
+use core::marker::PhantomData;
+#[cfg(not(no_global_oom_handling))]
+use core::marker::Unsize;
+use core::mem::{self, SizedTypeProperties};
 use core::ops::{Deref, DerefMut};
 use core::ptr::Pointee;
 use core::ptr::{self, NonNull};
@@ -29,13 +32,23 @@ use core::ptr::{self, NonNull};
 /// ```
 #[unstable(feature = "thin_box", issue = "92791")]
 pub struct ThinBox<T: ?Sized> {
-    ptr: WithHeader<<T as Pointee>::Metadata>,
+    // This is essentially `WithHeader<<T as Pointee>::Metadata>`,
+    // but that would be invariant in `T`, and we want covariance.
+    ptr: WithOpaqueHeader,
     _marker: PhantomData<T>,
 }
 
+/// `ThinBox<T>` is `Send` if `T` is `Send` because the data is owned.
+#[unstable(feature = "thin_box", issue = "92791")]
+unsafe impl<T: ?Sized + Send> Send for ThinBox<T> {}
+
+/// `ThinBox<T>` is `Sync` if `T` is `Sync` because the data is owned.
+#[unstable(feature = "thin_box", issue = "92791")]
+unsafe impl<T: ?Sized + Sync> Sync for ThinBox<T> {}
+
 #[unstable(feature = "thin_box", issue = "92791")]
 impl<T> ThinBox<T> {
-    /// Moves a type to the heap with its `Metadata` stored in the heap allocation instead of on
+    /// Moves a type to the heap with its [`Metadata`] stored in the heap allocation instead of on
     /// the stack.
     ///
     /// # Examples
@@ -46,17 +59,19 @@ impl<T> ThinBox<T> {
     ///
     /// let five = ThinBox::new(5);
     /// ```
+    ///
+    /// [`Metadata`]: core::ptr::Pointee::Metadata
     #[cfg(not(no_global_oom_handling))]
     pub fn new(value: T) -> Self {
         let meta = ptr::metadata(&value);
-        let ptr = WithHeader::new(meta, value);
+        let ptr = WithOpaqueHeader::new(meta, value);
         ThinBox { ptr, _marker: PhantomData }
     }
 }
 
 #[unstable(feature = "thin_box", issue = "92791")]
 impl<Dyn: ?Sized> ThinBox<Dyn> {
-    /// Moves a type to the heap with its `Metadata` stored in the heap allocation instead of on
+    /// Moves a type to the heap with its [`Metadata`] stored in the heap allocation instead of on
     /// the stack.
     ///
     /// # Examples
@@ -67,13 +82,15 @@ impl<Dyn: ?Sized> ThinBox<Dyn> {
     ///
     /// let thin_slice = ThinBox::<[i32]>::new_unsize([1, 2, 3, 4]);
     /// ```
+    ///
+    /// [`Metadata`]: core::ptr::Pointee::Metadata
     #[cfg(not(no_global_oom_handling))]
     pub fn new_unsize<T>(value: T) -> Self
     where
         T: Unsize<Dyn>,
     {
         let meta = ptr::metadata(&value as &Dyn);
-        let ptr = WithHeader::new(meta, value);
+        let ptr = WithOpaqueHeader::new(meta, value);
         ThinBox { ptr, _marker: PhantomData }
     }
 }
@@ -120,7 +137,7 @@ impl<T: ?Sized> Drop for ThinBox<T> {
         unsafe {
             let value = self.deref_mut();
             let value = value as *mut T;
-            self.ptr.drop::<T>(value);
+            self.with_header().drop::<T>(value);
         }
     }
 }
@@ -130,11 +147,16 @@ impl<T: ?Sized> ThinBox<T> {
     fn meta(&self) -> <T as Pointee>::Metadata {
         //  Safety:
         //  -   NonNull and valid.
-        unsafe { *self.ptr.header() }
+        unsafe { *self.with_header().header() }
     }
 
     fn data(&self) -> *mut u8 {
-        self.ptr.value()
+        self.with_header().value()
+    }
+
+    fn with_header(&self) -> &WithHeader<<T as Pointee>::Metadata> {
+        // SAFETY: both types are transparent to `NonNull<u8>`
+        unsafe { &*((&self.ptr) as *const WithOpaqueHeader as *const WithHeader<_>) }
     }
 }
 
@@ -143,7 +165,21 @@ impl<T: ?Sized> ThinBox<T> {
 ///    metadata (`H`) are ZSTs.
 /// 2. A pointer to a valid `T` that has a header `H` directly before the
 ///    pointed-to location.
+#[repr(transparent)]
 struct WithHeader<H>(NonNull<u8>, PhantomData<H>);
+
+/// An opaque representation of `WithHeader<H>` to avoid the
+/// projection invariance of `<T as Pointee>::Metadata`.
+#[repr(transparent)]
+struct WithOpaqueHeader(NonNull<u8>);
+
+impl WithOpaqueHeader {
+    #[cfg(not(no_global_oom_handling))]
+    fn new<H, T>(header: H, value: T) -> Self {
+        let ptr = WithHeader::new(header, value);
+        Self(ptr.0)
+    }
+}
 
 impl<H> WithHeader<H> {
     #[cfg(not(no_global_oom_handling))]
@@ -166,9 +202,7 @@ impl<H> WithHeader<H> {
             let ptr = if layout.size() == 0 {
                 // Some paranoia checking, mostly so that the ThinBox tests are
                 // more able to catch issues.
-                debug_assert!(
-                    value_offset == 0 && mem::size_of::<T>() == 0 && mem::size_of::<H>() == 0
-                );
+                debug_assert!(value_offset == 0 && T::IS_ZST && H::IS_ZST);
                 layout.dangling()
             } else {
                 let ptr = alloc::alloc(layout);
@@ -194,24 +228,43 @@ impl<H> WithHeader<H> {
     // - Assumes that either `value` can be dereferenced, or is the
     //   `NonNull::dangling()` we use when both `T` and `H` are ZSTs.
     unsafe fn drop<T: ?Sized>(&self, value: *mut T) {
+        struct DropGuard<H> {
+            ptr: NonNull<u8>,
+            value_layout: Layout,
+            _marker: PhantomData<H>,
+        }
+
+        impl<H> Drop for DropGuard<H> {
+            fn drop(&mut self) {
+                unsafe {
+                    // SAFETY: Layout must have been computable if we're in drop
+                    let (layout, value_offset) =
+                        WithHeader::<H>::alloc_layout(self.value_layout).unwrap_unchecked();
+
+                    // Note: Don't deallocate if the layout size is zero, because the pointer
+                    // didn't come from the allocator.
+                    if layout.size() != 0 {
+                        alloc::dealloc(self.ptr.as_ptr().sub(value_offset), layout);
+                    } else {
+                        debug_assert!(
+                            value_offset == 0 && H::IS_ZST && self.value_layout.size() == 0
+                        );
+                    }
+                }
+            }
+        }
+
         unsafe {
-            let value_layout = Layout::for_value_raw(value);
-            // SAFETY: Layout must have been computable if we're in drop
-            let (layout, value_offset) = Self::alloc_layout(value_layout).unwrap_unchecked();
+            // `_guard` will deallocate the memory when dropped, even if `drop_in_place` unwinds.
+            let _guard = DropGuard {
+                ptr: self.0,
+                value_layout: Layout::for_value_raw(value),
+                _marker: PhantomData::<H>,
+            };
 
             // We only drop the value because the Pointee trait requires that the metadata is copy
             // aka trivially droppable.
             ptr::drop_in_place::<T>(value);
-
-            // Note: Don't deallocate if the layout size is zero, because the pointer
-            // didn't come from the allocator.
-            if layout.size() != 0 {
-                alloc::dealloc(self.0.as_ptr().sub(value_offset), layout);
-            } else {
-                debug_assert!(
-                    value_offset == 0 && mem::size_of::<H>() == 0 && value_layout.size() == 0
-                );
-            }
         }
     }
 
@@ -238,5 +291,12 @@ impl<H> WithHeader<H> {
 
     fn alloc_layout(value_layout: Layout) -> Result<(Layout, usize), LayoutError> {
         Layout::new::<H>().extend(value_layout)
+    }
+}
+
+#[unstable(feature = "thin_box", issue = "92791")]
+impl<T: ?Sized + Error> Error for ThinBox<T> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.deref().source()
     }
 }

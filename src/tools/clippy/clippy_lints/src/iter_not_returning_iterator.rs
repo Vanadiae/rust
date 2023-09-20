@@ -1,5 +1,8 @@
-use clippy_utils::{diagnostics::span_lint, get_parent_node, ty::implements_trait};
-use rustc_hir::{def_id::LocalDefId, FnSig, ImplItem, ImplItemKind, Item, ItemKind, Node, TraitItem, TraitItemKind};
+use clippy_utils::diagnostics::span_lint;
+use clippy_utils::get_parent_node;
+use clippy_utils::ty::implements_trait;
+use rustc_hir::def_id::LocalDefId;
+use rustc_hir::{FnSig, ImplItem, ImplItemKind, Item, ItemKind, Node, TraitItem, TraitItemKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::symbol::sym;
@@ -44,7 +47,7 @@ impl<'tcx> LateLintPass<'tcx> for IterNotReturningIterator {
         let name = item.ident.name.as_str();
         if matches!(name, "iter" | "iter_mut") {
             if let TraitItemKind::Fn(fn_sig, _) = &item.kind {
-                check_sig(cx, name, fn_sig, item.def_id);
+                check_sig(cx, name, fn_sig, item.owner_id.def_id);
             }
         }
     }
@@ -58,7 +61,7 @@ impl<'tcx> LateLintPass<'tcx> for IterNotReturningIterator {
             )
         {
             if let ImplItemKind::Fn(fn_sig, _) = &item.kind {
-                check_sig(cx, name, fn_sig, item.def_id);
+                check_sig(cx, name, fn_sig, item.owner_id.def_id);
             }
         }
     }
@@ -66,7 +69,9 @@ impl<'tcx> LateLintPass<'tcx> for IterNotReturningIterator {
 
 fn check_sig(cx: &LateContext<'_>, name: &str, sig: &FnSig<'_>, fn_id: LocalDefId) {
     if sig.decl.implicit_self.has_implicit_self() {
-        let ret_ty = cx.tcx.erase_late_bound_regions(cx.tcx.fn_sig(fn_id).output());
+        let ret_ty = cx
+            .tcx
+            .erase_late_bound_regions(cx.tcx.fn_sig(fn_id).instantiate_identity().output());
         let ret_ty = cx
             .tcx
             .try_normalize_erasing_regions(cx.param_env, ret_ty)
@@ -80,10 +85,7 @@ fn check_sig(cx: &LateContext<'_>, name: &str, sig: &FnSig<'_>, fn_id: LocalDefI
                 cx,
                 ITER_NOT_RETURNING_ITERATOR,
                 sig.span,
-                &format!(
-                    "this method is named `{}` but its return type does not implement `Iterator`",
-                    name
-                ),
+                &format!("this method is named `{name}` but its return type does not implement `Iterator`"),
             );
         }
     }

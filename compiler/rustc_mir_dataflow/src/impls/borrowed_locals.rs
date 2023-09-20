@@ -1,8 +1,8 @@
-use super::*;
-
-use crate::{AnalysisDomain, CallReturnPlaces, GenKill, GenKillAnalysis};
+use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
+
+use crate::{AnalysisDomain, GenKill, GenKillAnalysis};
 
 /// A dataflow analysis that tracks whether a pointer or reference could possibly exist that points
 /// to a given local.
@@ -10,10 +10,11 @@ use rustc_middle::mir::*;
 /// At present, this is used as a very limited form of alias analysis. For example,
 /// `MaybeBorrowedLocals` is used to compute which locals are live during a yield expression for
 /// immovable generators.
+#[derive(Clone, Copy)]
 pub struct MaybeBorrowedLocals;
 
 impl MaybeBorrowedLocals {
-    fn transfer_function<'a, T>(&'a self, trans: &'a mut T) -> TransferFunction<'a, T> {
+    pub(super) fn transfer_function<'a, T>(&'a self, trans: &'a mut T) -> TransferFunction<'a, T> {
         TransferFunction { trans }
     }
 }
@@ -22,12 +23,12 @@ impl<'tcx> AnalysisDomain<'tcx> for MaybeBorrowedLocals {
     type Domain = BitSet<Local>;
     const NAME: &'static str = "maybe_borrowed_locals";
 
-    fn bottom_value(&self, body: &mir::Body<'tcx>) -> Self::Domain {
+    fn bottom_value(&self, body: &Body<'tcx>) -> Self::Domain {
         // bottom = unborrowed
         BitSet::new_empty(body.local_decls().len())
     }
 
-    fn initialize_start_block(&self, _: &mir::Body<'tcx>, _: &mut Self::Domain) {
+    fn initialize_start_block(&self, _: &Body<'tcx>, _: &mut Self::Domain) {
         // No locals are aliased on function entry
     }
 }
@@ -35,35 +36,40 @@ impl<'tcx> AnalysisDomain<'tcx> for MaybeBorrowedLocals {
 impl<'tcx> GenKillAnalysis<'tcx> for MaybeBorrowedLocals {
     type Idx = Local;
 
+    fn domain_size(&self, body: &Body<'tcx>) -> usize {
+        body.local_decls.len()
+    }
+
     fn statement_effect(
-        &self,
+        &mut self,
         trans: &mut impl GenKill<Self::Idx>,
-        statement: &mir::Statement<'tcx>,
+        statement: &Statement<'tcx>,
         location: Location,
     ) {
         self.transfer_function(trans).visit_statement(statement, location);
     }
 
-    fn terminator_effect(
-        &self,
-        trans: &mut impl GenKill<Self::Idx>,
-        terminator: &mir::Terminator<'tcx>,
+    fn terminator_effect<'mir>(
+        &mut self,
+        trans: &mut Self::Domain,
+        terminator: &'mir Terminator<'tcx>,
         location: Location,
-    ) {
+    ) -> TerminatorEdges<'mir, 'tcx> {
         self.transfer_function(trans).visit_terminator(terminator, location);
+        terminator.edges()
     }
 
     fn call_return_effect(
-        &self,
+        &mut self,
         _trans: &mut impl GenKill<Self::Idx>,
-        _block: mir::BasicBlock,
+        _block: BasicBlock,
         _return_places: CallReturnPlaces<'_, 'tcx>,
     ) {
     }
 }
 
 /// A `Visitor` that defines the transfer function for `MaybeBorrowedLocals`.
-struct TransferFunction<'a, T> {
+pub(super) struct TransferFunction<'a, T> {
     trans: &'a mut T,
 }
 
@@ -81,43 +87,37 @@ where
         }
     }
 
-    fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: Location) {
+    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
         self.super_rvalue(rvalue, location);
 
         match rvalue {
-            mir::Rvalue::AddressOf(_mt, borrowed_place) => {
+            Rvalue::AddressOf(_, borrowed_place) | Rvalue::Ref(_, _, borrowed_place) => {
                 if !borrowed_place.is_indirect() {
                     self.trans.gen(borrowed_place.local);
                 }
             }
 
-            mir::Rvalue::Ref(_, _kind, borrowed_place) => {
-                if !borrowed_place.is_indirect() {
-                    self.trans.gen(borrowed_place.local);
-                }
-            }
-
-            mir::Rvalue::Cast(..)
-            | mir::Rvalue::ShallowInitBox(..)
-            | mir::Rvalue::Use(..)
-            | mir::Rvalue::ThreadLocalRef(..)
-            | mir::Rvalue::Repeat(..)
-            | mir::Rvalue::Len(..)
-            | mir::Rvalue::BinaryOp(..)
-            | mir::Rvalue::CheckedBinaryOp(..)
-            | mir::Rvalue::NullaryOp(..)
-            | mir::Rvalue::UnaryOp(..)
-            | mir::Rvalue::Discriminant(..)
-            | mir::Rvalue::Aggregate(..) => {}
+            Rvalue::Cast(..)
+            | Rvalue::ShallowInitBox(..)
+            | Rvalue::Use(..)
+            | Rvalue::ThreadLocalRef(..)
+            | Rvalue::Repeat(..)
+            | Rvalue::Len(..)
+            | Rvalue::BinaryOp(..)
+            | Rvalue::CheckedBinaryOp(..)
+            | Rvalue::NullaryOp(..)
+            | Rvalue::UnaryOp(..)
+            | Rvalue::Discriminant(..)
+            | Rvalue::Aggregate(..)
+            | Rvalue::CopyForDeref(..) => {}
         }
     }
 
-    fn visit_terminator(&mut self, terminator: &mir::Terminator<'tcx>, location: Location) {
+    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
         self.super_terminator(terminator, location);
 
         match terminator.kind {
-            mir::TerminatorKind::Drop { place: dropped_place, .. }
-            | mir::TerminatorKind::DropAndReplace { place: dropped_place, .. } => {
+            TerminatorKind::Drop { place: dropped_place, .. } => {
                 // Drop terminators may call custom drop glue (`Drop::drop`), which takes `&mut
                 // self` as a parameter. In the general case, a drop impl could launder that
                 // reference into the surrounding environment through a raw pointer, thus creating
@@ -126,10 +126,12 @@ where
                 // for now. See discussion on [#61069].
                 //
                 // [#61069]: https://github.com/rust-lang/rust/pull/61069
-                self.trans.gen(dropped_place.local);
+                if !dropped_place.is_indirect() {
+                    self.trans.gen(dropped_place.local);
+                }
             }
 
-            TerminatorKind::Abort
+            TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::Assert { .. }
             | TerminatorKind::Call { .. }
             | TerminatorKind::FalseEdge { .. }
@@ -137,11 +139,31 @@ where
             | TerminatorKind::GeneratorDrop
             | TerminatorKind::Goto { .. }
             | TerminatorKind::InlineAsm { .. }
-            | TerminatorKind::Resume
+            | TerminatorKind::UnwindResume
             | TerminatorKind::Return
             | TerminatorKind::SwitchInt { .. }
             | TerminatorKind::Unreachable
             | TerminatorKind::Yield { .. } => {}
         }
     }
+}
+
+/// The set of locals that are borrowed at some point in the MIR body.
+pub fn borrowed_locals(body: &Body<'_>) -> BitSet<Local> {
+    struct Borrowed(BitSet<Local>);
+
+    impl GenKill<Local> for Borrowed {
+        #[inline]
+        fn gen(&mut self, elem: Local) {
+            self.0.gen(elem)
+        }
+        #[inline]
+        fn kill(&mut self, _: Local) {
+            // Ignore borrow invalidation.
+        }
+    }
+
+    let mut borrowed = Borrowed(BitSet::new_empty(body.local_decls.len()));
+    TransferFunction { trans: &mut borrowed }.visit_body(body);
+    borrowed.0
 }

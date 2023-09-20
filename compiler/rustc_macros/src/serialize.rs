@@ -42,6 +42,12 @@ fn decodable_body(
     }
     let ty_name = s.ast().ident.to_string();
     let decode_body = match s.variants() {
+        [] => {
+            let message = format!("`{ty_name}` has no variants to decode");
+            quote! {
+                panic!(#message)
+            }
+        }
         [vi] => vi.construct(|field, _index| decode_field(field)),
         variants => {
             let match_inner: TokenStream = variants
@@ -53,14 +59,14 @@ fn decodable_body(
                 })
                 .collect();
             let message = format!(
-                "invalid enum variant tag while decoding `{}`, expected 0..{}",
+                "invalid enum variant tag while decoding `{}`, expected 0..{}, actual {{}}",
                 ty_name,
                 variants.len()
             );
             quote! {
                 match ::rustc_serialize::Decoder::read_usize(__decoder) {
                     #match_inner
-                    _ => panic!(#message),
+                    n => panic!(#message, n),
                 }
             }
         }
@@ -139,6 +145,11 @@ fn encodable_body(
     });
 
     let encode_body = match s.variants() {
+        [] => {
+            quote! {
+                match *self {}
+            }
+        }
         [_] => {
             let encode_inner = s.each_variant(|vi| {
                 vi.bindings()
@@ -146,24 +157,37 @@ fn encodable_body(
                     .map(|binding| {
                         let bind_ident = &binding.binding;
                         let result = quote! {
-                            match ::rustc_serialize::Encodable::<#encoder_ty>::encode(
+                            ::rustc_serialize::Encodable::<#encoder_ty>::encode(
                                 #bind_ident,
                                 __encoder,
-                            ) {
-                                ::std::result::Result::Ok(()) => (),
-                                ::std::result::Result::Err(__err)
-                                    => return ::std::result::Result::Err(__err),
-                            }
+                            );
                         };
                         result
                     })
                     .collect::<TokenStream>()
             });
             quote! {
-                ::std::result::Result::Ok(match *self { #encode_inner })
+                match *self { #encode_inner }
             }
         }
         _ => {
+            let disc = {
+                let mut variant_idx = 0usize;
+                let encode_inner = s.each_variant(|_| {
+                    let result = quote! {
+                        #variant_idx
+                    };
+                    variant_idx += 1;
+                    result
+                });
+                quote! {
+                    let disc = match *self {
+                        #encode_inner
+                    };
+                    ::rustc_serialize::Encoder::emit_usize(__encoder, disc);
+                }
+            };
+
             let mut variant_idx = 0usize;
             let encode_inner = s.each_variant(|vi| {
                 let encode_fields: TokenStream = vi
@@ -172,38 +196,19 @@ fn encodable_body(
                     .map(|binding| {
                         let bind_ident = &binding.binding;
                         let result = quote! {
-                            match ::rustc_serialize::Encodable::<#encoder_ty>::encode(
+                            ::rustc_serialize::Encodable::<#encoder_ty>::encode(
                                 #bind_ident,
                                 __encoder,
-                            ) {
-                                ::std::result::Result::Ok(()) => (),
-                                ::std::result::Result::Err(__err)
-                                    => return ::std::result::Result::Err(__err),
-                            }
+                            );
                         };
                         result
                     })
                     .collect();
-
-                let result = if !vi.bindings().is_empty() {
-                    quote! {
-                        ::rustc_serialize::Encoder::emit_enum_variant(
-                            __encoder,
-                            #variant_idx,
-                            |__encoder| { ::std::result::Result::Ok({ #encode_fields }) }
-                        )
-                    }
-                } else {
-                    quote! {
-                        ::rustc_serialize::Encoder::emit_fieldless_enum_variant::<#variant_idx>(
-                            __encoder,
-                        )
-                    }
-                };
                 variant_idx += 1;
-                result
+                encode_fields
             });
             quote! {
+                #disc
                 match *self {
                     #encode_inner
                 }
@@ -223,7 +228,7 @@ fn encodable_body(
             fn encode(
                 &self,
                 __encoder: &mut #encoder_ty,
-            ) -> ::std::result::Result<(), <#encoder_ty as ::rustc_serialize::Encoder>::Error> {
+            ) {
                 #lints
                 #encode_body
             }

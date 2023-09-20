@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![warn(clippy::unnecessary_owned_empty_strings)]
 
 fn ref_str_argument(_value: &str) {}
@@ -12,6 +10,7 @@ fn main() {
     ref_str_argument(&String::new());
 
     // should be linted
+    #[allow(clippy::manual_string_new)]
     ref_str_argument(&String::from(""));
 
     // should not be linted

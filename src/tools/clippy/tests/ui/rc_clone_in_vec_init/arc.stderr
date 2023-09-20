@@ -1,29 +1,30 @@
-error: calling `Arc::new` in `vec![elem; len]`
-  --> $DIR/arc.rs:7:13
+error: initializing a reference-counted pointer in `vec![elem; len]`
+  --> $DIR/arc.rs:9:13
    |
 LL |     let v = vec![Arc::new("x".to_string()); 2];
    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
-   = note: `-D clippy::rc-clone-in-vec-init` implied by `-D warnings`
    = note: each element will point to the same `Arc` instance
+   = note: `-D clippy::rc-clone-in-vec-init` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::rc_clone_in_vec_init)]`
 help: consider initializing each `Arc` element individually
    |
 LL ~     let v = {
 LL +         let mut v = Vec::with_capacity(2);
-LL +         (0..2).for_each(|_| v.push(Arc::new("x".to_string())));
+LL +         (0..2).for_each(|_| v.push(Arc::new(..)));
 LL +         v
 LL ~     };
    |
 help: or if this is intentional, consider extracting the `Arc` initialization to a variable
    |
 LL ~     let v = {
-LL +         let data = Arc::new("x".to_string());
+LL +         let data = Arc::new(..);
 LL +         vec![data; 2]
 LL ~     };
    |
 
-error: calling `Arc::new` in `vec![elem; len]`
-  --> $DIR/arc.rs:15:21
+error: initializing a reference-counted pointer in `vec![elem; len]`
+  --> $DIR/arc.rs:19:21
    |
 LL |             let v = vec![Arc::new("x".to_string()); 2];
    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -33,26 +34,26 @@ help: consider initializing each `Arc` element individually
    |
 LL ~             let v = {
 LL +                 let mut v = Vec::with_capacity(2);
-LL +                 (0..2).for_each(|_| v.push(Arc::new("x".to_string())));
+LL +                 (0..2).for_each(|_| v.push(Arc::new(..)));
 LL +                 v
 LL ~             };
    |
 help: or if this is intentional, consider extracting the `Arc` initialization to a variable
    |
 LL ~             let v = {
-LL +                 let data = Arc::new("x".to_string());
+LL +                 let data = Arc::new(..);
 LL +                 vec![data; 2]
 LL ~             };
    |
 
-error: calling `Arc::new` in `vec![elem; len]`
-  --> $DIR/arc.rs:21:13
+error: initializing a reference-counted pointer in `vec![elem; len]`
+  --> $DIR/arc.rs:27:13
    |
 LL |       let v = vec![
    |  _____________^
+LL | |
+LL | |
 LL | |         std::sync::Arc::new(Mutex::new({
-LL | |             let x = 1;
-LL | |             dbg!(x);
 ...  |
 LL | |         2
 LL | |     ];
@@ -75,14 +76,14 @@ LL +         vec![data; 2]
 LL ~     };
    |
 
-error: calling `Arc::new` in `vec![elem; len]`
-  --> $DIR/arc.rs:30:14
+error: initializing a reference-counted pointer in `vec![elem; len]`
+  --> $DIR/arc.rs:38:14
    |
 LL |       let v1 = vec![
    |  ______________^
+LL | |
+LL | |
 LL | |         Arc::new(Mutex::new({
-LL | |             let x = 1;
-LL | |             dbg!(x);
 ...  |
 LL | |         2
 LL | |     ];

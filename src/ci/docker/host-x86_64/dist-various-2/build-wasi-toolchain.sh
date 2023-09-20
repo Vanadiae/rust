@@ -2,15 +2,15 @@
 
 set -ex
 
-# Originally from https://github.com/llvm/llvm-project/releases/download/llvmorg-14.0.0/clang+llvm-14.0.0-x86_64-linux-gnu-ubuntu-18.04.tar.xz
-curl https://ci-mirrors.rust-lang.org/rustc/2022-05-10-clang%2Bllvm-14.0.0-x86_64-linux-gnu-ubuntu-18.04.tar.xz | \
+# Originally from https://github.com/llvm/llvm-project/releases/download/llvmorg-16.0.4/clang+llvm-16.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz
+curl https://ci-mirrors.rust-lang.org/rustc/2023-05-17-clang%2Bllvm-16.0.4-x86_64-linux-gnu-ubuntu-22.04.tar.xz | \
   tar xJf -
-bin="$PWD/clang+llvm-14.0.0-x86_64-linux-gnu-ubuntu-18.04/bin"
+bin="$PWD/clang+llvm-16.0.4-x86_64-linux-gnu-ubuntu-22.04/bin"
 
 git clone https://github.com/WebAssembly/wasi-libc
 
 cd wasi-libc
-git reset --hard 9886d3d6200fcc3726329966860fc058707406cd
+git reset --hard ec4566beae84e54952637f0bf61bee4b4cacc087
 make -j$(nproc) \
     CC="$bin/clang" \
     NM="$bin/llvm-nm" \

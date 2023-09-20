@@ -1,53 +1,15 @@
 // Local js definitions:
 /* global addClass, getSettingValue, hasClass, searchState */
-/* global onEach, onEachLazy, removeClass */
+/* global onEach, onEachLazy, removeClass, getVar */
 
 "use strict";
 
-if (!String.prototype.startsWith) {
-    String.prototype.startsWith = function(searchString, position) {
-        position = position || 0;
-        return this.indexOf(searchString, position) === position;
-    };
-}
-if (!String.prototype.endsWith) {
-    String.prototype.endsWith = function(suffix, length) {
-        const l = length || this.length;
-        return this.indexOf(suffix, l - suffix.length) !== -1;
-    };
-}
-
-if (!DOMTokenList.prototype.add) {
-    DOMTokenList.prototype.add = function(className) {
-        if (className && !hasClass(this, className)) {
-            if (this.className && this.className.length > 0) {
-                this.className += " " + className;
-            } else {
-                this.className = className;
-            }
-        }
-    };
-}
-
-if (!DOMTokenList.prototype.remove) {
-    DOMTokenList.prototype.remove = function(className) {
-        if (className && this.className) {
-            this.className = (" " + this.className + " ").replace(" " + className + " ", " ")
-                                                         .trim();
-        }
-    };
-}
-
-// Get a value from the rustdoc-vars div, which is used to convey data from
-// Rust to the JS. If there is no such element, return null.
-function getVar(name) {
-    const el = document.getElementById("rustdoc-vars");
-    if (el) {
-        return el.attributes["data-" + name].value;
-    } else {
-        return null;
-    }
-}
+// The amount of time that the cursor must remain still over a hover target before
+// revealing a tooltip.
+//
+// https://www.nngroup.com/articles/timing-exposing-content/
+window.RUSTDOC_TOOLTIP_HOVER_MS = 300;
+window.RUSTDOC_TOOLTIP_HOVER_EXIT_MS = 450;
 
 // Given a basename (e.g. "storage") and an extension (e.g. ".js"), return a URL
 // for a resource under the root-path, with the resource-suffix.
@@ -63,28 +25,38 @@ function showMain() {
     removeClass(document.getElementById(MAIN_ID), "hidden");
 }
 
-(function() {
-    window.rootPath = getVar("root-path");
-    window.currentCrate = getVar("current-crate");
-    window.searchJS =  resourcePath("search", ".js");
-    window.searchIndexJS = resourcePath("search-index", ".js");
-    window.settingsJS = resourcePath("settings", ".js");
-    const sidebarVars = document.getElementById("sidebar-vars");
-    if (sidebarVars) {
-        window.sidebarCurrent = {
-            name: sidebarVars.attributes["data-name"].value,
-            ty: sidebarVars.attributes["data-ty"].value,
-            relpath: sidebarVars.attributes["data-relpath"].value,
-        };
-        // FIXME: It would be nicer to generate this text content directly in HTML,
-        // but with the current code it's hard to get the right information in the right place.
-        const mobileLocationTitle = document.querySelector(".mobile-topbar h2.location");
-        const locationTitle = document.querySelector(".sidebar h2.location");
-        if (mobileLocationTitle && locationTitle) {
-            mobileLocationTitle.innerHTML = locationTitle.innerHTML;
+function elemIsInParent(elem, parent) {
+    while (elem && elem !== document.body) {
+        if (elem === parent) {
+            return true;
         }
+        elem = elem.parentElement;
     }
-}());
+    return false;
+}
+
+function blurHandler(event, parentElem, hideCallback) {
+    if (!elemIsInParent(document.activeElement, parentElem) &&
+        !elemIsInParent(event.relatedTarget, parentElem)
+    ) {
+        hideCallback();
+    }
+}
+
+window.rootPath = getVar("root-path");
+window.currentCrate = getVar("current-crate");
+
+function setMobileTopbar() {
+    // FIXME: It would be nicer to generate this text content directly in HTML,
+    // but with the current code it's hard to get the right information in the right place.
+    const mobileTopbar = document.querySelector(".mobile-topbar");
+    const locationTitle = document.querySelector(".sidebar h2.location");
+    if (mobileTopbar && locationTitle) {
+        const mobileTitle = document.createElement("h2");
+        mobileTitle.innerHTML = locationTitle.innerHTML;
+        mobileTopbar.appendChild(mobileTitle);
+    }
+}
 
 // Gets the human-readable string for the virtual-key code of the
 // given KeyboardEvent, ev.
@@ -112,19 +84,20 @@ const MAIN_ID = "main-content";
 const SETTINGS_BUTTON_ID = "settings-menu";
 const ALTERNATIVE_DISPLAY_ID = "alternative-display";
 const NOT_DISPLAYED_ID = "not-displayed";
+const HELP_BUTTON_ID = "help-button";
 
 function getSettingsButton() {
     return document.getElementById(SETTINGS_BUTTON_ID);
+}
+
+function getHelpButton() {
+    return document.getElementById(HELP_BUTTON_ID);
 }
 
 // Returns the current URL without any query parameter or hash.
 function getNakedUrl() {
     return window.location.href.split("?")[0].split("#")[0];
 }
-
-window.hideSettings = () => {
-    // Does nothing by default.
-};
 
 /**
  * This function inserts `newNode` after `referenceNode`. It doesn't work if `referenceNode`
@@ -205,16 +178,18 @@ function browserSupportsHistoryApi() {
     return window.history && typeof window.history.pushState === "function";
 }
 
-// eslint-disable-next-line no-unused-vars
-function loadCss(cssFileName) {
+function preLoadCss(cssUrl) {
+    // https://developer.mozilla.org/en-US/docs/Web/HTML/Link_types/preload
     const link = document.createElement("link");
-    link.href = resourcePath(cssFileName, ".css");
-    link.type = "text/css";
-    link.rel = "stylesheet";
+    link.href = cssUrl;
+    link.rel = "preload";
+    link.as = "style";
     document.getElementsByTagName("head")[0].appendChild(link);
 }
 
 (function() {
+    const isHelpPage = window.location.pathname.endsWith("/help.html");
+
     function loadScript(url) {
         const script = document.createElement("script");
         script.src = url;
@@ -222,12 +197,29 @@ function loadCss(cssFileName) {
     }
 
     getSettingsButton().onclick = event => {
+        if (event.ctrlKey || event.altKey || event.metaKey) {
+            return;
+        }
+        window.hideAllModals(false);
         addClass(getSettingsButton(), "rotate");
         event.preventDefault();
         // Sending request for the CSS and the JS files at the same time so it will
         // hopefully be loaded when the JS will generate the settings content.
-        loadCss("settings");
-        loadScript(window.settingsJS);
+        loadScript(getVar("static-root-path") + getVar("settings-js"));
+        // Pre-load all theme CSS files, so that switching feels seamless.
+        //
+        // When loading settings.html as a standalone page, the equivalent HTML is
+        // generated in context.rs.
+        setTimeout(() => {
+            const themes = getVar("themes").split(",");
+            for (const theme of themes) {
+                // if there are no themes, do nothing
+                // "".split(",") == [""]
+                if (theme !== "") {
+                    preLoadCss(getVar("root-path") + theme + ".css");
+                }
+            }
+        }, 0);
     };
 
     window.searchState = {
@@ -276,14 +268,17 @@ function loadCss(cssFileName) {
             searchState.mouseMovedAfterSearch = false;
             document.title = searchState.title;
         },
+        removeQueryParameters: () => {
+            // We change the document title.
+            document.title = searchState.titleBeforeSearch;
+            if (browserSupportsHistoryApi()) {
+                history.replaceState(null, "", getNakedUrl() + window.location.hash);
+            }
+        },
         hideResults: () => {
             switchDisplayedElement(null);
-            document.title = searchState.titleBeforeSearch;
             // We also remove the query parameter from the URL.
-            if (browserSupportsHistoryApi()) {
-                history.replaceState(null, window.currentCrate + " - Rust",
-                    getNakedUrl() + window.location.hash);
-            }
+            searchState.removeQueryParameters();
         },
         getQueryStringParams: () => {
             const params = {};
@@ -304,8 +299,8 @@ function loadCss(cssFileName) {
             function loadSearch() {
                 if (!searchLoaded) {
                     searchLoaded = true;
-                    loadScript(window.searchJS);
-                    loadScript(window.searchIndexJS);
+                    loadScript(getVar("static-root-path") + getVar("search-js"));
+                    loadScript(resourcePath("search-index", ".js"));
                 }
             }
 
@@ -321,24 +316,16 @@ function loadCss(cssFileName) {
 
             const params = searchState.getQueryStringParams();
             if (params.search !== undefined) {
-                const search = searchState.outputElement();
-                search.innerHTML = "<h3 class=\"search-loading\">" +
-                    searchState.loadingText + "</h3>";
-                searchState.showResults(search);
+                searchState.setLoadingSearch();
                 loadSearch();
             }
         },
+        setLoadingSearch: () => {
+            const search = searchState.outputElement();
+            search.innerHTML = "<h3 class=\"search-loading\">" + searchState.loadingText + "</h3>";
+            searchState.showResults(search);
+        },
     };
-
-    function getPageId() {
-        if (window.location.hash) {
-            const tmp = window.location.hash.replace(/^#/, "");
-            if (tmp.length > 0) {
-                return tmp;
-            }
-        }
-        return null;
-    }
 
     const toggleAllDocsId = "toggle-all-docs";
     let savedHash = "";
@@ -360,19 +347,18 @@ function loadCss(cssFileName) {
             }
         }
         // This part is used in case an element is not visible.
-        if (savedHash !== window.location.hash) {
-            savedHash = window.location.hash;
-            if (savedHash.length === 0) {
-                return;
+        const pageId = window.location.hash.replace(/^#/, "");
+        if (savedHash !== pageId) {
+            savedHash = pageId;
+            if (pageId !== "") {
+                expandSection(pageId);
             }
-            expandSection(savedHash.slice(1)); // we remove the '#'
         }
     }
 
     function onHashChange(ev) {
         // If we're in mobile mode, we should hide the sidebar in any case.
-        const sidebar = document.getElementsByClassName("sidebar")[0];
-        removeClass(sidebar, "shown");
+        hideSidebar();
         handleHashes(ev);
     }
 
@@ -389,65 +375,24 @@ function loadCss(cssFileName) {
         openParentDetails(document.getElementById(id));
     }
 
-    function getHelpElement(build) {
-        if (build) {
-            buildHelperPopup();
-        }
-        return document.getElementById("help");
-    }
-
-    /**
-     * Show the help popup.
-     *
-     * @param {boolean} display    - Whether to show or hide the popup
-     * @param {Event}   ev         - The event that triggered this call
-     * @param {Element} [help]     - The help element if it already exists
-     */
-    function displayHelp(display, ev, help) {
-        if (display) {
-            help = help ? help : getHelpElement(true);
-            if (hasClass(help, "hidden")) {
-                ev.preventDefault();
-                removeClass(help, "hidden");
-                addClass(document.body, "blur");
-            }
-        } else {
-            // No need to build the help popup if we want to hide it in case it hasn't been
-            // built yet...
-            help = help ? help : getHelpElement(false);
-            if (help && !hasClass(help, "hidden")) {
-                ev.preventDefault();
-                addClass(help, "hidden");
-                removeClass(document.body, "blur");
-            }
-        }
-    }
-
     function handleEscape(ev) {
         searchState.clearInputTimeout();
-        const help = getHelpElement(false);
-        if (help && !hasClass(help, "hidden")) {
-            displayHelp(false, ev, help);
-        } else {
-            switchDisplayedElement(null);
-            if (browserSupportsHistoryApi()) {
-                history.replaceState(null, window.currentCrate + " - Rust",
-                    getNakedUrl() + window.location.hash);
-            }
-            ev.preventDefault();
-        }
+        searchState.hideResults();
+        ev.preventDefault();
         searchState.defocus();
-        window.hideSettings();
+        window.hideAllModals(true); // true = reset focus for tooltips
     }
 
-    const disableShortcuts = getSettingValue("disable-shortcuts") === "true";
     function handleShortcut(ev) {
         // Don't interfere with browser shortcuts
+        const disableShortcuts = getSettingValue("disable-shortcuts") === "true";
         if (ev.ctrlKey || ev.altKey || ev.metaKey || disableShortcuts) {
             return;
         }
 
-        if (document.activeElement.tagName === "INPUT") {
+        if (document.activeElement.tagName === "INPUT" &&
+            document.activeElement.type !== "checkbox" &&
+            document.activeElement.type !== "radio") {
             switch (getVirtualKey(ev)) {
             case "Escape":
                 handleEscape(ev);
@@ -461,19 +406,21 @@ function loadCss(cssFileName) {
 
             case "s":
             case "S":
-                displayHelp(false, ev);
                 ev.preventDefault();
                 searchState.focus();
                 break;
 
             case "+":
+                ev.preventDefault();
+                expandAllDocs();
+                break;
             case "-":
                 ev.preventDefault();
-                toggleAllDocs();
+                collapseAllDocs();
                 break;
 
             case "?":
-                displayHelp(true, ev);
+                showHelp();
                 break;
 
             default:
@@ -485,40 +432,11 @@ function loadCss(cssFileName) {
     document.addEventListener("keypress", handleShortcut);
     document.addEventListener("keydown", handleShortcut);
 
-    // delayed sidebar rendering.
-    window.initSidebarItems = items => {
-        const sidebar = document.getElementsByClassName("sidebar-elems")[0];
-        let others;
-        const current = window.sidebarCurrent;
-
-        function addSidebarCrates(crates) {
-            if (!hasClass(document.body, "crate")) {
-                // We only want to list crates on the crate page.
-                return;
-            }
-            // Draw a convenient sidebar of known crates if we have a listing
-            const div = document.createElement("div");
-            div.className = "block crate";
-            div.innerHTML = "<h3>Crates</h3>";
-            const ul = document.createElement("ul");
-            div.appendChild(ul);
-
-            for (const crate of crates) {
-                let klass = "crate";
-                if (window.rootPath !== "./" && crate === window.currentCrate) {
-                    klass += " current";
-                }
-                const link = document.createElement("a");
-                link.href = window.rootPath + crate + "/index.html";
-                link.className = klass;
-                link.textContent = crate;
-
-                const li = document.createElement("li");
-                li.appendChild(link);
-                ul.appendChild(li);
-            }
-            others.appendChild(div);
+    function addSidebarItems() {
+        if (!window.SIDEBAR_ITEMS) {
+            return;
         }
+        const sidebar = document.getElementsByClassName("sidebar-elems")[0];
 
         /**
          * Append to the sidebar a "block" of links - a heading along with a list (`<ul>`) of items.
@@ -529,78 +447,64 @@ function loadCss(cssFileName) {
          *                          "Modules", or "Macros".
          */
         function block(shortty, id, longty) {
-            const filtered = items[shortty];
+            const filtered = window.SIDEBAR_ITEMS[shortty];
             if (!filtered) {
                 return;
             }
 
-            const div = document.createElement("div");
-            div.className = "block " + shortty;
             const h3 = document.createElement("h3");
             h3.innerHTML = `<a href="index.html#${id}">${longty}</a>`;
-            div.appendChild(h3);
             const ul = document.createElement("ul");
+            ul.className = "block " + shortty;
 
-            for (const item of filtered) {
-                const name = item[0];
-                const desc = item[1]; // can be null
-
-                let klass = shortty;
-                if (name === current.name && shortty === current.ty) {
-                    klass += " current";
-                }
+            for (const name of filtered) {
                 let path;
                 if (shortty === "mod") {
                     path = name + "/index.html";
                 } else {
                     path = shortty + "." + name + ".html";
                 }
+                const current_page = document.location.href.split("/").pop();
                 const link = document.createElement("a");
-                link.href = current.relpath + path;
-                link.title = desc;
-                link.className = klass;
+                link.href = path;
+                if (path === current_page) {
+                    link.className = "current";
+                }
                 link.textContent = name;
                 const li = document.createElement("li");
                 li.appendChild(link);
                 ul.appendChild(li);
             }
-            div.appendChild(ul);
-            others.appendChild(div);
+            sidebar.appendChild(h3);
+            sidebar.appendChild(ul);
         }
 
         if (sidebar) {
-            others = document.createElement("div");
-            others.className = "others";
-            sidebar.appendChild(others);
-
-            const isModule = hasClass(document.body, "mod");
-            if (!isModule) {
-                block("primitive", "primitives", "Primitive Types");
-                block("mod", "modules", "Modules");
-                block("macro", "macros", "Macros");
-                block("struct", "structs", "Structs");
-                block("enum", "enums", "Enums");
-                block("union", "unions", "Unions");
-                block("constant", "constants", "Constants");
-                block("static", "static", "Statics");
-                block("trait", "traits", "Traits");
-                block("fn", "functions", "Functions");
-                block("type", "types", "Type Definitions");
-                block("foreigntype", "foreign-types", "Foreign Types");
-                block("keyword", "keywords", "Keywords");
-                block("traitalias", "trait-aliases", "Trait Aliases");
-            }
-
-            // `crates{version}.js` should always be loaded before this script, so we can use
-            // it safely.
-            addSidebarCrates(window.ALL_CRATES);
+            block("primitive", "primitives", "Primitive Types");
+            block("mod", "modules", "Modules");
+            block("macro", "macros", "Macros");
+            block("struct", "structs", "Structs");
+            block("enum", "enums", "Enums");
+            block("union", "unions", "Unions");
+            block("constant", "constants", "Constants");
+            block("static", "static", "Statics");
+            block("trait", "traits", "Traits");
+            block("fn", "functions", "Functions");
+            block("type", "types", "Type Aliases");
+            block("foreigntype", "foreign-types", "Foreign Types");
+            block("keyword", "keywords", "Keywords");
+            block("traitalias", "trait-aliases", "Trait Aliases");
         }
-    };
+    }
 
     window.register_implementors = imp => {
         const implementors = document.getElementById("implementors-list");
         const synthetic_implementors = document.getElementById("synthetic-implementors-list");
         const inlined_types = new Set();
+
+        const TEXT_IDX = 0;
+        const SYNTHETIC_IDX = 1;
+        const TYPES_IDX = 2;
 
         if (synthetic_implementors) {
             // This `inlined_types` variable is used to avoid having the same implementation
@@ -620,27 +524,31 @@ function loadCss(cssFileName) {
         }
 
         let currentNbImpls = implementors.getElementsByClassName("impl").length;
-        const traitName = document.querySelector("h1.fqn > .in-band > .trait").textContent;
+        const traitName = document.querySelector(".main-heading h1 > .trait").textContent;
         const baseIdName = "impl-" + traitName + "-";
         const libs = Object.getOwnPropertyNames(imp);
         // We don't want to include impls from this JS file, when the HTML already has them.
         // The current crate should always be ignored. Other crates that should also be
         // ignored are included in the attribute `data-ignore-extern-crates`.
-        const ignoreExternCrates = document
-            .querySelector("script[data-ignore-extern-crates]")
-            .getAttribute("data-ignore-extern-crates");
+        const script = document
+            .querySelector("script[data-ignore-extern-crates]");
+        const ignoreExternCrates = new Set(
+            (script ? script.getAttribute("data-ignore-extern-crates") : "").split(",")
+        );
         for (const lib of libs) {
-            if (lib === window.currentCrate || ignoreExternCrates.indexOf(lib) !== -1) {
+            if (lib === window.currentCrate || ignoreExternCrates.has(lib)) {
                 continue;
             }
             const structs = imp[lib];
 
             struct_loop:
             for (const struct of structs) {
-                const list = struct.synthetic ? synthetic_implementors : implementors;
+                const list = struct[SYNTHETIC_IDX] ? synthetic_implementors : implementors;
 
-                if (struct.synthetic) {
-                    for (const struct_type of struct.types) {
+                // The types list is only used for synthetic impls.
+                // If this changes, `main.js` and `write_shared.rs` both need changed.
+                if (struct[SYNTHETIC_IDX]) {
+                    for (const struct_type of struct[TYPES_IDX]) {
                         if (inlined_types.has(struct_type)) {
                             continue struct_loop;
                         }
@@ -649,14 +557,13 @@ function loadCss(cssFileName) {
                 }
 
                 const code = document.createElement("h3");
-                code.innerHTML = struct.text;
+                code.innerHTML = struct[TEXT_IDX];
                 addClass(code, "code-header");
-                addClass(code, "in-band");
 
                 onEachLazy(code.getElementsByTagName("a"), elem => {
                     const href = elem.getAttribute("href");
 
-                    if (href && href.indexOf("http") !== 0) {
+                    if (href && !/^(?:[a-z+]+:)?\/\//.test(href)) {
                         elem.setAttribute("href", window.rootPath + href);
                     }
                 });
@@ -680,14 +587,61 @@ function loadCss(cssFileName) {
         window.register_implementors(window.pending_implementors);
     }
 
-    function labelForToggleButton(sectionIsCollapsed) {
-        if (sectionIsCollapsed) {
-            // button will expand the section
-            return "+";
+    function addSidebarCrates() {
+        if (!window.ALL_CRATES) {
+            return;
         }
-        // button will collapse the section
-        // note that this text is also set in the HTML template in ../render/mod.rs
-        return "\u2212"; // "\u2212" is "−" minus sign
+        const sidebarElems = document.getElementsByClassName("sidebar-elems")[0];
+        if (!sidebarElems) {
+            return;
+        }
+        // Draw a convenient sidebar of known crates if we have a listing
+        const h3 = document.createElement("h3");
+        h3.innerHTML = "Crates";
+        const ul = document.createElement("ul");
+        ul.className = "block crate";
+
+        for (const crate of window.ALL_CRATES) {
+            const link = document.createElement("a");
+            link.href = window.rootPath + crate + "/index.html";
+            if (window.rootPath !== "./" && crate === window.currentCrate) {
+                link.className = "current";
+            }
+            link.textContent = crate;
+
+            const li = document.createElement("li");
+            li.appendChild(link);
+            ul.appendChild(li);
+        }
+        sidebarElems.appendChild(h3);
+        sidebarElems.appendChild(ul);
+    }
+
+    function expandAllDocs() {
+        const innerToggle = document.getElementById(toggleAllDocsId);
+        removeClass(innerToggle, "will-expand");
+        onEachLazy(document.getElementsByClassName("toggle"), e => {
+            if (!hasClass(e, "type-contents-toggle") && !hasClass(e, "more-examples-toggle")) {
+                e.open = true;
+            }
+        });
+        innerToggle.title = "collapse all docs";
+        innerToggle.children[0].innerText = "\u2212"; // "\u2212" is "−" minus sign
+    }
+
+    function collapseAllDocs() {
+        const innerToggle = document.getElementById(toggleAllDocsId);
+        addClass(innerToggle, "will-expand");
+        onEachLazy(document.getElementsByClassName("toggle"), e => {
+            if (e.parentNode.id !== "implementations-list" ||
+                (!hasClass(e, "implementors-toggle") &&
+                 !hasClass(e, "type-contents-toggle"))
+            ) {
+                e.open = false;
+            }
+        });
+        innerToggle.title = "expand all docs";
+        innerToggle.children[0].innerText = "+";
     }
 
     function toggleAllDocs() {
@@ -695,29 +649,11 @@ function loadCss(cssFileName) {
         if (!innerToggle) {
             return;
         }
-        let sectionIsCollapsed = false;
         if (hasClass(innerToggle, "will-expand")) {
-            removeClass(innerToggle, "will-expand");
-            onEachLazy(document.getElementsByClassName("rustdoc-toggle"), e => {
-                if (!hasClass(e, "type-contents-toggle")) {
-                    e.open = true;
-                }
-            });
-            innerToggle.title = "collapse all docs";
+            expandAllDocs();
         } else {
-            addClass(innerToggle, "will-expand");
-            onEachLazy(document.getElementsByClassName("rustdoc-toggle"), e => {
-                if (e.parentNode.id !== "implementations-list" ||
-                    (!hasClass(e, "implementors-toggle") &&
-                     !hasClass(e, "type-contents-toggle"))
-                ) {
-                    e.open = false;
-                }
-            });
-            sectionIsCollapsed = true;
-            innerToggle.title = "expand all docs";
+            collapseAllDocs();
         }
-        innerToggle.children[0].innerText = labelForToggleButton(sectionIsCollapsed);
     }
 
     (function() {
@@ -744,7 +680,7 @@ function loadCss(cssFileName) {
             setImplementorsTogglesOpen("blanket-implementations-list", false);
         }
 
-        onEachLazy(document.getElementsByClassName("rustdoc-toggle"), e => {
+        onEachLazy(document.getElementsByClassName("toggle"), e => {
             if (!hideLargeItemContents && hasClass(e, "type-contents-toggle")) {
                 e.open = true;
             }
@@ -753,80 +689,84 @@ function loadCss(cssFileName) {
             }
 
         });
-
-        const pageId = getPageId();
-        if (pageId !== null) {
-            expandSection(pageId);
-        }
     }());
 
-    (function() {
-        // To avoid checking on "rustdoc-line-numbers" value on every loop...
-        let lineNumbersFunc = () => {};
-        if (getSettingValue("line-numbers") === "true") {
-            lineNumbersFunc = x => {
-                const count = x.textContent.split("\n").length;
-                const elems = [];
-                for (let i = 0; i < count; ++i) {
-                    elems.push(i + 1);
-                }
-                const node = document.createElement("pre");
-                addClass(node, "line-number");
-                node.innerHTML = elems.join("\n");
-                x.parentNode.insertBefore(node, x);
-            };
-        }
-        onEachLazy(document.getElementsByClassName("rust-example-rendered"), e => {
-            if (hasClass(e, "compile_fail")) {
-                e.addEventListener("mouseover", function() {
-                    this.parentElement.previousElementSibling.childNodes[0].style.color = "#f00";
-                });
-                e.addEventListener("mouseout", function() {
-                    this.parentElement.previousElementSibling.childNodes[0].style.color = "";
-                });
-            } else if (hasClass(e, "ignore")) {
-                e.addEventListener("mouseover", function() {
-                    this.parentElement.previousElementSibling.childNodes[0].style.color = "#ff9200";
-                });
-                e.addEventListener("mouseout", function() {
-                    this.parentElement.previousElementSibling.childNodes[0].style.color = "";
-                });
+    window.rustdoc_add_line_numbers_to_examples = () => {
+        onEachLazy(document.getElementsByClassName("rust-example-rendered"), x => {
+            const parent = x.parentNode;
+            const line_numbers = parent.querySelectorAll(".example-line-numbers");
+            if (line_numbers.length > 0) {
+                return;
             }
-            lineNumbersFunc(e);
+            const count = x.textContent.split("\n").length;
+            const elems = [];
+            for (let i = 0; i < count; ++i) {
+                elems.push(i + 1);
+            }
+            const node = document.createElement("pre");
+            addClass(node, "example-line-numbers");
+            node.innerHTML = elems.join("\n");
+            parent.insertBefore(node, x);
         });
-    }());
+    };
+
+    window.rustdoc_remove_line_numbers_from_examples = () => {
+        onEachLazy(document.getElementsByClassName("rust-example-rendered"), x => {
+            const parent = x.parentNode;
+            const line_numbers = parent.querySelectorAll(".example-line-numbers");
+            for (const node of line_numbers) {
+                parent.removeChild(node);
+            }
+        });
+    };
+
+    if (getSettingValue("line-numbers") === "true") {
+        window.rustdoc_add_line_numbers_to_examples();
+    }
+
+    function showSidebar() {
+        window.hideAllModals(false);
+        const sidebar = document.getElementsByClassName("sidebar")[0];
+        addClass(sidebar, "shown");
+    }
 
     function hideSidebar() {
         const sidebar = document.getElementsByClassName("sidebar")[0];
         removeClass(sidebar, "shown");
     }
 
-    function handleClick(id, f) {
-        const elem = document.getElementById(id);
-        if (elem) {
-            elem.addEventListener("click", f);
+    window.addEventListener("resize", () => {
+        if (window.CURRENT_TOOLTIP_ELEMENT) {
+            // As a workaround to the behavior of `contains: layout` used in doc togglers,
+            // tooltip popovers are positioned using javascript.
+            //
+            // This means when the window is resized, we need to redo the layout.
+            const base = window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE;
+            const force_visible = base.TOOLTIP_FORCE_VISIBLE;
+            hideTooltip(false);
+            if (force_visible) {
+                showTooltip(base);
+                base.TOOLTIP_FORCE_VISIBLE = true;
+            }
         }
-    }
-    handleClick("help-button", ev => {
-        displayHelp(true, ev);
-    });
-    handleClick(MAIN_ID, () => {
-        hideSidebar();
     });
 
-    onEachLazy(document.getElementsByTagName("a"), el => {
+    const mainElem = document.getElementById(MAIN_ID);
+    if (mainElem) {
+        mainElem.addEventListener("click", hideSidebar);
+    }
+
+    onEachLazy(document.querySelectorAll("a[href^='#']"), el => {
         // For clicks on internal links (<A> tags with a hash property), we expand the section we're
         // jumping to *before* jumping there. We can't do this in onHashChange, because it changes
         // the height of the document so we wind up scrolled to the wrong place.
-        if (el.hash) {
-            el.addEventListener("click", () => {
-                expandSection(el.hash.slice(1));
-                hideSidebar();
-            });
-        }
+        el.addEventListener("click", () => {
+            expandSection(el.hash.slice(1));
+            hideSidebar();
+        });
     });
 
-    onEachLazy(document.querySelectorAll(".rustdoc-toggle > summary:not(.hideme)"), el => {
+    onEachLazy(document.querySelectorAll(".toggle > summary:not(.hideme)"), el => {
         el.addEventListener("click", e => {
             if (e.target.tagName !== "SUMMARY" && e.target.tagName !== "A") {
                 e.preventDefault();
@@ -834,10 +774,252 @@ function loadCss(cssFileName) {
         });
     });
 
-    onEachLazy(document.getElementsByClassName("notable-traits"), e => {
-        e.onclick = function() {
-            this.getElementsByClassName("notable-traits-tooltiptext")[0]
-                .classList.toggle("force-tooltip");
+    /**
+     * Show a tooltip immediately.
+     *
+     * @param {DOMElement} e - The tooltip's anchor point. The DOM is consulted to figure
+     *                         out what the tooltip should contain, and where it should be
+     *                         positioned.
+     */
+    function showTooltip(e) {
+        const notable_ty = e.getAttribute("data-notable-ty");
+        if (!window.NOTABLE_TRAITS && notable_ty) {
+            const data = document.getElementById("notable-traits-data");
+            if (data) {
+                window.NOTABLE_TRAITS = JSON.parse(data.innerText);
+            } else {
+                throw new Error("showTooltip() called with notable without any notable traits!");
+            }
+        }
+        // Make this function idempotent. If the tooltip is already shown, avoid doing extra work
+        // and leave it alone.
+        if (window.CURRENT_TOOLTIP_ELEMENT && window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE === e) {
+            clearTooltipHoverTimeout(window.CURRENT_TOOLTIP_ELEMENT);
+            return;
+        }
+        window.hideAllModals(false);
+        const wrapper = document.createElement("div");
+        if (notable_ty) {
+            wrapper.innerHTML = "<div class=\"content\">" +
+                window.NOTABLE_TRAITS[notable_ty] + "</div>";
+        } else {
+            // Replace any `title` attribute with `data-title` to avoid double tooltips.
+            if (e.getAttribute("title") !== null) {
+                e.setAttribute("data-title", e.getAttribute("title"));
+                e.removeAttribute("title");
+            }
+            if (e.getAttribute("data-title") !== null) {
+                const titleContent = document.createElement("div");
+                titleContent.className = "content";
+                titleContent.appendChild(document.createTextNode(e.getAttribute("data-title")));
+                wrapper.appendChild(titleContent);
+            }
+        }
+        wrapper.className = "tooltip popover";
+        const focusCatcher = document.createElement("div");
+        focusCatcher.setAttribute("tabindex", "0");
+        focusCatcher.onfocus = hideTooltip;
+        wrapper.appendChild(focusCatcher);
+        const pos = e.getBoundingClientRect();
+        // 5px overlap so that the mouse can easily travel from place to place
+        wrapper.style.top = (pos.top + window.scrollY + pos.height) + "px";
+        wrapper.style.left = 0;
+        wrapper.style.right = "auto";
+        wrapper.style.visibility = "hidden";
+        const body = document.getElementsByTagName("body")[0];
+        body.appendChild(wrapper);
+        const wrapperPos = wrapper.getBoundingClientRect();
+        // offset so that the arrow points at the center of the "(i)"
+        const finalPos = pos.left + window.scrollX - wrapperPos.width + 24;
+        if (finalPos > 0) {
+            wrapper.style.left = finalPos + "px";
+        } else {
+            wrapper.style.setProperty(
+                "--popover-arrow-offset",
+                (wrapperPos.right - pos.right + 4) + "px"
+            );
+        }
+        wrapper.style.visibility = "";
+        window.CURRENT_TOOLTIP_ELEMENT = wrapper;
+        window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE = e;
+        clearTooltipHoverTimeout(window.CURRENT_TOOLTIP_ELEMENT);
+        wrapper.onpointerenter = ev => {
+            // If this is a synthetic touch event, ignore it. A click event will be along shortly.
+            if (ev.pointerType !== "mouse") {
+                return;
+            }
+            clearTooltipHoverTimeout(e);
+        };
+        wrapper.onpointerleave = ev => {
+            // If this is a synthetic touch event, ignore it. A click event will be along shortly.
+            if (ev.pointerType !== "mouse") {
+                return;
+            }
+            if (!e.TOOLTIP_FORCE_VISIBLE && !elemIsInParent(ev.relatedTarget, e)) {
+                // See "Tooltip pointer leave gesture" below.
+                setTooltipHoverTimeout(e, false);
+                addClass(wrapper, "fade-out");
+            }
+        };
+    }
+
+    /**
+     * Show or hide the tooltip after a timeout. If a timeout was already set before this function
+     * was called, that timeout gets cleared. If the tooltip is already in the requested state,
+     * this function will still clear any pending timeout, but otherwise do nothing.
+     *
+     * @param {DOMElement} element - The tooltip's anchor point. The DOM is consulted to figure
+     *                               out what the tooltip should contain, and where it should be
+     *                               positioned.
+     * @param {boolean}    show    - If true, the tooltip will be made visible. If false, it will
+     *                               be hidden.
+     */
+    function setTooltipHoverTimeout(element, show) {
+        clearTooltipHoverTimeout(element);
+        if (!show && !window.CURRENT_TOOLTIP_ELEMENT) {
+            // To "hide" an already hidden element, just cancel its timeout.
+            return;
+        }
+        if (show && window.CURRENT_TOOLTIP_ELEMENT) {
+            // To "show" an already visible element, just cancel its timeout.
+            return;
+        }
+        if (window.CURRENT_TOOLTIP_ELEMENT &&
+            window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE !== element) {
+            // Don't do anything if another tooltip is already visible.
+            return;
+        }
+        element.TOOLTIP_HOVER_TIMEOUT = setTimeout(() => {
+            if (show) {
+                showTooltip(element);
+            } else if (!element.TOOLTIP_FORCE_VISIBLE) {
+                hideTooltip(false);
+            }
+        }, show ? window.RUSTDOC_TOOLTIP_HOVER_MS : window.RUSTDOC_TOOLTIP_HOVER_EXIT_MS);
+    }
+
+    /**
+     * If a show/hide timeout was set by `setTooltipHoverTimeout`, cancel it. If none exists,
+     * do nothing.
+     *
+     * @param {DOMElement} element - The tooltip's anchor point,
+     *                               as passed to `setTooltipHoverTimeout`.
+     */
+    function clearTooltipHoverTimeout(element) {
+        if (element.TOOLTIP_HOVER_TIMEOUT !== undefined) {
+            removeClass(window.CURRENT_TOOLTIP_ELEMENT, "fade-out");
+            clearTimeout(element.TOOLTIP_HOVER_TIMEOUT);
+            delete element.TOOLTIP_HOVER_TIMEOUT;
+        }
+    }
+
+    function tooltipBlurHandler(event) {
+        if (window.CURRENT_TOOLTIP_ELEMENT &&
+            !elemIsInParent(document.activeElement, window.CURRENT_TOOLTIP_ELEMENT) &&
+            !elemIsInParent(event.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT) &&
+            !elemIsInParent(document.activeElement, window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE) &&
+            !elemIsInParent(event.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE)
+        ) {
+            // Work around a difference in the focus behaviour between Firefox, Chrome, and Safari.
+            // When I click the button on an already-opened tooltip popover, Safari
+            // hides the popover and then immediately shows it again, while everyone else hides it
+            // and it stays hidden.
+            //
+            // To work around this, make sure the click finishes being dispatched before
+            // hiding the popover. Since `hideTooltip()` is idempotent, this makes Safari behave
+            // consistently with the other two.
+            setTimeout(() => hideTooltip(false), 0);
+        }
+    }
+
+    /**
+     * Hide the current tooltip immediately.
+     *
+     * @param {boolean} focus - If set to `true`, move keyboard focus to the tooltip anchor point.
+     *                          If set to `false`, leave keyboard focus alone.
+     */
+    function hideTooltip(focus) {
+        if (window.CURRENT_TOOLTIP_ELEMENT) {
+            if (window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE.TOOLTIP_FORCE_VISIBLE) {
+                if (focus) {
+                    window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE.focus();
+                }
+                window.CURRENT_TOOLTIP_ELEMENT.TOOLTIP_BASE.TOOLTIP_FORCE_VISIBLE = false;
+            }
+            const body = document.getElementsByTagName("body")[0];
+            body.removeChild(window.CURRENT_TOOLTIP_ELEMENT);
+            clearTooltipHoverTimeout(window.CURRENT_TOOLTIP_ELEMENT);
+            window.CURRENT_TOOLTIP_ELEMENT = null;
+        }
+    }
+
+    onEachLazy(document.getElementsByClassName("tooltip"), e => {
+        e.onclick = () => {
+            e.TOOLTIP_FORCE_VISIBLE = e.TOOLTIP_FORCE_VISIBLE ? false : true;
+            if (window.CURRENT_TOOLTIP_ELEMENT && !e.TOOLTIP_FORCE_VISIBLE) {
+                hideTooltip(true);
+            } else {
+                showTooltip(e);
+                window.CURRENT_TOOLTIP_ELEMENT.setAttribute("tabindex", "0");
+                window.CURRENT_TOOLTIP_ELEMENT.focus();
+                window.CURRENT_TOOLTIP_ELEMENT.onblur = tooltipBlurHandler;
+            }
+            return false;
+        };
+        e.onpointerenter = ev => {
+            // If this is a synthetic touch event, ignore it. A click event will be along shortly.
+            if (ev.pointerType !== "mouse") {
+                return;
+            }
+            setTooltipHoverTimeout(e, true);
+        };
+        e.onpointermove = ev => {
+            // If this is a synthetic touch event, ignore it. A click event will be along shortly.
+            if (ev.pointerType !== "mouse") {
+                return;
+            }
+            setTooltipHoverTimeout(e, true);
+        };
+        e.onpointerleave = ev => {
+            // If this is a synthetic touch event, ignore it. A click event will be along shortly.
+            if (ev.pointerType !== "mouse") {
+                return;
+            }
+            if (!e.TOOLTIP_FORCE_VISIBLE &&
+                !elemIsInParent(ev.relatedTarget, window.CURRENT_TOOLTIP_ELEMENT)) {
+                // Tooltip pointer leave gesture:
+                //
+                // Designing a good hover microinteraction is a matter of guessing user
+                // intent from what are, literally, vague gestures. In this case, guessing if
+                // hovering in or out of the tooltip base is intentional or not.
+                //
+                // To figure this out, a few different techniques are used:
+                //
+                // * When the mouse pointer enters a tooltip anchor point, its hitbox is grown
+                //   on the bottom, where the popover is/will appear. Search "hover tunnel" in
+                //   rustdoc.css for the implementation.
+                // * There's a delay when the mouse pointer enters the popover base anchor, in
+                //   case the mouse pointer was just passing through and the user didn't want
+                //   to open it.
+                // * Similarly, a delay is added when exiting the anchor, or the popover
+                //   itself, before hiding it.
+                // * A fade-out animation is layered onto the pointer exit delay to immediately
+                //   inform the user that they successfully dismissed the popover, while still
+                //   providing a way for them to cancel it if it was a mistake and they still
+                //   wanted to interact with it.
+                // * No animation is used for revealing it, because we don't want people to try
+                //   to interact with an element while it's in the middle of fading in: either
+                //   they're allowed to interact with it while it's fading in, meaning it can't
+                //   serve as mistake-proofing for the popover, or they can't, but
+                //   they might try and be frustrated.
+                //
+                // See also:
+                // * https://www.nngroup.com/articles/timing-exposing-content/
+                // * https://www.nngroup.com/articles/tooltip-guidelines/
+                // * https://bjk5.com/post/44698559168/breaking-down-amazons-mega-dropdown
+                setTooltipHoverTimeout(e, false);
+                addClass(window.CURRENT_TOOLTIP_ELEMENT, "fade-out");
+            }
         };
     });
 
@@ -846,31 +1028,24 @@ function loadCss(cssFileName) {
         sidebar_menu_toggle.addEventListener("click", () => {
             const sidebar = document.getElementsByClassName("sidebar")[0];
             if (!hasClass(sidebar, "shown")) {
-                addClass(sidebar, "shown");
+                showSidebar();
             } else {
-                removeClass(sidebar, "shown");
+                hideSidebar();
             }
         });
     }
 
-    let buildHelperPopup = () => {
-        const popup = document.createElement("aside");
-        addClass(popup, "hidden");
-        popup.id = "help";
+    function helpBlurHandler(event) {
+        blurHandler(event, getHelpButton(), window.hidePopoverMenus);
+    }
 
-        popup.addEventListener("click", ev => {
-            if (ev.target === popup) {
-                // Clicked the blurred zone outside the help popup; dismiss help.
-                displayHelp(false, ev);
-            }
-        });
-
+    function buildHelpMenu() {
         const book_info = document.createElement("span");
+        const channel = getVar("channel");
         book_info.className = "top";
-        book_info.innerHTML = "You can find more information in \
-            <a href=\"https://doc.rust-lang.org/rustdoc/\">the rustdoc book</a>.";
+        book_info.innerHTML = `You can find more information in \
+<a href="https://doc.rust-lang.org/${channel}/rustdoc/">the rustdoc book</a>.`;
 
-        const container = document.createElement("div");
         const shortcuts = [
             ["?", "Show this help dialog"],
             ["S", "Focus the search field"],
@@ -882,33 +1057,34 @@ function loadCss(cssFileName) {
             ["-", "Collapse all sections"],
         ].map(x => "<dt>" +
             x[0].split(" ")
-                .map((y, index) => (index & 1) === 0 ? "<kbd>" + y + "</kbd>" : " " + y + " ")
+                .map((y, index) => ((index & 1) === 0 ? "<kbd>" + y + "</kbd>" : " " + y + " "))
                 .join("") + "</dt><dd>" + x[1] + "</dd>").join("");
         const div_shortcuts = document.createElement("div");
         addClass(div_shortcuts, "shortcuts");
         div_shortcuts.innerHTML = "<h2>Keyboard Shortcuts</h2><dl>" + shortcuts + "</dl></div>";
 
         const infos = [
+            `For a full list of all search features, take a look <a \
+href="https://doc.rust-lang.org/${channel}/rustdoc/how-to-read-rustdoc.html\
+#the-search-interface">here</a>.`,
             "Prefix searches with a type followed by a colon (e.g., <code>fn:</code>) to \
              restrict the search to a given item kind.",
             "Accepted kinds are: <code>fn</code>, <code>mod</code>, <code>struct</code>, \
              <code>enum</code>, <code>trait</code>, <code>type</code>, <code>macro</code>, \
              and <code>const</code>.",
             "Search functions by type signature (e.g., <code>vec -&gt; usize</code> or \
-             <code>* -&gt; vec</code>)",
-            "Search multiple things at once by splitting your query with comma (e.g., \
-             <code>str,u8</code> or <code>String,struct:Vec,test</code>)",
+             <code>-&gt; vec</code> or <code>String, enum:Cow -&gt; bool</code>)",
             "You can look for items with an exact name by putting double quotes around \
              your request: <code>\"string\"</code>",
+             "Look for functions that accept or return \
+              <a href=\"https://doc.rust-lang.org/std/primitive.slice.html\">slices</a> and \
+              <a href=\"https://doc.rust-lang.org/std/primitive.array.html\">arrays</a> by writing \
+              square brackets (e.g., <code>-&gt; [u8]</code> or <code>[] -&gt; Option</code>)",
             "Look for items inside another one by searching for a path: <code>vec::Vec</code>",
         ].map(x => "<p>" + x + "</p>").join("");
         const div_infos = document.createElement("div");
         addClass(div_infos, "infos");
         div_infos.innerHTML = "<h2>Search Tricks</h2>" + infos;
-
-        container.appendChild(book_info);
-        container.appendChild(div_shortcuts);
-        container.appendChild(div_infos);
 
         const rustdoc_version = document.createElement("span");
         rustdoc_version.className = "bottom";
@@ -916,14 +1092,130 @@ function loadCss(cssFileName) {
         rustdoc_version_code.innerText = "rustdoc " + getVar("rustdoc-version");
         rustdoc_version.appendChild(rustdoc_version_code);
 
+        const container = document.createElement("div");
+        if (!isHelpPage) {
+            container.className = "popover";
+        }
+        container.id = "help";
+        container.style.display = "none";
+
+        const side_by_side = document.createElement("div");
+        side_by_side.className = "side-by-side";
+        side_by_side.appendChild(div_shortcuts);
+        side_by_side.appendChild(div_infos);
+
+        container.appendChild(book_info);
+        container.appendChild(side_by_side);
         container.appendChild(rustdoc_version);
 
-        popup.appendChild(container);
-        insertAfter(popup, document.querySelector("main"));
-        // So that it's only built once and then it'll do nothing when called!
-        buildHelperPopup = () => {};
+        if (isHelpPage) {
+            const help_section = document.createElement("section");
+            help_section.appendChild(container);
+            document.getElementById("main-content").appendChild(help_section);
+            container.style.display = "block";
+        } else {
+            const help_button = getHelpButton();
+            help_button.appendChild(container);
+
+            container.onblur = helpBlurHandler;
+            help_button.onblur = helpBlurHandler;
+            help_button.children[0].onblur = helpBlurHandler;
+        }
+
+        return container;
+    }
+
+    /**
+     * Hide popover menus, clickable tooltips, and the sidebar (if applicable).
+     *
+     * Pass "true" to reset focus for tooltip popovers.
+     */
+    window.hideAllModals = switchFocus => {
+        hideSidebar();
+        window.hidePopoverMenus();
+        hideTooltip(switchFocus);
     };
 
+    /**
+     * Hide all the popover menus.
+     */
+    window.hidePopoverMenus = () => {
+        onEachLazy(document.querySelectorAll(".search-form .popover"), elem => {
+            elem.style.display = "none";
+        });
+    };
+
+    /**
+     * Returns the help menu element (not the button).
+     *
+     * @param {boolean} buildNeeded - If this argument is `false`, the help menu element won't be
+     *                                built if it doesn't exist.
+     *
+     * @return {HTMLElement}
+     */
+    function getHelpMenu(buildNeeded) {
+        let menu = getHelpButton().querySelector(".popover");
+        if (!menu && buildNeeded) {
+            menu = buildHelpMenu();
+        }
+        return menu;
+    }
+
+    /**
+     * Show the help popup menu.
+     */
+    function showHelp() {
+        // Prevent `blur` events from being dispatched as a result of closing
+        // other modals.
+        getHelpButton().querySelector("a").focus();
+        const menu = getHelpMenu(true);
+        if (menu.style.display === "none") {
+            window.hideAllModals();
+            menu.style.display = "";
+        }
+    }
+
+    if (isHelpPage) {
+        showHelp();
+        document.querySelector(`#${HELP_BUTTON_ID} > a`).addEventListener("click", event => {
+            // Already on the help page, make help button a no-op.
+            const target = event.target;
+            if (target.tagName !== "A" ||
+                target.parentElement.id !== HELP_BUTTON_ID ||
+                event.ctrlKey ||
+                event.altKey ||
+                event.metaKey) {
+                return;
+            }
+            event.preventDefault();
+        });
+    } else {
+        document.querySelector(`#${HELP_BUTTON_ID} > a`).addEventListener("click", event => {
+            // By default, have help button open docs in a popover.
+            // If user clicks with a moderator, though, use default browser behavior,
+            // probably opening in a new window or tab.
+            const target = event.target;
+            if (target.tagName !== "A" ||
+                target.parentElement.id !== HELP_BUTTON_ID ||
+                event.ctrlKey ||
+                event.altKey ||
+                event.metaKey) {
+                return;
+            }
+            event.preventDefault();
+            const menu = getHelpMenu(true);
+            const shouldShowHelp = menu.style.display === "none";
+            if (shouldShowHelp) {
+                showHelp();
+            } else {
+                window.hidePopoverMenus();
+            }
+        });
+    }
+
+    setMobileTopbar();
+    addSidebarItems();
+    addSidebarCrates();
     onHashChange(null);
     window.addEventListener("hashchange", onHashChange);
     searchState.setup();
@@ -932,7 +1224,11 @@ function loadCss(cssFileName) {
 (function() {
     let reset_button_timeout = null;
 
-    window.copy_path = but => {
+    const but = document.getElementById("copy-path");
+    if (!but) {
+        return;
+    }
+    but.onclick = () => {
         const parent = but.parentElement;
         const path = [];
 

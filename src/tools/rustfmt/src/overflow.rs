@@ -32,7 +32,7 @@ use crate::utils::{count_newlines, extra_offset, first_line_width, last_line_wid
 /// Organized as a list of `(&str, usize)` tuples, giving the name of the macro and the number of
 /// arguments before the format string (none for `format!("format", ...)`, one for `assert!(result,
 /// "format", ...)`, two for `assert_eq!(left, right, "format", ...)`).
-const SPECIAL_MACRO_WHITELIST: &[(&str, usize)] = &[
+const SPECIAL_CASE_MACROS: &[(&str, usize)] = &[
     // format! like macros
     // From the Rust Standard Library.
     ("eprint!", 0),
@@ -60,7 +60,7 @@ const SPECIAL_MACRO_WHITELIST: &[(&str, usize)] = &[
     ("debug_assert_ne!", 2),
 ];
 
-const SPECIAL_ATTR_WHITELIST: &[(&str, usize)] = &[
+const SPECIAL_CASE_ATTR: &[(&str, usize)] = &[
     // From the `failure` crate.
     ("fail", 0),
 ];
@@ -125,7 +125,7 @@ impl<'a> OverflowableItem<'a> {
             OverflowableItem::MacroArg(MacroArg::Keyword(..)) => true,
             OverflowableItem::MacroArg(MacroArg::Expr(expr)) => is_simple_expr(expr),
             OverflowableItem::NestedMetaItem(nested_meta_item) => match nested_meta_item {
-                ast::NestedMetaItem::Literal(..) => true,
+                ast::NestedMetaItem::Lit(..) => true,
                 ast::NestedMetaItem::MetaItem(ref meta_item) => {
                     matches!(meta_item.kind, ast::MetaItemKind::Word)
                 }
@@ -169,7 +169,7 @@ impl<'a> OverflowableItem<'a> {
             },
             OverflowableItem::NestedMetaItem(nested_meta_item) if len == 1 => {
                 match nested_meta_item {
-                    ast::NestedMetaItem::Literal(..) => false,
+                    ast::NestedMetaItem::Lit(..) => false,
                     ast::NestedMetaItem::MetaItem(..) => true,
                 }
             }
@@ -182,10 +182,10 @@ impl<'a> OverflowableItem<'a> {
         }
     }
 
-    fn whitelist(&self) -> &'static [(&'static str, usize)] {
+    fn special_cases(&self) -> &'static [(&'static str, usize)] {
         match self {
-            OverflowableItem::MacroArg(..) => SPECIAL_MACRO_WHITELIST,
-            OverflowableItem::NestedMetaItem(..) => SPECIAL_ATTR_WHITELIST,
+            OverflowableItem::MacroArg(..) => SPECIAL_CASE_MACROS,
+            OverflowableItem::NestedMetaItem(..) => SPECIAL_CASE_ATTR,
             _ => &[],
         }
     }
@@ -589,6 +589,8 @@ impl<'a> Context<'a> {
 
     fn rewrite_items(&self) -> Option<(bool, String)> {
         let span = self.items_span();
+        debug!("items: {:?}", self.items);
+
         let items = itemize_list(
             self.context.snippet_provider,
             self.items.iter(),
@@ -602,6 +604,8 @@ impl<'a> Context<'a> {
             true,
         );
         let mut list_items: Vec<_> = items.collect();
+
+        debug!("items: {list_items:?}");
 
         // Try letting the last argument overflow to the next line with block
         // indentation. If its first line fits on one line with the other arguments,
@@ -770,7 +774,7 @@ pub(crate) fn maybe_get_args_offset(
 ) -> Option<(bool, usize)> {
     if let Some(&(_, num_args_before)) = args
         .get(0)?
-        .whitelist()
+        .special_cases()
         .iter()
         .find(|&&(s, _)| s == callee_str)
     {

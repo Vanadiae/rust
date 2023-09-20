@@ -10,7 +10,7 @@ use crate::ty::TyCtxt;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_hir as hir;
-use rustc_hir::Node;
+use rustc_hir::{HirIdMap, Node};
 use rustc_macros::HashStable;
 use rustc_query_system::ich::StableHashingContext;
 use rustc_span::{Span, DUMMY_SP};
@@ -147,9 +147,8 @@ rustc_index::newtype_index! {
     ///
     /// * The subscope with `first_statement_index == 1` is scope of `c`,
     ///   and thus does not include EXPR_2, but covers the `...`.
-    pub struct FirstStatementIndex {
-        derive [HashStable]
-    }
+    #[derive(HashStable)]
+    pub struct FirstStatementIndex {}
 }
 
 // compilation error if size of `ScopeData` is not the same as a `u32`
@@ -204,7 +203,7 @@ impl Scope {
 pub type ScopeDepth = u32;
 
 /// The region scope tree encodes information about region relationships.
-#[derive(TyEncodable, TyDecodable, Default, Debug)]
+#[derive(Default, Debug)]
 pub struct ScopeTree {
     /// If not empty, this body is the root of this region hierarchy.
     pub root_body: Option<hir::HirId>,
@@ -229,7 +228,7 @@ pub struct ScopeTree {
     /// and not the enclosing *statement*. Expressions that are not present in this
     /// table are not rvalue candidates. The set of rvalue candidates is computed
     /// during type check based on a traversal of the AST.
-    pub rvalue_candidates: FxHashMap<hir::HirId, RvalueCandidateType>,
+    pub rvalue_candidates: HirIdMap<RvalueCandidateType>,
 
     /// If there are any `yield` nested within a scope, this map
     /// stores the `Span` of the last one and its index in the
@@ -318,13 +317,13 @@ pub struct ScopeTree {
 /// candidates in general). In constants, the `lifetime` field is None
 /// to indicate that certain expressions escape into 'static and
 /// should have no local cleanup scope.
-#[derive(Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
+#[derive(Debug, Copy, Clone, HashStable)]
 pub enum RvalueCandidateType {
     Borrow { target: hir::ItemLocalId, lifetime: Option<Scope> },
     Pattern { target: hir::ItemLocalId, lifetime: Option<Scope> },
 }
 
-#[derive(Debug, Copy, Clone, TyEncodable, TyDecodable, HashStable)]
+#[derive(Debug, Copy, Clone, HashStable)]
 pub struct YieldData {
     /// The `Span` of the yield.
     pub span: Span,

@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use rustc_data_structures::fx::FxHashMap;
 
-use crate::error::Error;
 use crate::externalfiles::ExternalHtml;
 use crate::html::format::{Buffer, Print};
 use crate::html::render::{ensure_trailing_slash, StylePath};
 
 use askama::Template;
+
+use super::static_files::{StaticFiles, STATIC_FILES};
 
 #[derive(Clone)]
 pub(crate) struct Layout {
@@ -29,28 +30,32 @@ pub(crate) struct Page<'a> {
     pub(crate) root_path: &'a str,
     pub(crate) static_root_path: Option<&'a str>,
     pub(crate) description: &'a str,
-    pub(crate) keywords: &'a str,
     pub(crate) resource_suffix: &'a str,
-    pub(crate) extra_scripts: &'a [&'a str],
-    pub(crate) static_extra_scripts: &'a [&'a str],
 }
 
 impl<'a> Page<'a> {
-    pub(crate) fn get_static_root_path(&self) -> &str {
-        self.static_root_path.unwrap_or(self.root_path)
+    pub(crate) fn get_static_root_path(&self) -> String {
+        match self.static_root_path {
+            Some(s) => s.to_string(),
+            None => format!("{}static.files/", self.root_path),
+        }
     }
 }
 
 #[derive(Template)]
 #[template(path = "page.html")]
 struct PageLayout<'a> {
-    static_root_path: &'a str,
+    static_root_path: String,
     page: &'a Page<'a>,
     layout: &'a Layout,
+
+    files: &'static StaticFiles,
+
     themes: Vec<String>,
     sidebar: String,
     content: String,
     krate_with_trailing_slash: String,
+    rust_channel: &'static str,
     pub(crate) rustdoc_version: &'a str,
 }
 
@@ -63,23 +68,22 @@ pub(crate) fn render<T: Print, S: Print>(
 ) -> String {
     let static_root_path = page.get_static_root_path();
     let krate_with_trailing_slash = ensure_trailing_slash(&layout.krate).to_string();
-    let mut themes: Vec<String> = style_files
-        .iter()
-        .map(StylePath::basename)
-        .collect::<Result<_, Error>>()
-        .unwrap_or_default();
+    let mut themes: Vec<String> = style_files.iter().map(|s| s.basename().unwrap()).collect();
     themes.sort();
-    let rustdoc_version = rustc_interface::util::version_str().unwrap_or("unknown version");
+
+    let rustdoc_version = rustc_interface::util::version_str!().unwrap_or("unknown version");
     let content = Buffer::html().to_display(t); // Note: This must happen before making the sidebar.
     let sidebar = Buffer::html().to_display(sidebar);
     PageLayout {
         static_root_path,
         page,
         layout,
+        files: &STATIC_FILES,
         themes,
         sidebar,
         content,
         krate_with_trailing_slash,
+        rust_channel: *crate::clean::utils::DOC_CHANNEL,
         rustdoc_version,
     }
     .render()

@@ -1,4 +1,4 @@
-#[cfg(all(test, not(any(target_os = "emscripten", target_env = "sgx"))))]
+#[cfg(all(test, not(any(target_os = "emscripten", target_env = "sgx", target_os = "xous"))))]
 mod tests;
 
 use crate::fmt;
@@ -89,6 +89,15 @@ impl UdpSocket {
     ///     SocketAddr::from(([127, 0, 0, 1], 3401)),
     /// ];
     /// let socket = UdpSocket::bind(&addrs[..]).expect("couldn't bind to address");
+    /// ```
+    ///
+    /// Creates a UDP socket bound to a port assigned by the operating system
+    /// at `127.0.0.1`.
+    ///
+    /// ```no_run
+    /// use std::net::UdpSocket;
+    ///
+    /// let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
@@ -788,6 +797,7 @@ impl UdpSocket {
 // `AsRawSocket`/`IntoRawSocket`/`FromRawSocket` on Windows.
 
 impl AsInner<net_imp::UdpSocket> for UdpSocket {
+    #[inline]
     fn as_inner(&self) -> &net_imp::UdpSocket {
         &self.0
     }

@@ -1,6 +1,6 @@
-// aux-build:proc_macro_unsafe.rs
+//@aux-build:proc_macro_unsafe.rs
 
-#![warn(clippy::undocumented_unsafe_blocks)]
+#![warn(clippy::undocumented_unsafe_blocks, clippy::unnecessary_safety_comment)]
 #![allow(clippy::let_unit_value, clippy::missing_safety_doc)]
 
 extern crate proc_macro_unsafe;
@@ -250,6 +250,11 @@ fn from_proc_macro() {
     proc_macro_unsafe::unsafe_block!(token);
 }
 
+fn in_closure(x: *const u32) {
+    // Safety: reason
+    let _ = || unsafe { *x };
+}
+
 // Invalid comments
 
 #[rustfmt::skip]
@@ -351,9 +356,9 @@ mod unsafe_impl_smoke_test {
 
     #[rustfmt::skip]
     mod sub_mod2 {
-        // 
+        //
         // SAFETY: ok
-        // 
+        //
 
         unsafe impl B for (u32) {}
         unsafe trait B {}
@@ -484,5 +489,46 @@ unsafe impl CrateRoot for () {}
 
 // SAFETY: ok
 unsafe impl CrateRoot for (i32) {}
+
+fn issue_9142() {
+    // SAFETY: ok
+    let _ =
+        // we need this comment to avoid rustfmt putting
+        // it all on one line
+        unsafe {};
+
+    // SAFETY: this is more than one level away, so it should warn
+    let _ = {
+        if unsafe { true } {
+            todo!();
+        } else {
+            let bar = unsafe {};
+            todo!();
+            bar
+        }
+    };
+}
+
+pub unsafe fn a_function_with_a_very_long_name_to_break_the_line() -> u32 {
+    1
+}
+
+pub const unsafe fn a_const_function_with_a_very_long_name_to_break_the_line() -> u32 {
+    2
+}
+
+fn issue_10832() {
+    // Safety: A safety comment. But it will warn anyways
+    let _some_variable_with_a_very_long_name_to_break_the_line =
+        unsafe { a_function_with_a_very_long_name_to_break_the_line() };
+
+    // Safety: Another safety comment. But it will warn anyways
+    const _SOME_CONST_WITH_A_VERY_LONG_NAME_TO_BREAK_THE_LINE: u32 =
+        unsafe { a_const_function_with_a_very_long_name_to_break_the_line() };
+
+    // Safety: Yet another safety comment. But it will warn anyways
+    static _SOME_STATIC_WITH_A_VERY_LONG_NAME_TO_BREAK_THE_LINE: u32 =
+        unsafe { a_const_function_with_a_very_long_name_to_break_the_line() };
+}
 
 fn main() {}

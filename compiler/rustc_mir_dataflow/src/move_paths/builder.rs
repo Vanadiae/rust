@@ -1,4 +1,4 @@
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_middle::mir::tcx::RvalueInitializationState;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
@@ -38,18 +38,23 @@ impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
                 rev_lookup: MovePathLookup {
                     locals: body
                         .local_decls
-                        .indices()
-                        .map(|i| {
-                            Self::new_move_path(
-                                &mut move_paths,
-                                &mut path_map,
-                                &mut init_path_map,
-                                None,
-                                Place::from(i),
-                            )
+                        .iter_enumerated()
+                        .map(|(i, l)| {
+                            if l.is_deref_temp() {
+                                MovePathIndex::MAX
+                            } else {
+                                Self::new_move_path(
+                                    &mut move_paths,
+                                    &mut path_map,
+                                    &mut init_path_map,
+                                    None,
+                                    Place::from(i),
+                                )
+                            }
                         })
                         .collect(),
                     projections: Default::default(),
+                    un_derefer: Default::default(),
                 },
                 move_paths,
                 path_map,
@@ -94,8 +99,10 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
     ///
     /// Maybe we should have separate "borrowck" and "moveck" modes.
     fn move_path_for(&mut self, place: Place<'tcx>) -> Result<MovePathIndex, MoveError<'tcx>> {
+        let data = &mut self.builder.data;
+
         debug!("lookup({:?})", place);
-        let mut base = self.builder.data.rev_lookup.locals[place.local];
+        let mut base = data.rev_lookup.find_local(place.local);
 
         // The move path index of the first union that we find. Once this is
         // some we stop creating child move paths, since moves from unions
@@ -104,22 +111,15 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
         // from `*(u.f: &_)` isn't allowed.
         let mut union_path = None;
 
-        for (i, elem) in place.projection.iter().enumerate() {
-            let proj_base = &place.projection[..i];
+        for (place_ref, elem) in data.rev_lookup.un_derefer.iter_projections(place.as_ref()) {
             let body = self.builder.body;
             let tcx = self.builder.tcx;
-            let place_ty = Place::ty_from(place.local, proj_base, body, tcx).ty;
+            let place_ty = place_ref.ty(body, tcx).ty;
             match place_ty.kind() {
                 ty::Ref(..) | ty::RawPtr(..) => {
-                    let proj = &place.projection[..i + 1];
                     return Err(MoveError::cannot_move_out_of(
                         self.loc,
-                        BorrowedContent {
-                            target_place: Place {
-                                local: place.local,
-                                projection: tcx.intern_place_elems(proj),
-                            },
-                        },
+                        BorrowedContent { target_place: place_ref.project_deeper(&[elem], tcx) },
                     ));
                 }
                 ty::Adt(adt, _) if adt.has_dtor(tcx) && !adt.is_box() => {
@@ -154,10 +154,17 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             };
 
             if union_path.is_none() {
-                base = self.add_move_path(base, elem, |tcx| Place {
-                    local: place.local,
-                    projection: tcx.intern_place_elems(&place.projection[..i + 1]),
-                });
+                // inlined from add_move_path because of a borrowck conflict with the iterator
+                base =
+                    *data.rev_lookup.projections.entry((base, elem.lift())).or_insert_with(|| {
+                        MoveDataBuilder::new_move_path(
+                            &mut data.move_paths,
+                            &mut data.path_map,
+                            &mut data.init_path_map,
+                            Some(base),
+                            place_ref.project_deeper(&[elem], tcx),
+                        )
+                    })
             }
         }
 
@@ -198,10 +205,11 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
     }
 }
 
+pub type MoveDat<'tcx> =
+    Result<MoveData<'tcx>, (MoveData<'tcx>, Vec<(Place<'tcx>, MoveError<'tcx>)>)>;
+
 impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
-    fn finalize(
-        self,
-    ) -> Result<MoveData<'tcx>, (MoveData<'tcx>, Vec<(Place<'tcx>, MoveError<'tcx>)>)> {
+    fn finalize(self) -> MoveDat<'tcx> {
         debug!("{}", {
             debug!("moves for {:?}:", self.body.span);
             for (j, mo) in self.data.moves.iter_enumerated() {
@@ -214,7 +222,7 @@ impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
             "done dumping moves"
         });
 
-        if !self.errors.is_empty() { Err((self.data, self.errors)) } else { Ok(self.data) }
+        if self.errors.is_empty() { Ok(self.data) } else { Err((self.data, self.errors)) }
     }
 }
 
@@ -222,12 +230,12 @@ pub(super) fn gather_moves<'tcx>(
     body: &Body<'tcx>,
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
-) -> Result<MoveData<'tcx>, (MoveData<'tcx>, Vec<(Place<'tcx>, MoveError<'tcx>)>)> {
+) -> MoveDat<'tcx> {
     let mut builder = MoveDataBuilder::new(body, tcx, param_env);
 
     builder.gather_args();
 
-    for (bb, block) in body.basic_blocks().iter_enumerated() {
+    for (bb, block) in body.basic_blocks.iter_enumerated() {
         for (i, stmt) in block.statements.iter().enumerate() {
             let source = Location { block: bb, statement_index: i };
             builder.gather_statement(source, stmt);
@@ -243,7 +251,7 @@ pub(super) fn gather_moves<'tcx>(
 impl<'a, 'tcx> MoveDataBuilder<'a, 'tcx> {
     fn gather_args(&mut self) {
         for arg in self.body.args_iter() {
-            let path = self.data.rev_lookup.locals[arg];
+            let path = self.data.rev_lookup.find_local(arg);
 
             let init = self.data.inits.push(Init {
                 path,
@@ -276,6 +284,16 @@ struct Gatherer<'b, 'a, 'tcx> {
 impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
     fn gather_statement(&mut self, stmt: &Statement<'tcx>) {
         match &stmt.kind {
+            StatementKind::Assign(box (place, Rvalue::CopyForDeref(reffed))) => {
+                let local = place.as_local().unwrap();
+                assert!(self.builder.body.local_decls[local].is_deref_temp());
+
+                let rev_lookup = &mut self.builder.data.rev_lookup;
+
+                rev_lookup.un_derefer.insert(local, reffed.as_ref());
+                let base_local = rev_lookup.un_derefer.deref_chain(local).first().unwrap().local;
+                rev_lookup.locals[local] = rev_lookup.locals[base_local];
+            }
             StatementKind::Assign(box (place, rval)) => {
                 self.create_move_path(*place);
                 if let RvalueInitializationState::Shallow = rval.initialization_state() {
@@ -294,7 +312,10 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             }
             StatementKind::StorageLive(_) => {}
             StatementKind::StorageDead(local) => {
-                self.gather_move(Place::from(*local));
+                // DerefTemp locals (results of CopyForDeref) don't actually move anything.
+                if !self.builder.body.local_decls[*local].is_deref_temp() {
+                    self.gather_move(Place::from(*local));
+                }
             }
             StatementKind::SetDiscriminant { .. } | StatementKind::Deinit(..) => {
                 span_bug!(
@@ -304,8 +325,10 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             }
             StatementKind::Retag { .. }
             | StatementKind::AscribeUserType(..)
+            | StatementKind::PlaceMention(..)
             | StatementKind::Coverage(..)
-            | StatementKind::CopyNonOverlapping(..)
+            | StatementKind::Intrinsic(..)
+            | StatementKind::ConstEvalCounter
             | StatementKind::Nop => {}
         }
     }
@@ -328,11 +351,12 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
                     self.gather_operand(operand);
                 }
             }
+            Rvalue::CopyForDeref(..) => unreachable!(),
             Rvalue::Ref(..)
             | Rvalue::AddressOf(..)
             | Rvalue::Discriminant(..)
             | Rvalue::Len(..)
-            | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf, _) => {}
+            | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(..), _) => {}
         }
     }
 
@@ -346,10 +370,11 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             // this that could possibly access the return place, this doesn't
             // need recording.
             | TerminatorKind::Return
-            | TerminatorKind::Resume
-            | TerminatorKind::Abort
+            | TerminatorKind::UnwindResume
+            | TerminatorKind::UnwindTerminate(_)
             | TerminatorKind::GeneratorDrop
-            | TerminatorKind::Unreachable => {}
+            | TerminatorKind::Unreachable
+            | TerminatorKind::Drop { .. } => {}
 
             TerminatorKind::Assert { ref cond, .. } => {
                 self.gather_operand(cond);
@@ -364,22 +389,13 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
                 self.create_move_path(place);
                 self.gather_init(place.as_ref(), InitKind::Deep);
             }
-
-            TerminatorKind::Drop { place, target: _, unwind: _ } => {
-                self.gather_move(place);
-            }
-            TerminatorKind::DropAndReplace { place, ref value, .. } => {
-                self.create_move_path(place);
-                self.gather_operand(value);
-                self.gather_init(place.as_ref(), InitKind::Deep);
-            }
             TerminatorKind::Call {
                 ref func,
                 ref args,
                 destination,
                 target,
-                cleanup: _,
-                from_hir_call: _,
+                unwind: _,
+                call_source: _,
                 fn_span: _,
             } => {
                 self.gather_operand(func);
@@ -397,7 +413,7 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
                 options: _,
                 line_spans: _,
                 destination: _,
-                cleanup: _,
+                unwind: _,
             } => {
                 for op in operands {
                     match *op {
@@ -439,7 +455,6 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
 
     fn gather_move(&mut self, place: Place<'tcx>) {
         debug!("gather_move({:?}, {:?})", self.loc, place);
-
         if let [ref base @ .., ProjectionElem::Subslice { from, to, from_end: false }] =
             **place.projection
         {
@@ -447,7 +462,7 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             // `ConstIndex` patterns. This is done to ensure that all move paths
             // are disjoint, which is expected by drop elaboration.
             let base_place =
-                Place { local: place.local, projection: self.builder.tcx.intern_place_elems(base) };
+                Place { local: place.local, projection: self.builder.tcx.mk_place_elems(base) };
             let base_path = match self.move_path_for(base_place) {
                 Ok(path) => path,
                 Err(MoveError::UnionMove { path }) => {
@@ -461,7 +476,9 @@ impl<'b, 'a, 'tcx> Gatherer<'b, 'a, 'tcx> {
             };
             let base_ty = base_place.ty(self.builder.body, self.builder.tcx).ty;
             let len: u64 = match base_ty.kind() {
-                ty::Array(_, size) => size.eval_usize(self.builder.tcx, self.builder.param_env),
+                ty::Array(_, size) => {
+                    size.eval_target_usize(self.builder.tcx, self.builder.param_env)
+                }
                 _ => bug!("from_end: false slice pattern of non-array type"),
             };
             for offset in from..to {

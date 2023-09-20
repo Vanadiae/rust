@@ -34,13 +34,14 @@ where
             false
         }
         _ => {
+            // We cannot figure out the layout. Conservatively assume that this is disaligned.
             debug!("is_disaligned({:?}) - true", place);
             true
         }
     }
 }
 
-fn is_within_packed<'tcx, L>(
+pub fn is_within_packed<'tcx, L>(
     tcx: TyCtxt<'tcx>,
     local_decls: &L,
     place: Place<'tcx>,
@@ -48,20 +49,16 @@ fn is_within_packed<'tcx, L>(
 where
     L: HasLocalDecls<'tcx>,
 {
-    for (place_base, elem) in place.iter_projections().rev() {
-        match elem {
-            // encountered a Deref, which is ABI-aligned
-            ProjectionElem::Deref => break,
-            ProjectionElem::Field(..) => {
-                let ty = place_base.ty(local_decls, tcx).ty;
-                match ty.kind() {
-                    ty::Adt(def, _) => return def.repr().pack,
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
+    place
+        .iter_projections()
+        .rev()
+        // Stop at `Deref`; standard ABI alignment applies there.
+        .take_while(|(_base, elem)| !matches!(elem, ProjectionElem::Deref))
+        // Consider the packed alignments at play here...
+        .filter_map(|(base, _elem)| {
+            base.ty(local_decls, tcx).ty.ty_adt_def().and_then(|adt| adt.repr().pack)
+        })
+        // ... and compute their minimum.
+        // The overall smallest alignment is what matters.
+        .min()
 }

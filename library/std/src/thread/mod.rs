@@ -116,7 +116,7 @@
 //! Threads are able to have associated names for identification purposes. By default, spawned
 //! threads are unnamed. To specify a name for a thread, build the thread with [`Builder`] and pass
 //! the desired thread name to [`Builder::name`]. To retrieve the thread name from within the
-//! thread, use [`Thread::name`]. A couple examples of where the name of a thread gets used:
+//! thread, use [`Thread::name`]. A couple of examples where the name of a thread gets used:
 //!
 //! * If a panic occurs in a named thread, the thread name will be printed in the panic message.
 //! * The thread name is provided to the OS where applicable (e.g., `pthread_setname_np` in
@@ -124,13 +124,15 @@
 //!
 //! ## Stack size
 //!
-//! The default stack size for spawned threads is 2 MiB, though this particular stack size is
-//! subject to change in the future. There are two ways to manually specify the stack size for
-//! spawned threads:
+//! The default stack size is platform-dependent and subject to change.
+//! Currently, it is 2 MiB on all Tier-1 platforms.
+//!
+//! There are two ways to manually specify the stack size for spawned threads:
 //!
 //! * Build the thread with [`Builder`] and pass the desired stack size to [`Builder::stack_size`].
 //! * Set the `RUST_MIN_STACK` environment variable to an integer representing the desired stack
-//!   size (in bytes). Note that setting [`Builder::stack_size`] will override this.
+//!   size (in bytes). Note that setting [`Builder::stack_size`] will override this. Be aware that
+//!   changes to `RUST_MIN_STACK` may be ignored after program start.
 //!
 //! Note that the stack size of the main thread is *not* determined by Rust.
 //!
@@ -150,6 +152,8 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 #![deny(unsafe_op_in_unsafe_fn)]
+// Under `test`, `__FastLocalKeyInner` seems unused.
+#![cfg_attr(test, allow(dead_code))]
 
 #[cfg(all(test, not(target_os = "emscripten")))]
 mod tests;
@@ -159,7 +163,8 @@ use crate::cell::UnsafeCell;
 use crate::ffi::{CStr, CString};
 use crate::fmt;
 use crate::io;
-use crate::mem;
+use crate::marker::PhantomData;
+use crate::mem::{self, forget};
 use crate::num::NonZeroU64;
 use crate::num::NonZeroUsize;
 use crate::panic;
@@ -169,12 +174,17 @@ use crate::ptr::addr_of_mut;
 use crate::str;
 use crate::sync::Arc;
 use crate::sys::thread as imp;
-use crate::sys_common::mutex;
 use crate::sys_common::thread;
 use crate::sys_common::thread_info;
-use crate::sys_common::thread_parker::Parker;
+use crate::sys_common::thread_parking::Parker;
 use crate::sys_common::{AsInner, IntoInner};
-use crate::time::Duration;
+use crate::time::{Duration, Instant};
+
+#[stable(feature = "scoped_threads", since = "1.63.0")]
+mod scoped;
+
+#[stable(feature = "scoped_threads", since = "1.63.0")]
+pub use scoped::{scope, Scope, ScopedJoinHandle};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Thread-local storage
@@ -183,35 +193,23 @@ use crate::time::Duration;
 #[macro_use]
 mod local;
 
-#[unstable(feature = "scoped_threads", issue = "93203")]
-mod scoped;
+cfg_if::cfg_if! {
+    if #[cfg(test)] {
+        // Avoid duplicating the global state associated with thread-locals between this crate and
+        // realstd. Miri relies on this.
+        pub use realstd::thread::{local_impl, AccessError, LocalKey};
+    } else {
+        #[stable(feature = "rust1", since = "1.0.0")]
+        pub use self::local::{AccessError, LocalKey};
 
-#[unstable(feature = "scoped_threads", issue = "93203")]
-pub use scoped::{scope, Scope, ScopedJoinHandle};
-
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use self::local::{AccessError, LocalKey};
-
-// The types used by the thread_local! macro to access TLS keys. Note that there
-// are two types, the "OS" type and the "fast" type. The OS thread local key
-// type is accessed via platform-specific API calls and is slow, while the fast
-// key type is accessed via code generated via LLVM, where TLS keys are set up
-// by the elf linker. Note that the OS TLS type is always available: on macOS
-// the standard library is compiled with support for older platform versions
-// where fast TLS was not available; end-user code is compiled with fast TLS
-// where available, but both are needed.
-
-#[unstable(feature = "libstd_thread_internals", issue = "none")]
-#[cfg(target_thread_local)]
-#[doc(hidden)]
-pub use self::local::fast::Key as __FastLocalKeyInner;
-#[unstable(feature = "libstd_thread_internals", issue = "none")]
-#[doc(hidden)]
-pub use self::local::os::Key as __OsLocalKeyInner;
-#[unstable(feature = "libstd_thread_internals", issue = "none")]
-#[cfg(all(target_family = "wasm", not(target_feature = "atomics")))]
-#[doc(hidden)]
-pub use self::local::statik::Key as __StaticLocalKeyInner;
+        // Implementation details used by the thread_local!{} macro.
+        #[doc(hidden)]
+        #[unstable(feature = "thread_local_internals", issue = "none")]
+        pub mod local_impl {
+            pub use crate::sys::common::thread_local::{thread_local_inner, Key, abort_on_dtor_unwind};
+        }
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Builder
@@ -462,7 +460,7 @@ impl Builder {
     unsafe fn spawn_unchecked_<'a, 'scope, F, T>(
         self,
         f: F,
-        scope_data: Option<&'scope scoped::ScopeData>,
+        scope_data: Option<Arc<scoped::ScopeData>>,
     ) -> io::Result<JoinInner<'scope, T>>
     where
         F: FnOnce() -> T,
@@ -479,13 +477,41 @@ impl Builder {
         }));
         let their_thread = my_thread.clone();
 
-        let my_packet: Arc<Packet<'scope, T>> =
-            Arc::new(Packet { scope: scope_data, result: UnsafeCell::new(None) });
+        let my_packet: Arc<Packet<'scope, T>> = Arc::new(Packet {
+            scope: scope_data,
+            result: UnsafeCell::new(None),
+            _marker: PhantomData,
+        });
         let their_packet = my_packet.clone();
 
         let output_capture = crate::io::set_output_capture(None);
         crate::io::set_output_capture(output_capture.clone());
 
+        // Pass `f` in `MaybeUninit` because actually that closure might *run longer than the lifetime of `F`*.
+        // See <https://github.com/rust-lang/rust/issues/101983> for more details.
+        // To prevent leaks we use a wrapper that drops its contents.
+        #[repr(transparent)]
+        struct MaybeDangling<T>(mem::MaybeUninit<T>);
+        impl<T> MaybeDangling<T> {
+            fn new(x: T) -> Self {
+                MaybeDangling(mem::MaybeUninit::new(x))
+            }
+            fn into_inner(self) -> T {
+                // SAFETY: we are always initialized.
+                let ret = unsafe { self.0.assume_init_read() };
+                // Make sure we don't drop.
+                mem::forget(self);
+                ret
+            }
+        }
+        impl<T> Drop for MaybeDangling<T> {
+            fn drop(&mut self) {
+                // SAFETY: we are always initialized.
+                unsafe { self.0.assume_init_drop() };
+            }
+        }
+
+        let f = MaybeDangling::new(f);
         let main = move || {
             if let Some(name) = their_thread.cname() {
                 imp::Thread::set_name(name);
@@ -493,6 +519,8 @@ impl Builder {
 
             crate::io::set_output_capture(output_capture);
 
+            // SAFETY: we constructed `f` initialized.
+            let f = f.into_inner();
             // SAFETY: the stack guard passed is the one for the current thread.
             // This means the current thread's stack and the new thread's stack
             // are properly set and protected from each other.
@@ -505,9 +533,15 @@ impl Builder {
             // same `JoinInner` as this closure meaning the mutation will be
             // safe (not modify it and affect a value far away).
             unsafe { *their_packet.result.get() = Some(try_result) };
+            // Here `their_packet` gets dropped, and if this is the last `Arc` for that packet that
+            // will call `decrement_num_running_threads` and therefore signal that this thread is
+            // done.
+            drop(their_packet);
+            // Here, the lifetime `'a` and even `'scope` can end. `main` keeps running for a bit
+            // after that before returning itself.
         };
 
-        if let Some(scope_data) = scope_data {
+        if let Some(scope_data) = &my_packet.scope {
             scope_data.increment_num_running_threads();
         }
 
@@ -766,6 +800,8 @@ pub fn panicking() -> bool {
     panicking::panicking()
 }
 
+/// Use [`sleep`].
+///
 /// Puts the current thread to sleep for at least the specified amount of time.
 ///
 /// The thread may sleep longer than the duration specified due to scheduling
@@ -836,12 +872,104 @@ pub fn sleep(dur: Duration) {
     imp::Thread::sleep(dur)
 }
 
+/// Puts the current thread to sleep until the specified deadline has passed.
+///
+/// The thread may still be asleep after the deadline specified due to
+/// scheduling specifics or platform-dependent functionality. It will never
+/// wake before.
+///
+/// This function is blocking, and should not be used in `async` functions.
+///
+/// # Platform-specific behavior
+///
+/// This function uses [`sleep`] internally, see its platform-specific behaviour.
+///
+///
+/// # Examples
+///
+/// A simple game loop that limits the game to 60 frames per second.
+///
+/// ```no_run
+/// #![feature(thread_sleep_until)]
+/// # use std::time::{Duration, Instant};
+/// # use std::thread;
+/// #
+/// # fn update() {}
+/// # fn render() {}
+/// #
+/// let max_fps = 60.0;
+/// let frame_time = Duration::from_secs_f32(1.0/max_fps);
+/// let mut next_frame = Instant::now();
+/// loop {
+///     thread::sleep_until(next_frame);
+///     next_frame += frame_time;
+///     update();
+///     render();
+/// }
+/// ```
+///
+/// A slow api we must not call too fast and which takes a few
+/// tries before succeeding. By using `sleep_until` the time the
+/// api call takes does not influence when we retry or when we give up
+///
+/// ```no_run
+/// #![feature(thread_sleep_until)]
+/// # use std::time::{Duration, Instant};
+/// # use std::thread;
+/// #
+/// # enum Status {
+/// #     Ready(usize),
+/// #     Waiting,
+/// # }
+/// # fn slow_web_api_call() -> Status { Status::Ready(42) }
+/// #
+/// # const MAX_DURATION: Duration = Duration::from_secs(10);
+/// #
+/// # fn try_api_call() -> Result<usize, ()> {
+/// let deadline = Instant::now() + MAX_DURATION;
+/// let delay = Duration::from_millis(250);
+/// let mut next_attempt = Instant::now();
+/// loop {
+///     if Instant::now() > deadline {
+///         break Err(());
+///     }
+///     if let Status::Ready(data) = slow_web_api_call() {
+///         break Ok(data);
+///     }
+///
+///     next_attempt = deadline.min(next_attempt + delay);
+///     thread::sleep_until(next_attempt);
+/// }
+/// # }
+/// # let _data = try_api_call();
+/// ```
+#[unstable(feature = "thread_sleep_until", issue = "113752")]
+pub fn sleep_until(deadline: Instant) {
+    let now = Instant::now();
+
+    if let Some(delay) = deadline.checked_duration_since(now) {
+        sleep(delay);
+    }
+}
+
+/// Used to ensure that `park` and `park_timeout` do not unwind, as that can
+/// cause undefined behaviour if not handled correctly (see #102398 for context).
+struct PanicGuard;
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        rtabort!("an irrecoverable error occurred while synchronizing threads")
+    }
+}
+
 /// Blocks unless or until the current thread's token is made available.
 ///
 /// A call to `park` does not guarantee that the thread will remain parked
-/// forever, and callers should be prepared for this possibility.
+/// forever, and callers should be prepared for this possibility. However,
+/// it is guaranteed that this function will not panic (it may abort the
+/// process if the implementation encounters some rare errors).
 ///
-/// # park and unpark
+/// # `park` and `unpark`
 ///
 /// Every thread is equipped with some basic low-level blocking support, via the
 /// [`thread::park`][`park`] function and [`thread::Thread::unpark`][`unpark`]
@@ -862,14 +990,6 @@ pub fn sleep(dur: Duration) {
 ///   if it wasn't already. Because the token is initially absent, [`unpark`]
 ///   followed by [`park`] will result in the second call returning immediately.
 ///
-/// In other words, each [`Thread`] acts a bit like a spinlock that can be
-/// locked and unlocked using `park` and `unpark`.
-///
-/// Notice that being unblocked does not imply any synchronization with someone
-/// that unparked this thread, it could also be spurious.
-/// For example, it would be a valid, but inefficient, implementation to make both [`park`] and
-/// [`unpark`] return immediately without doing anything.
-///
 /// The API is typically used by acquiring a handle to the current thread,
 /// placing that handle in a shared data structure so that other threads can
 /// find it, and then `park`ing in a loop. When some desired condition is met, another
@@ -882,6 +1002,23 @@ pub fn sleep(dur: Duration) {
 ///   blocking/signaling.
 ///
 /// * It can be implemented very efficiently on many platforms.
+///
+/// # Memory Ordering
+///
+/// Calls to `park` _synchronize-with_ calls to `unpark`, meaning that memory
+/// operations performed before a call to `unpark` are made visible to the thread that
+/// consumes the token and returns from `park`. Note that all `park` and `unpark`
+/// operations for a given thread form a total order and `park` synchronizes-with
+/// _all_ prior `unpark` operations.
+///
+/// In atomic ordering terms, `unpark` performs a `Release` operation and `park`
+/// performs the corresponding `Acquire` operation. Calls to `unpark` for the same
+/// thread form a [release sequence].
+///
+/// Note that being unblocked does not imply a call was made to `unpark`, because
+/// wakeups can also be spurious. For example, a valid, but inefficient,
+/// implementation could have `park` and `unpark` return immediately without doing anything,
+/// making *all* wakeups spurious.
 ///
 /// # Examples
 ///
@@ -896,7 +1033,7 @@ pub fn sleep(dur: Duration) {
 /// let parked_thread = thread::spawn(move || {
 ///     // We want to wait until the flag is set. We *could* just spin, but using
 ///     // park/unpark is more efficient.
-///     while !flag2.load(Ordering::Acquire) {
+///     while !flag2.load(Ordering::Relaxed) {
 ///         println!("Parking thread");
 ///         thread::park();
 ///         // We *could* get here spuriously, i.e., way before the 10ms below are over!
@@ -913,7 +1050,7 @@ pub fn sleep(dur: Duration) {
 /// // There is no race condition here, if `unpark`
 /// // happens first, `park` will return immediately.
 /// // Hence there is no risk of a deadlock.
-/// flag.store(true, Ordering::Release);
+/// flag.store(true, Ordering::Relaxed);
 /// println!("Unpark the thread");
 /// parked_thread.thread().unpark();
 ///
@@ -922,12 +1059,16 @@ pub fn sleep(dur: Duration) {
 ///
 /// [`unpark`]: Thread::unpark
 /// [`thread::park_timeout`]: park_timeout
+/// [release sequence]: https://en.cppreference.com/w/cpp/atomic/memory_order#Release_sequence
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn park() {
+    let guard = PanicGuard;
     // SAFETY: park_timeout is called on the parker owned by this thread.
     unsafe {
         current().inner.as_ref().parker().park();
     }
+    // No panic occurred, do not abort.
+    forget(guard);
 }
 
 /// Use [`park_timeout`].
@@ -988,10 +1129,13 @@ pub fn park_timeout_ms(ms: u32) {
 /// ```
 #[stable(feature = "park_timeout", since = "1.4.0")]
 pub fn park_timeout(dur: Duration) {
+    let guard = PanicGuard;
     // SAFETY: park_timeout is called on the parker owned by this thread.
     unsafe {
         current().inner.as_ref().parker().park_timeout(dur);
     }
+    // No panic occurred, do not abort.
+    forget(guard);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1029,24 +1173,45 @@ pub struct ThreadId(NonZeroU64);
 impl ThreadId {
     // Generate a new unique thread ID.
     fn new() -> ThreadId {
-        // It is UB to attempt to acquire this mutex reentrantly!
-        static GUARD: mutex::StaticMutex = mutex::StaticMutex::new();
-        static mut COUNTER: u64 = 1;
+        #[cold]
+        fn exhausted() -> ! {
+            panic!("failed to generate unique thread ID: bitspace exhausted")
+        }
 
-        unsafe {
-            let guard = GUARD.lock();
+        cfg_if::cfg_if! {
+            if #[cfg(target_has_atomic = "64")] {
+                use crate::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-            // If we somehow use up all our bits, panic so that we're not
-            // covering up subtle bugs of IDs being reused.
-            if COUNTER == u64::MAX {
-                drop(guard); // in case the panic handler ends up calling `ThreadId::new()`, avoid reentrant lock acquire.
-                panic!("failed to generate unique thread ID: bitspace exhausted");
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+                let mut last = COUNTER.load(Relaxed);
+                loop {
+                    let Some(id) = last.checked_add(1) else {
+                        exhausted();
+                    };
+
+                    match COUNTER.compare_exchange_weak(last, id, Relaxed, Relaxed) {
+                        Ok(_) => return ThreadId(NonZeroU64::new(id).unwrap()),
+                        Err(id) => last = id,
+                    }
+                }
+            } else {
+                use crate::sync::{Mutex, PoisonError};
+
+                static COUNTER: Mutex<u64> = Mutex::new(0);
+
+                let mut counter = COUNTER.lock().unwrap_or_else(PoisonError::into_inner);
+                let Some(id) = counter.checked_add(1) else {
+                    // in case the panic handler ends up calling `ThreadId::new()`,
+                    // avoid reentrant lock acquire.
+                    drop(counter);
+                    exhausted();
+                };
+
+                *counter = id;
+                drop(counter);
+                ThreadId(NonZeroU64::new(id).unwrap())
             }
-
-            let id = COUNTER;
-            COUNTER += 1;
-
-            ThreadId(NonZeroU64::new(id).unwrap())
         }
     }
 
@@ -1110,7 +1275,7 @@ impl Thread {
     // Used only internally to construct a thread object without spawning
     // Panics if the name contains nuls.
     pub(crate) fn new(name: Option<CString>) -> Thread {
-        // We have to use `unsafe` here to constuct the `Parker` in-place,
+        // We have to use `unsafe` here to construct the `Parker` in-place,
         // which is required for the UNIX implementation.
         //
         // SAFETY: We pin the Arc immediately after creation, so its address never
@@ -1120,7 +1285,7 @@ impl Thread {
             let ptr = Arc::get_mut_unchecked(&mut arc).as_mut_ptr();
             addr_of_mut!((*ptr).name).write(name);
             addr_of_mut!((*ptr).id).write(ThreadId::new());
-            Parker::new(addr_of_mut!((*ptr).parker));
+            Parker::new_in_place(addr_of_mut!((*ptr).parker));
             Pin::new_unchecked(arc.assume_init())
         };
 
@@ -1298,8 +1463,9 @@ pub type Result<T> = crate::result::Result<T, Box<dyn Any + Send + 'static>>;
 // An Arc to the packet is stored into a `JoinInner` which in turns is placed
 // in `JoinHandle`.
 struct Packet<'scope, T> {
-    scope: Option<&'scope scoped::ScopeData>,
+    scope: Option<Arc<scoped::ScopeData>>,
     result: UnsafeCell<Option<Result<T>>>,
+    _marker: PhantomData<Option<&'scope scoped::ScopeData>>,
 }
 
 // Due to the usage of `UnsafeCell` we need to manually implement Sync.
@@ -1330,7 +1496,7 @@ impl<'scope, T> Drop for Packet<'scope, T> {
             rtabort!("thread result panicked on drop");
         }
         // Book-keeping so the scope knows when it's done.
-        if let Some(scope) = self.scope {
+        if let Some(scope) = &self.scope {
             // Now that there will be no more user code running on this thread
             // that can use 'scope, mark the thread as 'finished'.
             // It's important we only do this after the `result` has been dropped,
@@ -1487,13 +1653,14 @@ impl<T> JoinHandle<T> {
 
     /// Checks if the associated thread has finished running its main function.
     ///
+    /// `is_finished` supports implementing a non-blocking join operation, by checking
+    /// `is_finished`, and calling `join` if it returns `true`. This function does not block. To
+    /// block while waiting on the thread to finish, use [`join`][Self::join].
+    ///
     /// This might return `true` for a brief moment after the thread's main
     /// function has returned, but before the thread itself has stopped running.
     /// However, once this returns `true`, [`join`][Self::join] can be expected
     /// to return quickly, without blocking for any significant amount of time.
-    ///
-    /// This function does not block. To block while waiting on the thread to finish,
-    /// use [`join`][Self::join].
     #[stable(feature = "thread_is_running", since = "1.61.0")]
     pub fn is_finished(&self) -> bool {
         Arc::strong_count(&self.0.packet) == 1
@@ -1571,10 +1738,15 @@ fn _assert_sync_and_send() {
 ///
 /// On Linux:
 /// - It may overcount the amount of parallelism available when limited by a
-///   process-wide affinity mask or cgroup quotas and cgroup2 fs or `sched_getaffinity()` can't be
+///   process-wide affinity mask or cgroup quotas and `sched_getaffinity()` or cgroup fs can't be
 ///   queried, e.g. due to sandboxing.
 /// - It may undercount the amount of parallelism if the current thread's affinity mask
 ///   does not reflect the process' cpuset, e.g. due to pinned threads.
+/// - If the process is in a cgroup v1 cpu controller, this may need to
+///   scan mountpoints to find the corresponding cgroup v1 controller,
+///   which may take time on systems with large numbers of mountpoints.
+///   (This does not apply to cgroup v2, or to processes not in a
+///   cgroup.)
 ///
 /// On all targets:
 /// - It may overcount the amount of parallelism available when running in a VM

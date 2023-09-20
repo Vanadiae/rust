@@ -3,7 +3,8 @@ use super::HashMap;
 use super::RandomState;
 use crate::assert_matches::assert_matches;
 use crate::cell::RefCell;
-use rand::{thread_rng, Rng};
+use crate::test_helpers::test_rng;
+use rand::Rng;
 use realstd::collections::TryReserveErrorKind::*;
 
 // https://github.com/rust-lang/rust/issues/62301
@@ -268,10 +269,13 @@ fn test_lots_of_insertions() {
 
     // Try this a few times to make sure we never screw up the hashmap's
     // internal state.
-    for _ in 0..10 {
+    let loops = if cfg!(miri) { 2 } else { 10 };
+    for _ in 0..loops {
         assert!(m.is_empty());
 
-        for i in 1..1001 {
+        let count = if cfg!(miri) { 101 } else { 1001 };
+
+        for i in 1..count {
             assert!(m.insert(i, i).is_none());
 
             for j in 1..=i {
@@ -279,42 +283,42 @@ fn test_lots_of_insertions() {
                 assert_eq!(r, Some(&j));
             }
 
-            for j in i + 1..1001 {
+            for j in i + 1..count {
                 let r = m.get(&j);
                 assert_eq!(r, None);
             }
         }
 
-        for i in 1001..2001 {
+        for i in count..(2 * count) {
             assert!(!m.contains_key(&i));
         }
 
         // remove forwards
-        for i in 1..1001 {
+        for i in 1..count {
             assert!(m.remove(&i).is_some());
 
             for j in 1..=i {
                 assert!(!m.contains_key(&j));
             }
 
-            for j in i + 1..1001 {
+            for j in i + 1..count {
                 assert!(m.contains_key(&j));
             }
         }
 
-        for i in 1..1001 {
+        for i in 1..count {
             assert!(!m.contains_key(&i));
         }
 
-        for i in 1..1001 {
+        for i in 1..count {
             assert!(m.insert(i, i).is_none());
         }
 
         // remove backwards
-        for i in (1..1001).rev() {
+        for i in (1..count).rev() {
             assert!(m.remove(&i).is_some());
 
-            for j in i..1001 {
+            for j in i..count {
                 assert!(!m.contains_key(&j));
             }
 
@@ -707,16 +711,16 @@ fn test_entry_take_doesnt_corrupt() {
     }
 
     let mut m = HashMap::new();
-    let mut rng = thread_rng();
+    let mut rng = test_rng();
 
     // Populate the map with some items.
     for _ in 0..50 {
-        let x = rng.gen_range(-10, 10);
+        let x = rng.gen_range(-10..10);
         m.insert(x, ());
     }
 
     for _ in 0..1000 {
-        let x = rng.gen_range(-10, 10);
+        let x = rng.gen_range(-10..10);
         match m.entry(x) {
             Vacant(_) => {}
             Occupied(e) => {
@@ -817,6 +821,7 @@ fn test_retain() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
 #[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
 fn test_try_reserve() {
     let mut empty_bytes: HashMap<u8, u8> = HashMap::new();
@@ -939,7 +944,7 @@ fn test_raw_entry() {
     }
 }
 
-mod test_drain_filter {
+mod test_extract_if {
     use super::*;
 
     use crate::panic::{catch_unwind, AssertUnwindSafe};
@@ -963,7 +968,7 @@ mod test_drain_filter {
     #[test]
     fn empty() {
         let mut map: HashMap<i32, i32> = HashMap::new();
-        map.drain_filter(|_, _| unreachable!("there's nothing to decide on"));
+        map.extract_if(|_, _| unreachable!("there's nothing to decide on")).for_each(drop);
         assert!(map.is_empty());
     }
 
@@ -971,7 +976,7 @@ mod test_drain_filter {
     fn consuming_nothing() {
         let pairs = (0..3).map(|i| (i, i));
         let mut map: HashMap<_, _> = pairs.collect();
-        assert!(map.drain_filter(|_, _| false).eq_sorted(crate::iter::empty()));
+        assert!(map.extract_if(|_, _| false).eq_sorted(crate::iter::empty()));
         assert_eq!(map.len(), 3);
     }
 
@@ -979,7 +984,7 @@ mod test_drain_filter {
     fn consuming_all() {
         let pairs = (0..3).map(|i| (i, i));
         let mut map: HashMap<_, _> = pairs.clone().collect();
-        assert!(map.drain_filter(|_, _| true).eq_sorted(pairs));
+        assert!(map.extract_if(|_, _| true).eq_sorted(pairs));
         assert!(map.is_empty());
     }
 
@@ -988,7 +993,7 @@ mod test_drain_filter {
         let pairs = (0..3).map(|i| (i, i));
         let mut map: HashMap<_, _> = pairs.collect();
         assert!(
-            map.drain_filter(|_, v| {
+            map.extract_if(|_, v| {
                 *v += 6;
                 false
             })
@@ -1003,7 +1008,7 @@ mod test_drain_filter {
         let pairs = (0..3).map(|i| (i, i));
         let mut map: HashMap<_, _> = pairs.collect();
         assert!(
-            map.drain_filter(|_, v| {
+            map.extract_if(|_, v| {
                 *v += 6;
                 true
             })
@@ -1029,14 +1034,15 @@ mod test_drain_filter {
         let mut map = (0..3).map(|i| (i, D)).collect::<HashMap<_, _>>();
 
         catch_unwind(move || {
-            drop(map.drain_filter(|_, _| {
+            map.extract_if(|_, _| {
                 PREDS.fetch_add(1, Ordering::SeqCst);
                 true
-            }))
+            })
+            .for_each(drop)
         })
         .unwrap_err();
 
-        assert_eq!(PREDS.load(Ordering::SeqCst), 3);
+        assert_eq!(PREDS.load(Ordering::SeqCst), 2);
         assert_eq!(DROPS.load(Ordering::SeqCst), 3);
     }
 
@@ -1055,10 +1061,11 @@ mod test_drain_filter {
         let mut map = (0..3).map(|i| (i, D)).collect::<HashMap<_, _>>();
 
         catch_unwind(AssertUnwindSafe(|| {
-            drop(map.drain_filter(|_, _| match PREDS.fetch_add(1, Ordering::SeqCst) {
+            map.extract_if(|_, _| match PREDS.fetch_add(1, Ordering::SeqCst) {
                 0 => true,
                 _ => panic!(),
-            }))
+            })
+            .for_each(drop)
         }))
         .unwrap_err();
 
@@ -1083,7 +1090,7 @@ mod test_drain_filter {
         let mut map = (0..3).map(|i| (i, D)).collect::<HashMap<_, _>>();
 
         {
-            let mut it = map.drain_filter(|_, _| match PREDS.fetch_add(1, Ordering::SeqCst) {
+            let mut it = map.extract_if(|_, _| match PREDS.fetch_add(1, Ordering::SeqCst) {
                 0 => true,
                 _ => panic!(),
             });
@@ -1110,4 +1117,10 @@ fn from_array() {
     // If you make a change that causes this line to no longer infer,
     // that's a problem!
     let _must_not_require_type_annotation = HashMap::from([(1, 2)]);
+}
+
+#[test]
+fn const_with_hasher() {
+    const X: HashMap<(), (), ()> = HashMap::with_hasher(());
+    assert_eq!(X.len(), 0);
 }

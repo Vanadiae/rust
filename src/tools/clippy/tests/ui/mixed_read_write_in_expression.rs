@@ -4,7 +4,7 @@
     unused_variables,
     clippy::no_effect,
     dead_code,
-    clippy::blacklisted_name
+    clippy::disallowed_names
 )]
 fn main() {
     let mut x = 0;
@@ -12,9 +12,11 @@ fn main() {
         x = 1;
         1
     } + x;
+    //~^ ERROR: unsequenced read of `x`
 
     // Example from iss#277
     x += {
+        //~^ ERROR: unsequenced read of `x`
         x = 20;
         2
     };
@@ -28,6 +30,7 @@ fn main() {
     let base = Foo { a: 4, b: 5 };
     let foo = Foo {
         a: x,
+        //~^ ERROR: unsequenced read of `x`
         ..{
             x = 6;
             base
@@ -37,6 +40,7 @@ fn main() {
     let closure = || {
         let mut x = 0;
         x += {
+            //~^ ERROR: unsequenced read of `x`
             x = 20;
             2
         };

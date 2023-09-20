@@ -21,11 +21,12 @@ declare_clippy_lint! {
     ///
     /// ### Example
     /// ```rust,ignore
-    /// // Bad
     /// let a = f(*&mut b);
     /// let c = *&d;
+    /// ```
     ///
-    /// // Good
+    /// Use instead:
+    /// ```rust,ignore
     /// let a = f(b);
     /// let c = d;
     /// ```
@@ -93,7 +94,7 @@ impl EarlyLintPass for DerefAddrOf {
                         DEREF_ADDROF,
                         e.span,
                         "immediately dereferencing a reference",
-                        "try this",
+                        "try",
                         sugg.to_string(),
                         applicability,
                     );

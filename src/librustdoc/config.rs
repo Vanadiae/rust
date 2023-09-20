@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::convert::TryFrom;
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::PathBuf;
@@ -11,11 +10,12 @@ use rustc_session::config::{
 };
 use rustc_session::config::{get_cmd_lint_options, nightly_options};
 use rustc_session::config::{
-    CodegenOptions, DebuggingOptions, ErrorOutputType, Externs, JsonUnusedExterns,
+    CodegenOptions, ErrorOutputType, Externs, JsonUnusedExterns, UnstableOptions,
 };
 use rustc_session::getopts;
 use rustc_session::lint::Level;
 use rustc_session::search_paths::SearchPath;
+use rustc_session::EarlyErrorHandler;
 use rustc_span::edition::Edition;
 use rustc_target::spec::TargetTriple;
 
@@ -30,16 +30,11 @@ use crate::passes::{self, Condition};
 use crate::scrape_examples::{AllCallLocations, ScrapeExamplesOptions};
 use crate::theme;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum OutputFormat {
     Json,
+    #[default]
     Html,
-}
-
-impl Default for OutputFormat {
-    fn default() -> OutputFormat {
-        OutputFormat::Html
-    }
 }
 
 impl OutputFormat {
@@ -55,7 +50,7 @@ impl TryFrom<&str> for OutputFormat {
         match value {
             "json" => Ok(OutputFormat::Json),
             "html" => Ok(OutputFormat::Html),
-            _ => Err(format!("unknown output format `{}`", value)),
+            _ => Err(format!("unknown output format `{value}`")),
         }
     }
 }
@@ -68,10 +63,14 @@ pub(crate) struct Options {
     pub(crate) input: PathBuf,
     /// The name of the crate being documented.
     pub(crate) crate_name: Option<String>,
+    /// Whether or not this is a bin crate
+    pub(crate) bin_crate: bool,
     /// Whether or not this is a proc-macro crate
     pub(crate) proc_macro_crate: bool,
     /// How to format errors and warnings.
     pub(crate) error_format: ErrorOutputType,
+    /// Width of output buffer to truncate errors appropriately.
+    pub(crate) diagnostic_width: Option<usize>,
     /// Library search paths to hand to the compiler.
     pub(crate) libs: Vec<SearchPath>,
     /// Library search paths strings to hand to the compiler.
@@ -88,10 +87,10 @@ pub(crate) struct Options {
     pub(crate) codegen_options: CodegenOptions,
     /// Codegen options strings to hand to the compiler.
     pub(crate) codegen_options_strs: Vec<String>,
-    /// Debugging (`-Z`) options to pass to the compiler.
-    pub(crate) debugging_opts: DebuggingOptions,
-    /// Debugging (`-Z`) options strings to pass to the compiler.
-    pub(crate) debugging_opts_strs: Vec<String>,
+    /// Unstable (`-Z`) options to pass to the compiler.
+    pub(crate) unstable_opts: UnstableOptions,
+    /// Unstable (`-Z`) options strings to pass to the compiler.
+    pub(crate) unstable_opts_strs: Vec<String>,
     /// The target used to compile the crate against.
     pub(crate) target: TargetTriple,
     /// Edition used when reading the crate. Defaults to "2015". Also used by default when
@@ -139,8 +138,6 @@ pub(crate) struct Options {
     // Options that alter generated documentation pages
     /// Crate version to note on the sidebar of generated docs.
     pub(crate) crate_version: Option<String>,
-    /// Collected options specific to outputting final pages.
-    pub(crate) render_options: RenderOptions,
     /// The format that we output when rendering.
     ///
     /// Currently used only for the `--show-coverage` option.
@@ -156,6 +153,16 @@ pub(crate) struct Options {
     /// Configuration for scraping examples from the current crate. If this option is Some(..) then
     /// the compiler will scrape examples and not generate documentation.
     pub(crate) scrape_examples_options: Option<ScrapeExamplesOptions>,
+
+    /// Note: this field is duplicated in `RenderOptions` because it's useful
+    /// to have it in both places.
+    pub(crate) unstable_features: rustc_feature::UnstableFeatures,
+
+    /// All commandline args used to invoke the compiler, with @file args fully expanded.
+    /// This will only be used within debug info, e.g. in the pdb file on windows
+    /// This is mainly useful for other tools that reads that debuginfo to figure out
+    /// how to call the compiler with the same arguments.
+    pub(crate) expanded_args: Vec<String>,
 }
 
 impl fmt::Debug for Options {
@@ -171,6 +178,7 @@ impl fmt::Debug for Options {
         f.debug_struct("Options")
             .field("input", &self.input)
             .field("crate_name", &self.crate_name)
+            .field("bin_crate", &self.bin_crate)
             .field("proc_macro_crate", &self.proc_macro_crate)
             .field("error_format", &self.error_format)
             .field("libs", &self.libs)
@@ -178,7 +186,7 @@ impl fmt::Debug for Options {
             .field("cfgs", &self.cfgs)
             .field("check-cfgs", &self.check_cfgs)
             .field("codegen_options", &"...")
-            .field("debugging_options", &"...")
+            .field("unstable_options", &"...")
             .field("target", &self.target)
             .field("edition", &self.edition)
             .field("maybe_sysroot", &self.maybe_sysroot)
@@ -191,7 +199,6 @@ impl fmt::Debug for Options {
             .field("persist_doctests", &self.persist_doctests)
             .field("show_coverage", &self.show_coverage)
             .field("crate_version", &self.crate_version)
-            .field("render_options", &self.render_options)
             .field("runtool", &self.runtool)
             .field("runtool_args", &self.runtool_args)
             .field("enable-per-target-ignores", &self.enable_per_target_ignores)
@@ -199,6 +206,7 @@ impl fmt::Debug for Options {
             .field("no_run", &self.no_run)
             .field("nocapture", &self.nocapture)
             .field("scrape_examples_options", &self.scrape_examples_options)
+            .field("unstable_features", &self.unstable_features)
             .finish()
     }
 }
@@ -217,12 +225,9 @@ pub(crate) struct RenderOptions {
     ///
     /// Be aware: This option can come both from the CLI and from crate attributes!
     pub(crate) playground_url: Option<String>,
-    /// Whether to sort modules alphabetically on a module page instead of using declaration order.
-    /// `true` by default.
-    //
-    // FIXME(misdreavus): the flag name is `--sort-modules-by-appearance` but the meaning is
-    // inverted once read.
-    pub(crate) sort_modules_alphabetically: bool,
+    /// What sorting mode to use for module pages.
+    /// `ModuleSorting::Alphabetical` by default.
+    pub(crate) module_sorting: ModuleSorting,
     /// List of themes to extend the docs with. Original argument name is included to assist in
     /// displaying errors if it fails a theme check.
     pub(crate) themes: Vec<StylePath>,
@@ -230,19 +235,13 @@ pub(crate) struct RenderOptions {
     pub(crate) extension_css: Option<PathBuf>,
     /// A map of crate names to the URL to use instead of querying the crate's `html_root_url`.
     pub(crate) extern_html_root_urls: BTreeMap<String, String>,
-    /// Whether to give precedence to `html_root_url` or `--exten-html-root-url`.
+    /// Whether to give precedence to `html_root_url` or `--extern-html-root-url`.
     pub(crate) extern_html_root_takes_precedence: bool,
     /// A map of the default settings (values are as for DOM storage API). Keys should lack the
     /// `rustdoc-` prefix.
     pub(crate) default_settings: FxHashMap<String, String>,
     /// If present, suffix added to CSS/JavaScript files when referencing them in generated pages.
     pub(crate) resource_suffix: String,
-    /// Whether to run the static CSS/JavaScript through a minifier when outputting them. `true` by
-    /// default.
-    //
-    // FIXME(misdreavus): the flag name is `--disable-minification` but the meaning is inverted
-    // once read.
-    pub(crate) enable_minification: bool,
     /// Whether to create an index page in the root of the output directory. If this is true but
     /// `enable_index_page` is None, generate a static listing of crates instead.
     pub(crate) enable_index_page: bool,
@@ -270,6 +269,8 @@ pub(crate) struct RenderOptions {
     pub(crate) generate_redirect_map: bool,
     /// Show the memory layout of types in the docs.
     pub(crate) show_type_layout: bool,
+    /// Note: this field is duplicated in `Options` because it's useful to have
+    /// it in both places.
     pub(crate) unstable_features: rustc_feature::UnstableFeatures,
     pub(crate) emit: Vec<EmitType>,
     /// If `true`, HTML source pages will generate links for items to their definition.
@@ -278,6 +279,14 @@ pub(crate) struct RenderOptions {
     pub(crate) call_locations: AllCallLocations,
     /// If `true`, Context::init will not emit shared files.
     pub(crate) no_emit_shared: bool,
+    /// If `true`, HTML source code pages won't be generated.
+    pub(crate) html_no_source: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModuleSorting {
+    DeclarationOrder,
+    Alphabetical,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -310,27 +319,36 @@ impl RenderOptions {
 impl Options {
     /// Parses the given command-line for options. If an error message or other early-return has
     /// been printed, returns `Err` with the exit code.
-    pub(crate) fn from_matches(matches: &getopts::Matches) -> Result<Options, i32> {
+    pub(crate) fn from_matches(
+        handler: &mut EarlyErrorHandler,
+        matches: &getopts::Matches,
+        args: Vec<String>,
+    ) -> Result<(Options, RenderOptions), i32> {
         // Check for unstable options.
-        nightly_options::check_nightly_options(matches, &opts());
+        nightly_options::check_nightly_options(handler, matches, &opts());
 
-        if matches.opt_present("h") || matches.opt_present("help") {
+        if args.is_empty() || matches.opt_present("h") || matches.opt_present("help") {
             crate::usage("rustdoc");
             return Err(0);
         } else if matches.opt_present("version") {
-            rustc_driver::version("rustdoc", matches);
+            rustc_driver::version!(&handler, "rustdoc", matches);
             return Err(0);
         }
 
-        let color = config::parse_color(matches);
+        if rustc_driver::describe_flag_categories(handler, &matches) {
+            return Err(0);
+        }
+
+        let color = config::parse_color(handler, matches);
         let config::JsonConfig { json_rendered, json_unused_externs, .. } =
-            config::parse_json(matches);
-        let error_format = config::parse_error_format(matches, color, json_rendered);
+            config::parse_json(handler, matches);
+        let error_format = config::parse_error_format(handler, matches, color, json_rendered);
+        let diagnostic_width = matches.opt_get("diagnostic-width").unwrap_or_default();
 
-        let codegen_options = CodegenOptions::build(matches, error_format);
-        let debugging_opts = DebuggingOptions::build(matches, error_format);
+        let codegen_options = CodegenOptions::build(handler, matches);
+        let unstable_opts = UnstableOptions::build(handler, matches);
 
-        let diag = new_handler(error_format, None, &debugging_opts);
+        let diag = new_handler(error_format, None, diagnostic_width, &unstable_opts);
 
         // check for deprecated options
         check_deprecated_options(matches, &diag);
@@ -373,7 +391,7 @@ impl Options {
                 match kind.parse() {
                     Ok(kind) => emit.push(kind),
                     Err(()) => {
-                        diag.err(&format!("unrecognized emission type: {}", kind));
+                        diag.err(format!("unrecognized emission type: {kind}"));
                         return Err(1);
                     }
                 }
@@ -385,20 +403,33 @@ impl Options {
             && !matches.opt_present("show-coverage")
             && !nightly_options::is_unstable_enabled(matches)
         {
-            rustc_session::early_error(
-                error_format,
+            handler.early_error(
                 "the -Z unstable-options flag must be passed to enable --output-format for documentation generation (see https://github.com/rust-lang/rust/issues/76578)",
             );
         }
 
         let to_check = matches.opt_strs("check-theme");
         if !to_check.is_empty() {
-            let paths = theme::load_css_paths(static_files::themes::LIGHT.as_bytes());
+            let mut content =
+                std::str::from_utf8(static_files::STATIC_FILES.rustdoc_css.bytes).unwrap();
+            if let Some((_, inside)) = content.split_once("/* Begin theme: light */") {
+                content = inside;
+            }
+            if let Some((inside, _)) = content.split_once("/* End theme: light */") {
+                content = inside;
+            }
+            let paths = match theme::load_css_paths(content) {
+                Ok(p) => p,
+                Err(e) => {
+                    diag.struct_err(e).emit();
+                    return Err(1);
+                }
+            };
             let mut errors = 0;
 
             println!("rustdoc: [check-theme] Starting tests! (Ignoring all other arguments)");
             for theme_file in to_check.iter() {
-                print!(" - Checking \"{}\"...", theme_file);
+                print!(" - Checking \"{theme_file}\"...");
                 let (success, differences) = theme::test_theme_against(theme_file, &paths, &diag);
                 if !differences.is_empty() || !success {
                     println!(" FAILED");
@@ -416,22 +447,23 @@ impl Options {
             return Err(0);
         }
 
-        if matches.free.is_empty() {
+        let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(handler, matches);
+
+        let input = PathBuf::from(if describe_lints {
+            "" // dummy, this won't be used
+        } else if matches.free.is_empty() {
             diag.struct_err("missing file operand").emit();
             return Err(1);
-        }
-        if matches.free.len() > 1 {
+        } else if matches.free.len() > 1 {
             diag.struct_err("too many file operands").emit();
             return Err(1);
-        }
-        let input = PathBuf::from(&matches.free[0]);
+        } else {
+            &matches.free[0]
+        });
 
-        let libs = matches
-            .opt_strs("L")
-            .iter()
-            .map(|s| SearchPath::from_cli_opt(s, error_format))
-            .collect();
-        let externs = parse_externs(matches, &debugging_opts, error_format);
+        let libs =
+            matches.opt_strs("L").iter().map(|s| SearchPath::from_cli_opt(handler, s)).collect();
+        let externs = parse_externs(handler, matches, &unstable_opts);
         let extern_html_root_urls = match parse_extern_html_roots(matches) {
             Ok(ex) => ex,
             Err(err) => {
@@ -470,11 +502,11 @@ impl Options {
                 //   https://developer.mozilla.org/en-US/docs/Web/API/HTMLElement/dataset
                 //
                 // The original key values we have are the same as the DOM storage API keys and the
-                // command line options, so contain `-`.  Our Javascript needs to be able to look
+                // command line options, so contain `-`.  Our JavaScript needs to be able to look
                 // these values up both in `dataset` and in the storage API, so it needs to be able
                 // to convert the names back and forth.  Despite doing this kebab-case to
                 // StudlyCaps transformation automatically, the JS DOM API does not provide a
-                // mechanism for doing the just transformation on a string.  So we want to avoid
+                // mechanism for doing just the transformation on a string.  So we want to avoid
                 // the StudlyCaps representation in the `dataset` property.
                 //
                 // We solve this by replacing all the `-`s with `_`s.  We do that here, when we
@@ -524,36 +556,48 @@ impl Options {
 
         let mut themes = Vec::new();
         if matches.opt_present("theme") {
-            let paths = theme::load_css_paths(static_files::themes::LIGHT.as_bytes());
+            let mut content =
+                std::str::from_utf8(static_files::STATIC_FILES.rustdoc_css.bytes).unwrap();
+            if let Some((_, inside)) = content.split_once("/* Begin theme: light */") {
+                content = inside;
+            }
+            if let Some((inside, _)) = content.split_once("/* End theme: light */") {
+                content = inside;
+            }
+            let paths = match theme::load_css_paths(content) {
+                Ok(p) => p,
+                Err(e) => {
+                    diag.struct_err(e).emit();
+                    return Err(1);
+                }
+            };
 
             for (theme_file, theme_s) in
                 matches.opt_strs("theme").iter().map(|s| (PathBuf::from(&s), s.to_owned()))
             {
                 if !theme_file.is_file() {
-                    diag.struct_err(&format!("invalid argument: \"{}\"", theme_s))
+                    diag.struct_err(format!("invalid argument: \"{theme_s}\""))
                         .help("arguments to --theme must be files")
                         .emit();
                     return Err(1);
                 }
                 if theme_file.extension() != Some(OsStr::new("css")) {
-                    diag.struct_err(&format!("invalid argument: \"{}\"", theme_s))
+                    diag.struct_err(format!("invalid argument: \"{theme_s}\""))
                         .help("arguments to --theme must have a .css extension")
                         .emit();
                     return Err(1);
                 }
                 let (success, ret) = theme::test_theme_against(&theme_file, &paths, &diag);
                 if !success {
-                    diag.struct_err(&format!("error loading theme file: \"{}\"", theme_s)).emit();
+                    diag.struct_err(format!("error loading theme file: \"{theme_s}\"")).emit();
                     return Err(1);
                 } else if !ret.is_empty() {
-                    diag.struct_warn(&format!(
-                        "theme file \"{}\" is missing CSS rules from the default theme",
-                        theme_s
+                    diag.struct_warn(format!(
+                        "theme file \"{theme_s}\" is missing CSS rules from the default theme",
                     ))
                     .warn("the theme may appear incorrect when loaded")
-                    .help(&format!(
-                        "to see what rules are missing, call `rustdoc --check-theme \"{}\"`",
-                        theme_s
+                    .help(format!(
+                        "to see what rules are missing, call `rustdoc --check-theme \"{theme_s}\"`",
                     ))
                     .emit();
                 }
@@ -561,7 +605,7 @@ impl Options {
             }
         }
 
-        let edition = config::parse_crate_edition(matches);
+        let edition = config::parse_crate_edition(handler, matches);
 
         let mut id_map = html::markdown::IdMap::new();
         let Some(external_html) = ExternalHtml::load(
@@ -582,7 +626,7 @@ impl Options {
         match matches.opt_str("r").as_deref() {
             Some("rust") | None => {}
             Some(s) => {
-                diag.struct_err(&format!("unknown input format: {}", s)).emit();
+                diag.struct_err(format!("unknown input format: {s}")).emit();
                 return Err(1);
             }
         }
@@ -595,14 +639,14 @@ impl Options {
             }
         }
 
-        let target = parse_target_triple(matches, error_format);
+        let target = parse_target_triple(handler, matches);
 
         let show_coverage = matches.opt_present("show-coverage");
 
         let crate_types = match parse_crate_types_from_list(matches.opt_strs("crate-type")) {
             Ok(types) => types,
             Err(e) => {
-                diag.struct_err(&format!("unknown crate type: {}", e)).emit();
+                diag.struct_err(format!("unknown crate type: {e}")).emit();
                 return Err(1);
             }
         };
@@ -620,19 +664,23 @@ impl Options {
                     out_fmt
                 }
                 Err(e) => {
-                    diag.struct_err(&e).emit();
+                    diag.struct_err(e).emit();
                     return Err(1);
                 }
             },
             None => OutputFormat::default(),
         };
         let crate_name = matches.opt_str("crate-name");
+        let bin_crate = crate_types.contains(&CrateType::Executable);
         let proc_macro_crate = crate_types.contains(&CrateType::ProcMacro);
         let playground_url = matches.opt_str("playground-url");
         let maybe_sysroot = matches.opt_str("sysroot").map(PathBuf::from);
-        let sort_modules_alphabetically = !matches.opt_present("sort-modules-by-appearance");
+        let module_sorting = if matches.opt_present("sort-modules-by-appearance") {
+            ModuleSorting::DeclarationOrder
+        } else {
+            ModuleSorting::Alphabetical
+        };
         let resource_suffix = matches.opt_str("resource-suffix").unwrap_or_default();
-        let enable_minification = !matches.opt_present("disable-minification");
         let markdown_no_toc = matches.opt_present("markdown-no-toc");
         let markdown_css = matches.opt_strs("markdown-css");
         let markdown_playground_url = matches.opt_str("markdown-playground-url");
@@ -643,7 +691,7 @@ impl Options {
         let persist_doctests = matches.opt_str("persist-doctests").map(PathBuf::from);
         let test_builder = matches.opt_str("test-builder").map(PathBuf::from);
         let codegen_options_strs = matches.opt_strs("C");
-        let debugging_opts_strs = matches.opt_strs("Z");
+        let unstable_opts_strs = matches.opt_strs("Z");
         let lib_strs = matches.opt_strs("L");
         let extern_strs = matches.opt_strs("extern");
         let runtool = matches.opt_str("runtool");
@@ -658,6 +706,7 @@ impl Options {
         let generate_link_to_definition = matches.opt_present("generate-link-to-definition");
         let extern_html_root_takes_precedence =
             matches.opt_present("extern-html-root-takes-precedence");
+        let html_no_source = matches.opt_present("html-no-source");
 
         if generate_link_to_definition && (show_coverage || output_format != OutputFormat::Html) {
             diag.struct_err(
@@ -671,12 +720,14 @@ impl Options {
         let with_examples = matches.opt_strs("with-examples");
         let call_locations = crate::scrape_examples::load_call_locations(with_examples, &diag)?;
 
-        let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(matches, error_format);
-
-        Ok(Options {
+        let unstable_features =
+            rustc_feature::UnstableFeatures::from_environment(crate_name.as_deref());
+        let options = Options {
             input,
+            bin_crate,
             proc_macro_crate,
             error_format,
+            diagnostic_width,
             libs,
             lib_strs,
             externs,
@@ -685,8 +736,8 @@ impl Options {
             check_cfgs,
             codegen_options,
             codegen_options_strs,
-            debugging_opts,
-            debugging_opts_strs,
+            unstable_opts,
+            unstable_opts_strs,
             target,
             edition,
             maybe_sysroot,
@@ -706,42 +757,43 @@ impl Options {
             run_check,
             no_run,
             nocapture,
-            render_options: RenderOptions {
-                output,
-                external_html,
-                id_map,
-                playground_url,
-                sort_modules_alphabetically,
-                themes,
-                extension_css,
-                extern_html_root_urls,
-                extern_html_root_takes_precedence,
-                default_settings,
-                resource_suffix,
-                enable_minification,
-                enable_index_page,
-                index_page,
-                static_root_path,
-                markdown_no_toc,
-                markdown_css,
-                markdown_playground_url,
-                document_private,
-                document_hidden,
-                generate_redirect_map,
-                show_type_layout,
-                unstable_features: rustc_feature::UnstableFeatures::from_environment(
-                    crate_name.as_deref(),
-                ),
-                emit,
-                generate_link_to_definition,
-                call_locations,
-                no_emit_shared: false,
-            },
             crate_name,
             output_format,
             json_unused_externs,
             scrape_examples_options,
-        })
+            unstable_features,
+            expanded_args: args,
+        };
+        let render_options = RenderOptions {
+            output,
+            external_html,
+            id_map,
+            playground_url,
+            module_sorting,
+            themes,
+            extension_css,
+            extern_html_root_urls,
+            extern_html_root_takes_precedence,
+            default_settings,
+            resource_suffix,
+            enable_index_page,
+            index_page,
+            static_root_path,
+            markdown_no_toc,
+            markdown_css,
+            markdown_playground_url,
+            document_private,
+            document_hidden,
+            generate_redirect_map,
+            show_type_layout,
+            unstable_features,
+            emit,
+            generate_link_to_definition,
+            call_locations,
+            no_emit_shared: false,
+            html_no_source,
+        };
+        Ok((options, render_options))
     }
 
     /// Returns `true` if the file given as `self.input` is a Markdown file.
@@ -756,7 +808,7 @@ fn check_deprecated_options(matches: &getopts::Matches, diag: &rustc_errors::Han
 
     for &flag in deprecated_flags.iter() {
         if matches.opt_present(flag) {
-            diag.struct_warn(&format!("the `{}` flag is deprecated", flag))
+            diag.struct_warn(format!("the `{flag}` flag is deprecated"))
                 .note(
                     "see issue #44136 <https://github.com/rust-lang/rust/issues/44136> \
                     for more information",
@@ -769,7 +821,7 @@ fn check_deprecated_options(matches: &getopts::Matches, diag: &rustc_errors::Han
 
     for &flag in removed_flags.iter() {
         if matches.opt_present(flag) {
-            let mut err = diag.struct_warn(&format!("the `{}` flag no longer functions", flag));
+            let mut err = diag.struct_warn(format!("the `{flag}` flag no longer functions"));
             err.note(
                 "see issue #44136 <https://github.com/rust-lang/rust/issues/44136> \
                 for more information",

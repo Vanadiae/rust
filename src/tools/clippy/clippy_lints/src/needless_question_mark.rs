@@ -1,9 +1,9 @@
 use clippy_utils::diagnostics::span_lint_and_sugg;
-use clippy_utils::is_lang_ctor;
+use clippy_utils::path_res;
 use clippy_utils::source::snippet;
 use if_chain::if_chain;
 use rustc_errors::Applicability;
-use rustc_hir::LangItem::{OptionSome, ResultOk};
+use rustc_hir::def::{DefKind, Res};
 use rustc_hir::{AsyncGeneratorKind, Block, Body, Expr, ExprKind, GeneratorKind, LangItem, MatchSource, QPath};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
@@ -112,16 +112,17 @@ impl LateLintPass<'_> for NeedlessQuestionMark {
 
 fn check(cx: &LateContext<'_>, expr: &Expr<'_>) {
     if_chain! {
-        if let ExprKind::Call(path, [arg]) = &expr.kind;
-        if let ExprKind::Path(ref qpath) = &path.kind;
-        let sugg_remove = if is_lang_ctor(cx, qpath, OptionSome) {
+        if let ExprKind::Call(path, [arg]) = expr.kind;
+        if let Res::Def(DefKind::Ctor(..), ctor_id) = path_res(cx, path);
+        if let Some(variant_id) = cx.tcx.opt_parent(ctor_id);
+        let sugg_remove = if cx.tcx.lang_items().option_some_variant() == Some(variant_id) {
             "Some()"
-        } else if is_lang_ctor(cx, qpath, ResultOk) {
+        } else if cx.tcx.lang_items().result_ok_variant() == Some(variant_id) {
             "Ok()"
         } else {
             return;
         };
-        if let ExprKind::Match(inner_expr_with_q, _, MatchSource::TryDesugar) = &arg.kind;
+        if let ExprKind::Match(inner_expr_with_q, _, MatchSource::TryDesugar(_)) = &arg.kind;
         if let ExprKind::Call(called, [inner_expr]) = &inner_expr_with_q.kind;
         if let ExprKind::Path(QPath::LangItem(LangItem::TryTraitBranch, ..)) = &called.kind;
         if expr.span.ctxt() == inner_expr.span.ctxt();
@@ -134,7 +135,7 @@ fn check(cx: &LateContext<'_>, expr: &Expr<'_>) {
                 NEEDLESS_QUESTION_MARK,
                 expr.span,
                 "question mark operator is useless here",
-                &format!("try removing question mark and `{}`", sugg_remove),
+                &format!("try removing question mark and `{sugg_remove}`"),
                 format!("{}", snippet(cx, inner_expr.span, r#""...""#)),
                 Applicability::MachineApplicable,
             );

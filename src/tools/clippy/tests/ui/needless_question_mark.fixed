@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![warn(clippy::needless_question_mark)]
 #![allow(
     clippy::needless_return,
@@ -8,7 +6,6 @@
     dead_code,
     unused_must_use
 )]
-#![feature(custom_inner_attributes)]
 
 struct TO {
     magic: Option<usize>,

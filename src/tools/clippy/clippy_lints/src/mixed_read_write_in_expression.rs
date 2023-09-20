@@ -25,14 +25,16 @@ declare_clippy_lint! {
     /// ```rust
     /// let mut x = 0;
     ///
-    /// // Bad
     /// let a = {
     ///     x = 1;
     ///     1
     /// } + x;
     /// // Unclear whether a is 1 or 2.
+    /// ```
     ///
-    /// // Good
+    /// Use instead:
+    /// ```rust
+    /// # let mut x = 0;
     /// let tmp = {
     ///     x = 1;
     ///     1
@@ -112,7 +114,7 @@ struct DivergenceVisitor<'a, 'tcx> {
 impl<'a, 'tcx> DivergenceVisitor<'a, 'tcx> {
     fn maybe_walk_expr(&mut self, e: &'tcx Expr<'_>) {
         match e.kind {
-            ExprKind::Closure(..) => {},
+            ExprKind::Closure(..) | ExprKind::If(..) | ExprKind::Loop(..) => {},
             ExprKind::Match(e, arms, _) => {
                 self.visit_expr(e);
                 for arm in arms {
@@ -120,12 +122,13 @@ impl<'a, 'tcx> DivergenceVisitor<'a, 'tcx> {
                         self.visit_expr(if_expr);
                     }
                     // make sure top level arm expressions aren't linted
-                    self.maybe_walk_expr(&*arm.body);
+                    self.maybe_walk_expr(arm.body);
                 }
             },
             _ => walk_expr(self, e),
         }
     }
+
     fn report_diverging_sub_expr(&mut self, e: &Expr<'_>) {
         span_lint(self.cx, DIVERGING_SUB_EXPRESSION, e.span, "sub-expression diverges");
     }
@@ -134,6 +137,15 @@ impl<'a, 'tcx> DivergenceVisitor<'a, 'tcx> {
 impl<'a, 'tcx> Visitor<'tcx> for DivergenceVisitor<'a, 'tcx> {
     fn visit_expr(&mut self, e: &'tcx Expr<'_>) {
         match e.kind {
+            // fix #10776
+            ExprKind::Block(block, ..) => match (block.stmts, block.expr) {
+                ([], Some(e)) => self.visit_expr(e),
+                ([stmt], None) => match stmt.kind {
+                    StmtKind::Expr(e) | StmtKind::Semi(e) => self.visit_expr(e),
+                    _ => {},
+                },
+                _ => {},
+            },
             ExprKind::Continue(_) | ExprKind::Break(_, _) | ExprKind::Ret(_) => self.report_diverging_sub_expr(e),
             ExprKind::Call(func, _) => {
                 let typ = self.cx.typeck_results().expr_ty(func);
@@ -184,14 +196,11 @@ fn check_for_unsequenced_reads(vis: &mut ReadVisitor<'_, '_>) {
     let map = &vis.cx.tcx.hir();
     let mut cur_id = vis.write_expr.hir_id;
     loop {
-        let parent_id = map.get_parent_node(cur_id);
+        let parent_id = map.parent_id(cur_id);
         if parent_id == cur_id {
             break;
         }
-        let parent_node = match map.find(parent_id) {
-            Some(parent) => parent,
-            None => break,
-        };
+        let Some(parent_node) = map.find(parent_id) else { break };
 
         let stop_early = match parent_node {
             Node::Expr(expr) => check_expr(vis, expr),
@@ -219,7 +228,7 @@ enum StopEarly {
     Stop,
 }
 
-fn check_expr<'a, 'tcx>(vis: &mut ReadVisitor<'a, 'tcx>, expr: &'tcx Expr<'_>) -> StopEarly {
+fn check_expr<'tcx>(vis: &mut ReadVisitor<'_, 'tcx>, expr: &'tcx Expr<'_>) -> StopEarly {
     if expr.hir_id == vis.last_expr.hir_id {
         return StopEarly::KeepGoing;
     }
@@ -230,7 +239,7 @@ fn check_expr<'a, 'tcx>(vis: &mut ReadVisitor<'a, 'tcx>, expr: &'tcx Expr<'_>) -
         | ExprKind::MethodCall(..)
         | ExprKind::Call(_, _)
         | ExprKind::Assign(..)
-        | ExprKind::Index(_, _)
+        | ExprKind::Index(..)
         | ExprKind::Repeat(_, _)
         | ExprKind::Struct(_, _, _) => {
             walk_expr(vis, expr);
@@ -243,7 +252,7 @@ fn check_expr<'a, 'tcx>(vis: &mut ReadVisitor<'a, 'tcx>, expr: &'tcx Expr<'_>) -
                 walk_expr(vis, expr);
             }
         },
-        ExprKind::Closure(_, _, _, _, _) => {
+        ExprKind::Closure { .. } => {
             // Either
             //
             // * `var` is defined in the closure body, in which case we've reached the top of the enclosing
@@ -266,7 +275,7 @@ fn check_expr<'a, 'tcx>(vis: &mut ReadVisitor<'a, 'tcx>, expr: &'tcx Expr<'_>) -
     StopEarly::KeepGoing
 }
 
-fn check_stmt<'a, 'tcx>(vis: &mut ReadVisitor<'a, 'tcx>, stmt: &'tcx Stmt<'_>) -> StopEarly {
+fn check_stmt<'tcx>(vis: &mut ReadVisitor<'_, 'tcx>, stmt: &'tcx Stmt<'_>) -> StopEarly {
     match stmt.kind {
         StmtKind::Expr(expr) | StmtKind::Semi(expr) => check_expr(vis, expr),
         // If the declaration is of a local variable, check its initializer
@@ -315,7 +324,7 @@ impl<'a, 'tcx> Visitor<'tcx> for ReadVisitor<'a, 'tcx> {
             // We're about to descend a closure. Since we don't know when (or
             // if) the closure will be evaluated, any reads in it might not
             // occur here (or ever). Like above, bail to avoid false positives.
-            ExprKind::Closure(_, _, _, _, _) |
+            ExprKind::Closure{..} |
 
             // We want to avoid a false positive when a variable name occurs
             // only to have its address taken, so we stop here. Technically,

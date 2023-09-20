@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use rustc_ast::token::{BinOpToken, Delimiter, Token, TokenKind};
-use rustc_ast::tokenstream::{Cursor, Spacing, TokenStream, TokenTree};
+use rustc_ast::tokenstream::{RefTokenTreeCursor, TokenStream, TokenTree};
 use rustc_ast::{ast, ptr};
 use rustc_ast_pretty::pprust;
 use rustc_span::{
@@ -35,8 +35,8 @@ use crate::shape::{Indent, Shape};
 use crate::source_map::SpanUtils;
 use crate::spanned::Spanned;
 use crate::utils::{
-    format_visibility, indent_next_line, is_empty_line, mk_sp, remove_trailing_white_spaces,
-    rewrite_ident, trim_left_preserve_layout, wrap_str, NodeIdExt,
+    filtered_str_fits, format_visibility, indent_next_line, is_empty_line, mk_sp,
+    remove_trailing_white_spaces, rewrite_ident, trim_left_preserve_layout, NodeIdExt,
 };
 use crate::visitor::FmtVisitor;
 
@@ -157,7 +157,8 @@ pub(crate) fn rewrite_macro(
 ) -> Option<String> {
     let should_skip = context
         .skip_context
-        .skip_macro(context.snippet(mac.path.span));
+        .macros
+        .skip(context.snippet(mac.path.span));
     if should_skip {
         None
     } else {
@@ -208,7 +209,7 @@ fn rewrite_macro_inner(
         original_style
     };
 
-    let ts = mac.args.inner_tokens();
+    let ts = mac.args.tokens.clone();
     let has_comment = contains_comment(context.snippet(mac.span()));
     if ts.is_empty() && !has_comment {
         return match style {
@@ -392,8 +393,8 @@ pub(crate) fn rewrite_macro_def(
         return snippet;
     }
 
-    let ts = def.body.inner_tokens();
-    let mut parser = MacroParser::new(ts.into_trees());
+    let ts = def.body.tokens.clone();
+    let mut parser = MacroParser::new(ts.trees());
     let parsed_def = match parser.parse() {
         Some(def) => def,
         None => return snippet,
@@ -682,7 +683,7 @@ struct MacroArgParser {
 
 fn last_tok(tt: &TokenTree) -> Token {
     match *tt {
-        TokenTree::Token(ref t) => t.clone(),
+        TokenTree::Token(ref t, _) => t.clone(),
         TokenTree::Delimited(delim_span, delim, _) => Token {
             kind: TokenKind::CloseDelim(delim),
             span: delim_span.close,
@@ -735,12 +736,15 @@ impl MacroArgParser {
         self.buf.clear();
     }
 
-    fn add_meta_variable(&mut self, iter: &mut Cursor) -> Option<()> {
+    fn add_meta_variable(&mut self, iter: &mut RefTokenTreeCursor<'_>) -> Option<()> {
         match iter.next() {
-            Some(TokenTree::Token(Token {
-                kind: TokenKind::Ident(name, _),
-                ..
-            })) => {
+            Some(&TokenTree::Token(
+                Token {
+                    kind: TokenKind::Ident(name, _),
+                    ..
+                },
+                _,
+            )) => {
                 self.result.push(ParsedMacroArg {
                     kind: MacroArgKind::MetaVariable(name, self.buf.clone()),
                 });
@@ -764,7 +768,7 @@ impl MacroArgParser {
         &mut self,
         inner: Vec<ParsedMacroArg>,
         delim: Delimiter,
-        iter: &mut Cursor,
+        iter: &mut RefTokenTreeCursor<'_>,
     ) -> Option<()> {
         let mut buffer = String::new();
         let mut first = true;
@@ -777,21 +781,30 @@ impl MacroArgParser {
             }
 
             match tok {
-                TokenTree::Token(Token {
-                    kind: TokenKind::BinOp(BinOpToken::Plus),
-                    ..
-                })
-                | TokenTree::Token(Token {
-                    kind: TokenKind::Question,
-                    ..
-                })
-                | TokenTree::Token(Token {
-                    kind: TokenKind::BinOp(BinOpToken::Star),
-                    ..
-                }) => {
+                TokenTree::Token(
+                    Token {
+                        kind: TokenKind::BinOp(BinOpToken::Plus),
+                        ..
+                    },
+                    _,
+                )
+                | TokenTree::Token(
+                    Token {
+                        kind: TokenKind::Question,
+                        ..
+                    },
+                    _,
+                )
+                | TokenTree::Token(
+                    Token {
+                        kind: TokenKind::BinOp(BinOpToken::Star),
+                        ..
+                    },
+                    _,
+                ) => {
                     break;
                 }
-                TokenTree::Token(ref t) => {
+                TokenTree::Token(ref t, _) => {
                     buffer.push_str(&pprust::token_to_string(t));
                 }
                 _ => return None,
@@ -855,14 +868,17 @@ impl MacroArgParser {
 
     /// Returns a collection of parsed macro def's arguments.
     fn parse(mut self, tokens: TokenStream) -> Option<Vec<ParsedMacroArg>> {
-        let mut iter = tokens.into_trees();
+        let mut iter = tokens.trees();
 
         while let Some(tok) = iter.next() {
             match tok {
-                TokenTree::Token(Token {
-                    kind: TokenKind::Dollar,
-                    span,
-                }) => {
+                &TokenTree::Token(
+                    Token {
+                        kind: TokenKind::Dollar,
+                        span,
+                    },
+                    _,
+                ) => {
                     // We always want to add a separator before meta variables.
                     if !self.buf.is_empty() {
                         self.add_separator();
@@ -875,14 +891,17 @@ impl MacroArgParser {
                         span,
                     };
                 }
-                TokenTree::Token(Token {
-                    kind: TokenKind::Colon,
-                    ..
-                }) if self.is_meta_var => {
+                TokenTree::Token(
+                    Token {
+                        kind: TokenKind::Colon,
+                        ..
+                    },
+                    _,
+                ) if self.is_meta_var => {
                     self.add_meta_variable(&mut iter)?;
                 }
-                TokenTree::Token(ref t) => self.update_buffer(t),
-                TokenTree::Delimited(_delimited_span, delimited, ref tts) => {
+                TokenTree::Token(ref t, _) => self.update_buffer(t),
+                &TokenTree::Delimited(_delimited_span, delimited, ref tts) => {
                     if !self.buf.is_empty() {
                         if next_space(&self.last_tok.kind) == SpaceState::Always {
                             self.add_separator();
@@ -1069,7 +1088,7 @@ pub(crate) fn convert_try_mac(
 ) -> Option<ast::Expr> {
     let path = &pprust::path_to_string(&mac.path);
     if path == "try" || path == "r#try" {
-        let ts = mac.args.inner_tokens();
+        let ts = mac.args.tokens.clone();
 
         Some(ast::Expr {
             id: ast::NodeId::root(), // dummy value
@@ -1100,12 +1119,15 @@ pub(crate) fn macro_style(mac: &ast::MacCall, context: &RewriteContext<'_>) -> D
 
 // A very simple parser that just parses a macros 2.0 definition into its branches.
 // Currently we do not attempt to parse any further than that.
-#[derive(new)]
-struct MacroParser {
-    toks: Cursor,
+struct MacroParser<'a> {
+    toks: RefTokenTreeCursor<'a>,
 }
 
-impl MacroParser {
+impl<'a> MacroParser<'a> {
+    const fn new(toks: RefTokenTreeCursor<'a>) -> Self {
+        Self { toks }
+    }
+
     // (`(` ... `)` `=>` `{` ... `}`)*
     fn parse(&mut self) -> Option<Macro> {
         let mut branches = vec![];
@@ -1121,14 +1143,17 @@ impl MacroParser {
         let tok = self.toks.next()?;
         let (lo, args_paren_kind) = match tok {
             TokenTree::Token(..) => return None,
-            TokenTree::Delimited(delimited_span, d, _) => (delimited_span.open.lo(), d),
+            &TokenTree::Delimited(delimited_span, d, _) => (delimited_span.open.lo(), d),
         };
-        let args = TokenStream::new(vec![(tok, Spacing::Joint)]);
+        let args = TokenStream::new(vec![tok.clone()]);
         match self.toks.next()? {
-            TokenTree::Token(Token {
-                kind: TokenKind::FatArrow,
-                ..
-            }) => {}
+            TokenTree::Token(
+                Token {
+                    kind: TokenKind::FatArrow,
+                    ..
+                },
+                _,
+            ) => {}
             _ => return None,
         }
         let (mut hi, body, whole_body) = match self.toks.next()? {
@@ -1147,10 +1172,13 @@ impl MacroParser {
                 )
             }
         };
-        if let Some(TokenTree::Token(Token {
-            kind: TokenKind::Semi,
-            span,
-        })) = self.toks.look_ahead(0)
+        if let Some(TokenTree::Token(
+            Token {
+                kind: TokenKind::Semi,
+                span,
+            },
+            _,
+        )) = self.toks.look_ahead(0)
         {
             hi = span.hi();
             self.toks.next();
@@ -1241,15 +1269,14 @@ impl MacroBranch {
                 }
             }
         };
-        let new_body = wrap_str(
-            new_body_snippet.snippet.to_string(),
-            config.max_width(),
-            shape,
-        )?;
+
+        if !filtered_str_fits(&new_body_snippet.snippet, config.max_width(), shape) {
+            return None;
+        }
 
         // Indent the body since it is in a block.
         let indent_str = body_indent.to_string(&config);
-        let mut new_body = LineClasses::new(new_body.trim_end())
+        let mut new_body = LineClasses::new(new_body_snippet.snippet.trim_end())
             .enumerate()
             .fold(
                 (String::new(), true),

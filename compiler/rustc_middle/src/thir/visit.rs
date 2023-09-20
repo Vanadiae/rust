@@ -1,5 +1,6 @@
 use super::{
-    Arm, Block, Expr, ExprKind, Guard, InlineAsmOperand, Pat, PatKind, Stmt, StmtKind, Thir,
+    AdtExpr, Arm, Block, ClosureExpr, Expr, ExprKind, Guard, InlineAsmExpr, InlineAsmOperand, Pat,
+    PatKind, Stmt, StmtKind, Thir,
 };
 
 pub trait Visitor<'a, 'tcx: 'a>: Sized {
@@ -64,23 +65,23 @@ pub fn walk_expr<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, expr: &Exp
         Cast { source } => visitor.visit_expr(&visitor.thir()[source]),
         Use { source } => visitor.visit_expr(&visitor.thir()[source]),
         NeverToAny { source } => visitor.visit_expr(&visitor.thir()[source]),
-        Pointer { source, cast: _ } => visitor.visit_expr(&visitor.thir()[source]),
+        PointerCoercion { source, cast: _ } => visitor.visit_expr(&visitor.thir()[source]),
         Let { expr, .. } => {
             visitor.visit_expr(&visitor.thir()[expr]);
         }
         Loop { body } => visitor.visit_expr(&visitor.thir()[body]),
-        Match { scrutinee, ref arms } => {
+        Match { scrutinee, ref arms, .. } => {
             visitor.visit_expr(&visitor.thir()[scrutinee]);
             for &arm in &**arms {
                 visitor.visit_arm(&visitor.thir()[arm]);
             }
         }
-        Block { ref body } => visitor.visit_block(body),
+        Block { block } => visitor.visit_block(&visitor.thir()[block]),
         Assign { lhs, rhs } | AssignOp { lhs, rhs, op: _ } => {
             visitor.visit_expr(&visitor.thir()[lhs]);
             visitor.visit_expr(&visitor.thir()[rhs]);
         }
-        Field { lhs, name: _ } => visitor.visit_expr(&visitor.thir()[lhs]),
+        Field { lhs, variant_index: _, name: _ } => visitor.visit_expr(&visitor.thir()[lhs]),
         Index { lhs, index } => {
             visitor.visit_expr(&visitor.thir()[lhs]);
             visitor.visit_expr(&visitor.thir()[index]);
@@ -99,7 +100,8 @@ pub fn walk_expr<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, expr: &Exp
                 visitor.visit_expr(&visitor.thir()[value])
             }
         }
-        ConstBlock { did: _, substs: _ } => {}
+        Become { value } => visitor.visit_expr(&visitor.thir()[value]),
+        ConstBlock { did: _, args: _ } => {}
         Repeat { value, count: _ } => {
             visitor.visit_expr(&visitor.thir()[value]);
         }
@@ -108,12 +110,12 @@ pub fn walk_expr<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, expr: &Exp
                 visitor.visit_expr(&visitor.thir()[field]);
             }
         }
-        Adt(box crate::thir::Adt {
+        Adt(box AdtExpr {
             ref fields,
             ref base,
             adt_def: _,
             variant_index: _,
-            substs: _,
+            args: _,
             user_ty: _,
         }) => {
             for field in &**fields {
@@ -126,13 +128,20 @@ pub fn walk_expr<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, expr: &Exp
         PlaceTypeAscription { source, user_ty: _ } | ValueTypeAscription { source, user_ty: _ } => {
             visitor.visit_expr(&visitor.thir()[source])
         }
-        Closure { closure_id: _, substs: _, upvars: _, movability: _, fake_reads: _ } => {}
+        Closure(box ClosureExpr {
+            closure_id: _,
+            args: _,
+            upvars: _,
+            movability: _,
+            fake_reads: _,
+        }) => {}
         Literal { lit: _, neg: _ } => {}
         NonHirLiteral { lit: _, user_ty: _ } => {}
-        NamedConst { def_id: _, substs: _, user_ty: _ } => {}
+        ZstLiteral { user_ty: _ } => {}
+        NamedConst { def_id: _, args: _, user_ty: _ } => {}
         ConstParam { param: _, def_id: _ } => {}
         StaticRef { alloc_id: _, ty: _, def_id: _ } => {}
-        InlineAsm { ref operands, template: _, options: _, line_spans: _ } => {
+        InlineAsm(box InlineAsmExpr { ref operands, template: _, options: _, line_spans: _ }) => {
             for op in &**operands {
                 use InlineAsmOperand::*;
                 match op {
@@ -152,6 +161,7 @@ pub fn walk_expr<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, expr: &Exp
                 }
             }
         }
+        OffsetOf { container: _, fields: _ } => {}
         ThreadLocalRef(_) => {}
         Yield { value } => visitor.visit_expr(&visitor.thir()[value]),
     }
@@ -166,11 +176,16 @@ pub fn walk_stmt<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, stmt: &Stm
             init_scope: _,
             ref pattern,
             lint_level: _,
+            else_block,
+            span: _,
         } => {
             if let Some(init) = initializer {
                 visitor.visit_expr(&visitor.thir()[*init]);
             }
             visitor.visit_pat(pattern);
+            if let Some(block) = else_block {
+                visitor.visit_block(&visitor.thir()[*block])
+            }
         }
     }
 }
@@ -199,7 +214,7 @@ pub fn walk_arm<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, arm: &Arm<'
 
 pub fn walk_pat<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, pat: &Pat<'tcx>) {
     use PatKind::*;
-    match pat.kind.as_ref() {
+    match &pat.kind {
         AscribeUserType { subpattern, ascription: _ }
         | Deref { subpattern }
         | Binding {
@@ -212,7 +227,7 @@ pub fn walk_pat<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, pat: &Pat<'
             name: _,
         } => visitor.visit_pat(&subpattern),
         Binding { .. } | Wild => {}
-        Variant { subpatterns, adt_def: _, substs: _, variant_index: _ } | Leaf { subpatterns } => {
+        Variant { subpatterns, adt_def: _, args: _, variant_index: _ } | Leaf { subpatterns } => {
             for subpattern in subpatterns {
                 visitor.visit_pat(&subpattern.pattern);
             }
@@ -220,18 +235,18 @@ pub fn walk_pat<'a, 'tcx: 'a, V: Visitor<'a, 'tcx>>(visitor: &mut V, pat: &Pat<'
         Constant { value: _ } => {}
         Range(_) => {}
         Slice { prefix, slice, suffix } | Array { prefix, slice, suffix } => {
-            for subpattern in prefix {
+            for subpattern in prefix.iter() {
                 visitor.visit_pat(&subpattern);
             }
             if let Some(pat) = slice {
-                visitor.visit_pat(pat);
+                visitor.visit_pat(&pat);
             }
-            for subpattern in suffix {
+            for subpattern in suffix.iter() {
                 visitor.visit_pat(&subpattern);
             }
         }
         Or { pats } => {
-            for pat in pats {
+            for pat in pats.iter() {
                 visitor.visit_pat(&pat);
             }
         }

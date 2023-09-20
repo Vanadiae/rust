@@ -9,6 +9,7 @@ use crate::borrow::Borrow;
 use crate::cell::Cell;
 use crate::collections::TryReserveError;
 use crate::collections::TryReserveErrorKind;
+use crate::error::Error;
 use crate::fmt::{self, Debug};
 #[allow(deprecated)]
 use crate::hash::{BuildHasher, Hash, Hasher, SipHasher13};
@@ -48,12 +49,14 @@ use crate::sys;
 /// ```
 ///
 /// In other words, if two keys are equal, their hashes must be equal.
+/// Violating this property is a logic error.
 ///
-/// It is a logic error for a key to be modified in such a way that the key's
+/// It is also a logic error for a key to be modified in such a way that the key's
 /// hash, as determined by the [`Hash`] trait, or its equality, as determined by
 /// the [`Eq`] trait, changes while it is in the map. This is normally only
 /// possible through [`Cell`], [`RefCell`], global state, I/O, or unsafe code.
-/// The behavior resulting from such a logic error is not specified, but will
+///
+/// The behavior resulting from either logic error is not specified, but will
 /// be encapsulated to the `HashMap` that observed the logic error and not
 /// result in undefined behavior. This could include panics, incorrect results,
 /// aborts, memory leaks, and non-termination.
@@ -164,6 +167,9 @@ use crate::sys;
 /// // update a key, guarding against the key possibly not being set
 /// let stat = player_stats.entry("attack").or_insert(100);
 /// *stat += random_stat_buff();
+///
+/// // modify an entry before an insert with in-place mutation
+/// player_stats.entry("mana").and_modify(|mana| *mana += 200).or_insert(100);
 /// ```
 ///
 /// The easiest way to use `HashMap` with a custom key type is to derive [`Eq`] and [`Hash`].
@@ -230,10 +236,11 @@ impl<K, V> HashMap<K, V, RandomState> {
         Default::default()
     }
 
-    /// Creates an empty `HashMap` with the specified capacity.
+    /// Creates an empty `HashMap` with at least the specified capacity.
     ///
     /// The hash map will be able to hold at least `capacity` elements without
-    /// reallocating. If `capacity` is 0, the hash map will not allocate.
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is 0, the hash map will not allocate.
     ///
     /// # Examples
     ///
@@ -275,22 +282,24 @@ impl<K, V, S> HashMap<K, V, S> {
     /// ```
     #[inline]
     #[stable(feature = "hashmap_build_hasher", since = "1.7.0")]
-    pub fn with_hasher(hash_builder: S) -> HashMap<K, V, S> {
+    #[rustc_const_unstable(feature = "const_collections_with_hasher", issue = "102575")]
+    pub const fn with_hasher(hash_builder: S) -> HashMap<K, V, S> {
         HashMap { base: base::HashMap::with_hasher(hash_builder) }
     }
 
-    /// Creates an empty `HashMap` with the specified capacity, using `hash_builder`
-    /// to hash the keys.
+    /// Creates an empty `HashMap` with at least the specified capacity, using
+    /// `hasher` to hash the keys.
     ///
     /// The hash map will be able to hold at least `capacity` elements without
-    /// reallocating. If `capacity` is 0, the hash map will not allocate.
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is 0, the hash map will not allocate.
     ///
-    /// Warning: `hash_builder` is normally randomly generated, and
+    /// Warning: `hasher` is normally randomly generated, and
     /// is designed to allow HashMaps to be resistant to attacks that
     /// cause many collisions and very poor performance. Setting it
     /// manually using this function can expose a DoS attack vector.
     ///
-    /// The `hash_builder` passed should implement the [`BuildHasher`] trait for
+    /// The `hasher` passed should implement the [`BuildHasher`] trait for
     /// the HashMap to be useful, see its documentation for details.
     ///
     /// # Examples
@@ -305,8 +314,8 @@ impl<K, V, S> HashMap<K, V, S> {
     /// ```
     #[inline]
     #[stable(feature = "hashmap_build_hasher", since = "1.7.0")]
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
-        HashMap { base: base::HashMap::with_capacity_and_hasher(capacity, hash_builder) }
+    pub fn with_capacity_and_hasher(capacity: usize, hasher: S) -> HashMap<K, V, S> {
+        HashMap { base: base::HashMap::with_capacity_and_hasher(capacity, hasher) }
     }
 
     /// Returns the number of elements the map can hold without reallocating.
@@ -585,7 +594,7 @@ impl<K, V, S> HashMap<K, V, S> {
     ///
     /// If the returned iterator is dropped before being fully consumed, it
     /// drops the remaining key-value pairs. The returned iterator keeps a
-    /// mutable borrow on the vector to optimize its implementation.
+    /// mutable borrow on the map to optimize its implementation.
     ///
     /// # Examples
     ///
@@ -616,28 +625,27 @@ impl<K, V, S> HashMap<K, V, S> {
     /// If the closure returns false, or panics, the element remains in the map and will not be
     /// yielded.
     ///
-    /// Note that `drain_filter` lets you mutate every value in the filter closure, regardless of
+    /// Note that `extract_if` lets you mutate every value in the filter closure, regardless of
     /// whether you choose to keep or remove it.
     ///
-    /// If the iterator is only partially consumed or not consumed at all, each of the remaining
-    /// elements will still be subjected to the closure and removed and dropped if it returns true.
+    /// If the returned `ExtractIf` is not exhausted, e.g. because it is dropped without iterating
+    /// or the iteration short-circuits, then the remaining elements will be retained.
+    /// Use [`retain`] with a negated predicate if you do not need the returned iterator.
     ///
-    /// It is unspecified how many more elements will be subjected to the closure
-    /// if a panic occurs in the closure, or a panic occurs while dropping an element,
-    /// or if the `DrainFilter` value is leaked.
+    /// [`retain`]: HashMap::retain
     ///
     /// # Examples
     ///
     /// Splitting a map into even and odd keys, reusing the original map:
     ///
     /// ```
-    /// #![feature(hash_drain_filter)]
+    /// #![feature(hash_extract_if)]
     /// use std::collections::HashMap;
     ///
     /// let mut map: HashMap<i32, i32> = (0..8).map(|x| (x, x)).collect();
-    /// let drained: HashMap<i32, i32> = map.drain_filter(|k, _v| k % 2 == 0).collect();
+    /// let extracted: HashMap<i32, i32> = map.extract_if(|k, _v| k % 2 == 0).collect();
     ///
-    /// let mut evens = drained.keys().copied().collect::<Vec<_>>();
+    /// let mut evens = extracted.keys().copied().collect::<Vec<_>>();
     /// let mut odds = map.keys().copied().collect::<Vec<_>>();
     /// evens.sort();
     /// odds.sort();
@@ -647,12 +655,12 @@ impl<K, V, S> HashMap<K, V, S> {
     /// ```
     #[inline]
     #[rustc_lint_query_instability]
-    #[unstable(feature = "hash_drain_filter", issue = "59618")]
-    pub fn drain_filter<F>(&mut self, pred: F) -> DrainFilter<'_, K, V, F>
+    #[unstable(feature = "hash_extract_if", issue = "59618")]
+    pub fn extract_if<F>(&mut self, pred: F) -> ExtractIf<'_, K, V, F>
     where
         F: FnMut(&K, &mut V) -> bool,
     {
-        DrainFilter { base: self.base.drain_filter(pred) }
+        ExtractIf { base: self.base.extract_if(pred) }
     }
 
     /// Retains only the elements specified by the predicate.
@@ -728,8 +736,10 @@ where
     S: BuildHasher,
 {
     /// Reserves capacity for at least `additional` more elements to be inserted
-    /// in the `HashMap`. The collection may reserve more space to avoid
-    /// frequent reallocations.
+    /// in the `HashMap`. The collection may reserve more space to speculatively
+    /// avoid frequent reallocations. After calling `reserve`,
+    /// capacity will be greater than or equal to `self.len() + additional`.
+    /// Does nothing if capacity is already sufficient.
     ///
     /// # Panics
     ///
@@ -749,8 +759,11 @@ where
     }
 
     /// Tries to reserve capacity for at least `additional` more elements to be inserted
-    /// in the given `HashMap<K, V>`. The collection may reserve more space to avoid
-    /// frequent reallocations.
+    /// in the `HashMap`. The collection may reserve more space to speculatively
+    /// avoid frequent reallocations. After calling `try_reserve`,
+    /// capacity will be greater than or equal to `self.len() + additional` if
+    /// it returns `Ok(())`.
+    /// Does nothing if capacity is already sufficient.
     ///
     /// # Errors
     ///
@@ -763,7 +776,7 @@ where
     /// use std::collections::HashMap;
     ///
     /// let mut map: HashMap<&str, isize> = HashMap::new();
-    /// map.try_reserve(10).expect("why is the test harness OOMing on 10 bytes?");
+    /// map.try_reserve(10).expect("why is the test harness OOMing on a handful of bytes?");
     /// ```
     #[inline]
     #[stable(feature = "try_reserve", since = "1.57.0")]
@@ -829,8 +842,7 @@ where
     /// let mut letters = HashMap::new();
     ///
     /// for ch in "a short treatise on fungi".chars() {
-    ///     let counter = letters.entry(ch).or_insert(0);
-    ///     *counter += 1;
+    ///     letters.entry(ch).and_modify(|counter| *counter += 1).or_insert(1);
     /// }
     ///
     /// assert_eq!(letters[&'s'], 2);
@@ -1435,7 +1447,6 @@ impl<'a, K, V> IterMut<'a, K, V> {
 /// (provided by the [`IntoIterator`] trait). See its documentation for more.
 ///
 /// [`into_iter`]: IntoIterator::into_iter
-/// [`IntoIterator`]: crate::iter::IntoIterator
 ///
 /// # Example
 ///
@@ -1568,28 +1579,29 @@ impl<'a, K, V> Drain<'a, K, V> {
 
 /// A draining, filtering iterator over the entries of a `HashMap`.
 ///
-/// This `struct` is created by the [`drain_filter`] method on [`HashMap`].
+/// This `struct` is created by the [`extract_if`] method on [`HashMap`].
 ///
-/// [`drain_filter`]: HashMap::drain_filter
+/// [`extract_if`]: HashMap::extract_if
 ///
 /// # Example
 ///
 /// ```
-/// #![feature(hash_drain_filter)]
+/// #![feature(hash_extract_if)]
 ///
 /// use std::collections::HashMap;
 ///
 /// let mut map = HashMap::from([
 ///     ("a", 1),
 /// ]);
-/// let iter = map.drain_filter(|_k, v| *v % 2 == 0);
+/// let iter = map.extract_if(|_k, v| *v % 2 == 0);
 /// ```
-#[unstable(feature = "hash_drain_filter", issue = "59618")]
-pub struct DrainFilter<'a, K, V, F>
+#[unstable(feature = "hash_extract_if", issue = "59618")]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct ExtractIf<'a, K, V, F>
 where
     F: FnMut(&K, &mut V) -> bool,
 {
-    base: base::DrainFilter<'a, K, V, F>,
+    base: base::ExtractIf<'a, K, V, F>,
 }
 
 /// A mutable iterator over the values of a `HashMap`.
@@ -2149,6 +2161,14 @@ impl<'a, K: Debug, V: Debug> fmt::Display for OccupiedError<'a, K, V> {
     }
 }
 
+#[unstable(feature = "map_try_insert", issue = "82766")]
+impl<'a, K: fmt::Debug, V: fmt::Debug> Error for OccupiedError<'a, K, V> {
+    #[allow(deprecated)]
+    fn description(&self) -> &str {
+        "key already exists"
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, K, V, S> IntoIterator for &'a HashMap<K, V, S> {
     type Item = (&'a K, &'a V);
@@ -2461,8 +2481,8 @@ where
     }
 }
 
-#[unstable(feature = "hash_drain_filter", issue = "59618")]
-impl<K, V, F> Iterator for DrainFilter<'_, K, V, F>
+#[unstable(feature = "hash_extract_if", issue = "59618")]
+impl<K, V, F> Iterator for ExtractIf<'_, K, V, F>
 where
     F: FnMut(&K, &mut V) -> bool,
 {
@@ -2478,16 +2498,16 @@ where
     }
 }
 
-#[unstable(feature = "hash_drain_filter", issue = "59618")]
-impl<K, V, F> FusedIterator for DrainFilter<'_, K, V, F> where F: FnMut(&K, &mut V) -> bool {}
+#[unstable(feature = "hash_extract_if", issue = "59618")]
+impl<K, V, F> FusedIterator for ExtractIf<'_, K, V, F> where F: FnMut(&K, &mut V) -> bool {}
 
-#[unstable(feature = "hash_drain_filter", issue = "59618")]
-impl<'a, K, V, F> fmt::Debug for DrainFilter<'a, K, V, F>
+#[unstable(feature = "hash_extract_if", issue = "59618")]
+impl<'a, K, V, F> fmt::Debug for ExtractIf<'a, K, V, F>
 where
     F: FnMut(&K, &mut V) -> bool,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DrainFilter").finish_non_exhaustive()
+        f.debug_struct("ExtractIf").finish_non_exhaustive()
     }
 }
 
@@ -2525,12 +2545,12 @@ impl<'a, K, V> Entry<'a, K, V> {
     /// ```
     /// use std::collections::HashMap;
     ///
-    /// let mut map: HashMap<&str, String> = HashMap::new();
-    /// let s = "hoho".to_string();
+    /// let mut map = HashMap::new();
+    /// let value = "hoho";
     ///
-    /// map.entry("poneyland").or_insert_with(|| s);
+    /// map.entry("poneyland").or_insert_with(|| value);
     ///
-    /// assert_eq!(map["poneyland"], "hoho".to_string());
+    /// assert_eq!(map["poneyland"], "hoho");
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -3140,9 +3160,11 @@ impl DefaultHasher {
     /// `DefaultHasher` instances, but is the same as all other `DefaultHasher`
     /// instances created through `new` or `default`.
     #[stable(feature = "hashmap_default_hasher", since = "1.13.0")]
+    #[inline]
     #[allow(deprecated)]
+    #[rustc_const_unstable(feature = "const_hash", issue = "104061")]
     #[must_use]
-    pub fn new() -> DefaultHasher {
+    pub const fn new() -> DefaultHasher {
         DefaultHasher(SipHasher13::new_with_keys(0, 0))
     }
 }
@@ -3153,6 +3175,7 @@ impl Default for DefaultHasher {
     /// See its documentation for more.
     ///
     /// [`new`]: DefaultHasher::new
+    #[inline]
     fn default() -> DefaultHasher {
         DefaultHasher::new()
     }

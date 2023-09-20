@@ -1,12 +1,15 @@
-// compile-flags: --test
+//@compile-flags: --test
 
-#![allow(unused_mut, clippy::from_iter_instead_of_collect)]
+#![allow(
+    unused_mut,
+    clippy::get_first,
+    clippy::from_iter_instead_of_collect,
+    clippy::useless_vec
+)]
 #![warn(clippy::unwrap_used)]
-#![deny(clippy::get_unwrap)]
+#![warn(clippy::get_unwrap)]
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 struct GetFalsePositive {
     arr: [u32; 3],
@@ -70,4 +73,23 @@ fn main() {
 fn test() {
     let boxed_slice: Box<[u8]> = Box::new([0, 1, 2, 3]);
     let _ = boxed_slice.get(1).unwrap();
+}
+
+#[cfg(test)]
+mod issue9612 {
+    // should not lint in `#[cfg(test)]` modules
+    #[test]
+    fn test_fn() {
+        let _a: u8 = 2.try_into().unwrap();
+        let _a: u8 = 3.try_into().expect("");
+
+        util();
+    }
+
+    fn util() {
+        let _a: u8 = 4.try_into().unwrap();
+        let _a: u8 = 5.try_into().expect("");
+        // should still warn
+        let _ = Box::new([0]).get(1).unwrap();
+    }
 }

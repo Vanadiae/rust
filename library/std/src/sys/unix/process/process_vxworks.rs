@@ -108,6 +108,11 @@ impl Command {
         }
     }
 
+    pub fn output(&mut self) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+        let (proc, pipes) = self.spawn(Stdio::MakePipe, false)?;
+        crate::sys_common::process::wait_with_output(proc, pipes)
+    }
+
     pub fn exec(&mut self, default: Stdio) -> io::Error {
         let ret = Command::spawn(self, default, false);
         match ret {
@@ -139,12 +144,9 @@ impl Process {
     pub fn kill(&mut self) -> io::Result<()> {
         // If we've already waited on this process then the pid can be recycled
         // and used for another process, and we probably shouldn't be killing
-        // random processes, so just return an error.
+        // random processes, so return Ok because the process has exited already.
         if self.status.is_some() {
-            Err(io::const_io_error!(
-                ErrorKind::InvalidInput,
-                "invalid argument: can't kill an exited process",
-            ))
+            Ok(())
         } else {
             cvt(unsafe { libc::kill(self.pid, libc::SIGKILL) }).map(drop)
         }
@@ -177,7 +179,7 @@ impl Process {
 }
 
 /// Unix exit statuses
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub struct ExitStatus(c_int);
 
 impl ExitStatus {
@@ -190,11 +192,11 @@ impl ExitStatus {
     }
 
     pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
-        // This assumes that WIFEXITED(status) && WEXITSTATUS==0 corresponds to status==0.  This is
+        // This assumes that WIFEXITED(status) && WEXITSTATUS==0 corresponds to status==0. This is
         // true on all actual versions of Unix, is widely assumed, and is specified in SuS
-        // https://pubs.opengroup.org/onlinepubs/9699919799/functions/wait.html .  If it is not
+        // https://pubs.opengroup.org/onlinepubs/9699919799/functions/wait.html. If it is not
         // true for a platform pretending to be Unix, the tests (our doctests, and also
-        // procsss_unix/tests.rs) will spot it.  `ExitStatusError::code` assumes this too.
+        // process_unix/tests.rs) will spot it. `ExitStatusError::code` assumes this too.
         match NonZero_c_int::try_from(self.0) {
             Ok(failure) => Err(ExitStatusError(failure)),
             Err(_) => Ok(()),

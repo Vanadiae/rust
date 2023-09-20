@@ -1,4 +1,4 @@
-use crate::simd::{LaneCount, Simd, SimdElement, SupportedLaneCount};
+use crate::simd::{LaneCount, Simd, SimdElement, SimdPartialEq, SupportedLaneCount};
 use core::ops::{Add, Mul};
 use core::ops::{BitAnd, BitOr, BitXor};
 use core::ops::{Div, Rem, Sub};
@@ -15,6 +15,7 @@ where
     I: core::slice::SliceIndex<[T]>,
 {
     type Output = I::Output;
+    #[inline]
     fn index(&self, index: I) -> &Self::Output {
         &self.as_array()[index]
     }
@@ -26,6 +27,7 @@ where
     LaneCount<LANES>: SupportedLaneCount,
     I: core::slice::SliceIndex<[T]>,
 {
+    #[inline]
     fn index_mut(&mut self, index: I) -> &mut Self::Output {
         &mut self.as_mut_array()[index]
     }
@@ -33,13 +35,14 @@ where
 
 macro_rules! unsafe_base {
     ($lhs:ident, $rhs:ident, {$simd_call:ident}, $($_:tt)*) => {
+        // Safety: $lhs and $rhs are vectors
         unsafe { $crate::simd::intrinsics::$simd_call($lhs, $rhs) }
     };
 }
 
 /// SAFETY: This macro should not be used for anything except Shl or Shr, and passed the appropriate shift intrinsic.
 /// It handles performing a bitand in addition to calling the shift operator, so that the result
-/// is well-defined: LLVM can return a poison value if you shl, lshr, or ashr if rhs >= <Int>::BITS
+/// is well-defined: LLVM can return a poison value if you shl, lshr, or ashr if `rhs >= <Int>::BITS`
 /// At worst, this will maybe add another instruction and cycle,
 /// at best, it may open up more optimization opportunities,
 /// or simply be elided entirely, especially for SIMD ISAs which default to this.
@@ -48,6 +51,8 @@ macro_rules! unsafe_base {
 // cg_clif defaults to this, and scalar MIR shifts also default to wrapping
 macro_rules! wrap_bitshift {
     ($lhs:ident, $rhs:ident, {$simd_call:ident}, $int:ident) => {
+        #[allow(clippy::suspicious_arithmetic_impl)]
+        // Safety: $lhs and the bitand result are vectors
         unsafe {
             $crate::simd::intrinsics::$simd_call(
                 $lhs,
@@ -74,7 +79,7 @@ macro_rules! int_divrem_guard {
             $simd_call:ident
         },
         $int:ident ) => {
-        if $rhs.lanes_eq(Simd::splat(0)).any() {
+        if $rhs.simd_eq(Simd::splat(0 as _)).any() {
             panic!($zero);
         } else {
             // Prevent otherwise-UB overflow on the MIN / -1 case.
@@ -82,14 +87,15 @@ macro_rules! int_divrem_guard {
                 // This should, at worst, optimize to a few branchless logical ops
                 // Ideally, this entire conditional should evaporate
                 // Fire LLVM and implement those manually if it doesn't get the hint
-                ($lhs.lanes_eq(Simd::splat(<$int>::MIN))
+                ($lhs.simd_eq(Simd::splat(<$int>::MIN))
                 // type inference can break here, so cut an SInt to size
-                & $rhs.lanes_eq(Simd::splat(-1i64 as _)))
-                .select(Simd::splat(1), $rhs)
+                & $rhs.simd_eq(Simd::splat(-1i64 as _)))
+                .select(Simd::splat(1 as _), $rhs)
             } else {
                 // Nice base case to make it easy to const-fold away the other branch.
                 $rhs
             };
+            // Safety: $lhs and rhs are vectors
             unsafe { $crate::simd::intrinsics::$simd_call($lhs, rhs) }
         }
     };
@@ -114,10 +120,14 @@ macro_rules! for_base_types {
 
                     #[inline]
                     #[must_use = "operator returns a new vector without mutating the inputs"]
+                    // TODO: only useful for int Div::div, but we hope that this
+                    // will essentially always always get inlined anyway.
+                    #[track_caller]
                     fn $call(self, rhs: Self) -> Self::Output {
                         $macro_impl!(self, rhs, $inner, $scalar)
                     }
-                })*
+                }
+            )*
     }
 }
 

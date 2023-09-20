@@ -1,6 +1,6 @@
 use super::*;
 
-use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::sync::{FreezeLock, Lrc};
 
 fn init_source_map() -> SourceMap {
     let sm = SourceMap::new(FilePathMapping::empty());
@@ -50,6 +50,7 @@ impl SourceMap {
     fn bytepos_to_file_charpos(&self, bpos: BytePos) -> CharPos {
         let idx = self.lookup_source_file_idx(bpos);
         let sf = &(*self.files.borrow().source_files)[idx];
+        let bpos = sf.relative_position(bpos);
         sf.bytepos_to_file_charpos(bpos)
     }
 }
@@ -230,8 +231,7 @@ fn t10() {
     let SourceFile {
         name,
         src_hash,
-        start_pos,
-        end_pos,
+        source_len,
         lines,
         multibyte_chars,
         non_narrow_chars,
@@ -244,14 +244,13 @@ fn t10() {
         name,
         src_hash,
         name_hash,
-        (end_pos - start_pos).to_usize(),
+        source_len.to_u32(),
         CrateNum::new(0),
-        lines,
+        FreezeLock::new(lines.read().clone()),
         multibyte_chars,
         non_narrow_chars,
         normalized_pos,
-        start_pos,
-        end_pos,
+        0,
     );
 
     assert!(
@@ -344,6 +343,10 @@ fn map_path_prefix(mapping: &FilePathMapping, p: &str) -> String {
     mapping.map_prefix(path(p)).0.to_string_lossy().to_string()
 }
 
+fn reverse_map_prefix(mapping: &FilePathMapping, p: &str) -> Option<String> {
+    mapping.reverse_map_prefix_heuristically(&path(p)).map(|q| q.to_string_lossy().to_string())
+}
+
 #[test]
 fn path_prefix_remapping() {
     // Relative to relative
@@ -387,7 +390,7 @@ fn path_prefix_remapping_expand_to_absolute() {
     let working_directory = path("/foo");
     let working_directory = RealFileName::Remapped {
         local_path: Some(working_directory.clone()),
-        virtual_name: mapping.map_prefix(working_directory).0,
+        virtual_name: mapping.map_prefix(working_directory).0.into_owned(),
     };
 
     assert_eq!(working_directory.remapped_path_if_available(), path("FOO"));
@@ -478,4 +481,89 @@ fn path_prefix_remapping_expand_to_absolute() {
         ),
         RealFileName::Remapped { local_path: None, virtual_name: path("XYZ/src/main.rs") }
     );
+}
+
+#[test]
+fn path_prefix_remapping_reverse() {
+    // Ignores options without alphanumeric chars.
+    {
+        let mapping =
+            &FilePathMapping::new(vec![(path("abc"), path("/")), (path("def"), path("."))]);
+
+        assert_eq!(reverse_map_prefix(mapping, "/hello.rs"), None);
+        assert_eq!(reverse_map_prefix(mapping, "./hello.rs"), None);
+    }
+
+    // Returns `None` if multiple options match.
+    {
+        let mapping = &FilePathMapping::new(vec![
+            (path("abc"), path("/redacted")),
+            (path("def"), path("/redacted")),
+        ]);
+
+        assert_eq!(reverse_map_prefix(mapping, "/redacted/hello.rs"), None);
+    }
+
+    // Distinct reverse mappings.
+    {
+        let mapping = &FilePathMapping::new(vec![
+            (path("abc"), path("/redacted")),
+            (path("def/ghi"), path("/fake/dir")),
+        ]);
+
+        assert_eq!(
+            reverse_map_prefix(mapping, "/redacted/path/hello.rs"),
+            Some(path_str("abc/path/hello.rs"))
+        );
+        assert_eq!(
+            reverse_map_prefix(mapping, "/fake/dir/hello.rs"),
+            Some(path_str("def/ghi/hello.rs"))
+        );
+    }
+}
+
+#[test]
+fn test_next_point() {
+    let sm = SourceMap::new(FilePathMapping::empty());
+    sm.new_source_file(PathBuf::from("example.rs").into(), "a…b".to_string());
+
+    // Dummy spans don't advance.
+    let span = DUMMY_SP;
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 0);
+    assert_eq!(span.hi().0, 0);
+
+    // Span advance respect multi-byte character
+    let span = Span::with_root_ctxt(BytePos(0), BytePos(1));
+    assert_eq!(sm.span_to_snippet(span), Ok("a".to_string()));
+    let span = sm.next_point(span);
+    assert_eq!(sm.span_to_snippet(span), Ok("…".to_string()));
+    assert_eq!(span.lo().0, 1);
+    assert_eq!(span.hi().0, 4);
+
+    // An empty span pointing just before a multi-byte character should
+    // advance to contain the multi-byte character.
+    let span = Span::with_root_ctxt(BytePos(1), BytePos(1));
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 1);
+    assert_eq!(span.hi().0, 4);
+
+    let span = Span::with_root_ctxt(BytePos(1), BytePos(4));
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 4);
+    assert_eq!(span.hi().0, 5);
+
+    // Reaching to the end of file, return a span that will get error with `span_to_snippet`
+    let span = Span::with_root_ctxt(BytePos(4), BytePos(5));
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 5);
+    assert_eq!(span.hi().0, 6);
+    assert!(sm.span_to_snippet(span).is_err());
+
+    // Reaching to the end of file, return a span that will get error with `span_to_snippet`
+    let span = Span::with_root_ctxt(BytePos(5), BytePos(5));
+    let span = sm.next_point(span);
+    assert_eq!(span.lo().0, 5);
+    assert_eq!(span.hi().0, 6);
+    assert!(sm.span_to_snippet(span).is_err());
 }

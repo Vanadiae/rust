@@ -15,7 +15,7 @@ use rustc_span::symbol::sym;
 use std::fmt::Display;
 use std::iter::Iterator;
 
-/// Checks for for loops that sequentially copy items from one slice-like
+/// Checks for `for` loops that sequentially copy items from one slice-like
 /// object to another.
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
@@ -51,7 +51,7 @@ pub(super) fn check<'tcx>(
                 iter_b = Some(get_assignment(body));
             }
 
-            let assignments = iter_a.into_iter().flatten().chain(iter_b.into_iter());
+            let assignments = iter_a.into_iter().flatten().chain(iter_b);
 
             let big_sugg = assignments
                 // The only statements in the for loops can be indexed assignments from
@@ -60,8 +60,8 @@ pub(super) fn check<'tcx>(
                     o.and_then(|(lhs, rhs)| {
                         let rhs = fetch_cloned_expr(rhs);
                         if_chain! {
-                            if let ExprKind::Index(base_left, idx_left) = lhs.kind;
-                            if let ExprKind::Index(base_right, idx_right) = rhs.kind;
+                            if let ExprKind::Index(base_left, idx_left, _) = lhs.kind;
+                            if let ExprKind::Index(base_right, idx_right, _) = rhs.kind;
                             if let Some(ty) = get_slice_like_element_ty(cx, cx.typeck_results().expr_ty(base_left));
                             if get_slice_like_element_ty(cx, cx.typeck_results().expr_ty(base_right)).is_some();
                             if let Some((start_left, offset_left)) = get_details_from_idx(cx, idx_left, &starts);
@@ -119,11 +119,9 @@ fn build_manual_memcpy_suggestion<'tcx>(
 
     let print_limit = |end: &Expr<'_>, end_str: &str, base: &Expr<'_>, sugg: MinifyingSugg<'static>| {
         if_chain! {
-            if let ExprKind::MethodCall(method, len_args, _) = end.kind;
+            if let ExprKind::MethodCall(method, recv, [], _) = end.kind;
             if method.ident.name == sym::len;
-            if len_args.len() == 1;
-            if let Some(arg) = len_args.get(0);
-            if path_to_local(arg) == path_to_local(base);
+            if path_to_local(recv) == path_to_local(base);
             then {
                 if sugg.to_string() == end_str {
                     sugg::EMPTY.into()
@@ -179,13 +177,7 @@ fn build_manual_memcpy_suggestion<'tcx>(
     let dst = if dst_offset == sugg::EMPTY && dst_limit == sugg::EMPTY {
         dst_base_str
     } else {
-        format!(
-            "{}[{}..{}]",
-            dst_base_str,
-            dst_offset.maybe_par(),
-            dst_limit.maybe_par()
-        )
-        .into()
+        format!("{dst_base_str}[{}..{}]", dst_offset.maybe_par(), dst_limit.maybe_par()).into()
     };
 
     let method_str = if is_copy(cx, elem_ty) {
@@ -195,10 +187,7 @@ fn build_manual_memcpy_suggestion<'tcx>(
     };
 
     format!(
-        "{}.{}(&{}[{}..{}]);",
-        dst,
-        method_str,
-        src_base_str,
+        "{dst}.{method_str}(&{src_base_str}[{}..{}]);",
         src_offset.maybe_par(),
         src_limit.maybe_par()
     )
@@ -343,10 +332,8 @@ fn get_slice_like_element_ty<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Opti
 
 fn fetch_cloned_expr<'tcx>(expr: &'tcx Expr<'tcx>) -> &'tcx Expr<'tcx> {
     if_chain! {
-        if let ExprKind::MethodCall(method, args, _) = expr.kind;
+        if let ExprKind::MethodCall(method, arg, [], _) = expr.kind;
         if method.ident.name == sym::clone;
-        if args.len() == 1;
-        if let Some(arg) = args.get(0);
         then { arg } else { expr }
     }
 }
@@ -415,7 +402,7 @@ fn get_assignments<'a, 'tcx>(
             StmtKind::Local(..) | StmtKind::Item(..) => None,
             StmtKind::Expr(e) | StmtKind::Semi(e) => Some(e),
         })
-        .chain((*expr).into_iter())
+        .chain(*expr)
         .filter(move |e| {
             if let ExprKind::AssignOp(_, place, _) = e.kind {
                 path_to_local(place).map_or(false, |id| {

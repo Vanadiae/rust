@@ -56,15 +56,11 @@
 #[cfg(not(no_global_oom_handling))]
 use core::cmp;
 use core::cmp::Ordering;
-use core::convert::TryFrom;
 use core::fmt;
 use core::hash::{Hash, Hasher};
-use core::intrinsics::{arith_offset, assume};
 use core::iter;
-#[cfg(not(no_global_oom_handling))]
-use core::iter::FromIterator;
 use core::marker::PhantomData;
-use core::mem::{self, ManuallyDrop, MaybeUninit};
+use core::mem::{self, ManuallyDrop, MaybeUninit, SizedTypeProperties};
 use core::ops::{self, Index, IndexMut, Range, RangeBounds};
 use core::ptr::{self, NonNull};
 use core::slice::{self, SliceIndex};
@@ -75,10 +71,10 @@ use crate::boxed::Box;
 use crate::collections::TryReserveError;
 use crate::raw_vec::RawVec;
 
-#[unstable(feature = "drain_filter", reason = "recently added", issue = "43244")]
-pub use self::drain_filter::DrainFilter;
+#[unstable(feature = "extract_if", reason = "recently added", issue = "43244")]
+pub use self::extract_if::ExtractIf;
 
-mod drain_filter;
+mod extract_if;
 
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "vec_splice", since = "1.21.0")]
@@ -125,7 +121,7 @@ use self::set_len_on_drop::SetLenOnDrop;
 mod set_len_on_drop;
 
 #[cfg(not(no_global_oom_handling))]
-use self::in_place_drop::InPlaceDrop;
+use self::in_place_drop::{InPlaceDrop, InPlaceDstBufDrop};
 
 #[cfg(not(no_global_oom_handling))]
 mod in_place_drop;
@@ -166,7 +162,7 @@ mod spec_extend;
 /// vec[0] = 7;
 /// assert_eq!(vec[0], 7);
 ///
-/// vec.extend([1, 2, 3].iter().copied());
+/// vec.extend([1, 2, 3]);
 ///
 /// for x in &vec {
 ///     println!("{x}");
@@ -217,7 +213,7 @@ mod spec_extend;
 ///
 /// # Indexing
 ///
-/// The `Vec` type allows to access values by index, because it implements the
+/// The `Vec` type allows access to values by index, because it implements the
 /// [`Index`] trait. An example will be more explicit:
 ///
 /// ```
@@ -378,8 +374,8 @@ mod spec_extend;
 /// Currently, `Vec` does not guarantee the order in which elements are dropped.
 /// The order has changed in the past and may change again.
 ///
-/// [`get`]: ../../std/vec/struct.Vec.html#method.get
-/// [`get_mut`]: ../../std/vec/struct.Vec.html#method.get_mut
+/// [`get`]: slice::get
+/// [`get_mut`]: slice::get_mut
 /// [`String`]: crate::string::String
 /// [`&str`]: type@str
 /// [`shrink_to_fit`]: Vec::shrink_to_fit
@@ -425,17 +421,25 @@ impl<T> Vec<T> {
         Vec { buf: RawVec::NEW, len: 0 }
     }
 
-    /// Constructs a new, empty `Vec<T>` with the specified capacity.
+    /// Constructs a new, empty `Vec<T>` with at least the specified capacity.
     ///
-    /// The vector will be able to hold exactly `capacity` elements without
-    /// reallocating. If `capacity` is 0, the vector will not allocate.
+    /// The vector will be able to hold at least `capacity` elements without
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is 0, the vector will not allocate.
     ///
     /// It is important to note that although the returned vector has the
-    /// *capacity* specified, the vector will have a zero *length*. For an
-    /// explanation of the difference between length and capacity, see
+    /// minimum *capacity* specified, the vector will have a zero *length*. For
+    /// an explanation of the difference between length and capacity, see
     /// *[Capacity and reallocation]*.
     ///
+    /// If it is important to know the exact allocated capacity of a `Vec`,
+    /// always use the [`capacity`] method after construction.
+    ///
+    /// For `Vec<T>` where `T` is a zero-sized type, there will be no allocation
+    /// and the capacity will always be `usize::MAX`.
+    ///
     /// [Capacity and reallocation]: #capacity-and-reallocation
+    /// [`capacity`]: Vec::capacity
     ///
     /// # Panics
     ///
@@ -448,19 +452,24 @@ impl<T> Vec<T> {
     ///
     /// // The vector contains no items, even though it has capacity for more
     /// assert_eq!(vec.len(), 0);
-    /// assert_eq!(vec.capacity(), 10);
+    /// assert!(vec.capacity() >= 10);
     ///
     /// // These are all done without reallocating...
     /// for i in 0..10 {
     ///     vec.push(i);
     /// }
     /// assert_eq!(vec.len(), 10);
-    /// assert_eq!(vec.capacity(), 10);
+    /// assert!(vec.capacity() >= 10);
     ///
     /// // ...but this may make the vector reallocate
     /// vec.push(11);
     /// assert_eq!(vec.len(), 11);
     /// assert!(vec.capacity() >= 11);
+    ///
+    /// // A vector of a zero-sized type will always over-allocate, since no
+    /// // allocation is necessary
+    /// let vec_units = Vec::<()>::with_capacity(10);
+    /// assert_eq!(vec_units.capacity(), usize::MAX);
     /// ```
     #[cfg(not(no_global_oom_handling))]
     #[inline]
@@ -470,15 +479,15 @@ impl<T> Vec<T> {
         Self::with_capacity_in(capacity, Global)
     }
 
-    /// Creates a `Vec<T>` directly from the raw components of another vector.
+    /// Creates a `Vec<T>` directly from a pointer, a capacity, and a length.
     ///
     /// # Safety
     ///
     /// This is highly unsafe, due to the number of invariants that aren't
     /// checked:
     ///
-    /// * `ptr` needs to have been previously allocated via [`String`]/`Vec<T>`
-    ///   (at least, it's highly likely to be incorrect if it wasn't).
+    /// * `ptr` must have been allocated using the global allocator, such as via
+    ///   the [`alloc::alloc`] function.
     /// * `T` needs to have the same alignment as what `ptr` was allocated with.
     ///   (`T` having a less strict alignment is not sufficient, the alignment really
     ///   needs to be equal to satisfy the [`dealloc`] requirement that memory must be
@@ -487,6 +496,14 @@ impl<T> Vec<T> {
     ///   to be the same size as the pointer was allocated with. (Because similar to
     ///   alignment, [`dealloc`] must be called with the same layout `size`.)
     /// * `length` needs to be less than or equal to `capacity`.
+    /// * The first `length` values must be properly initialized values of type `T`.
+    /// * `capacity` needs to be the capacity that the pointer was allocated with.
+    /// * The allocated size in bytes must be no larger than `isize::MAX`.
+    ///   See the safety documentation of [`pointer::offset`].
+    ///
+    /// These requirements are always upheld by any `ptr` that has been allocated
+    /// via `Vec<T>`. Other allocation sources are allowed if the invariants are
+    /// upheld.
     ///
     /// Violating these may cause problems like corrupting the allocator's
     /// internal data structures. For example it is normally **not** safe
@@ -507,6 +524,7 @@ impl<T> Vec<T> {
     /// function.
     ///
     /// [`String`]: crate::string::String
+    /// [`alloc::alloc`]: crate::alloc::alloc
     /// [`dealloc`]: crate::alloc::GlobalAlloc::dealloc
     ///
     /// # Examples
@@ -529,13 +547,37 @@ impl<T> Vec<T> {
     ///
     /// unsafe {
     ///     // Overwrite memory with 4, 5, 6
-    ///     for i in 0..len as isize {
-    ///         ptr::write(p.offset(i), 4 + i);
+    ///     for i in 0..len {
+    ///         ptr::write(p.add(i), 4 + i);
     ///     }
     ///
     ///     // Put everything back together into a Vec
     ///     let rebuilt = Vec::from_raw_parts(p, len, cap);
     ///     assert_eq!(rebuilt, [4, 5, 6]);
+    /// }
+    /// ```
+    ///
+    /// Using memory that was allocated elsewhere:
+    ///
+    /// ```rust
+    /// use std::alloc::{alloc, Layout};
+    ///
+    /// fn main() {
+    ///     let layout = Layout::array::<u32>(16).expect("overflow cannot happen");
+    ///
+    ///     let vec = unsafe {
+    ///         let mem = alloc(layout).cast::<u32>();
+    ///         if mem.is_null() {
+    ///             return;
+    ///         }
+    ///
+    ///         mem.write(1_000_000);
+    ///
+    ///         Vec::from_raw_parts(mem, 1, 16)
+    ///     };
+    ///
+    ///     assert_eq!(vec, &[1_000_000]);
+    ///     assert_eq!(vec.capacity(), 16);
     /// }
     /// ```
     #[inline]
@@ -566,18 +608,26 @@ impl<T, A: Allocator> Vec<T, A> {
         Vec { buf: RawVec::new_in(alloc), len: 0 }
     }
 
-    /// Constructs a new, empty `Vec<T, A>` with the specified capacity with the provided
-    /// allocator.
+    /// Constructs a new, empty `Vec<T, A>` with at least the specified capacity
+    /// with the provided allocator.
     ///
-    /// The vector will be able to hold exactly `capacity` elements without
-    /// reallocating. If `capacity` is 0, the vector will not allocate.
+    /// The vector will be able to hold at least `capacity` elements without
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is 0, the vector will not allocate.
     ///
     /// It is important to note that although the returned vector has the
-    /// *capacity* specified, the vector will have a zero *length*. For an
-    /// explanation of the difference between length and capacity, see
+    /// minimum *capacity* specified, the vector will have a zero *length*. For
+    /// an explanation of the difference between length and capacity, see
     /// *[Capacity and reallocation]*.
     ///
+    /// If it is important to know the exact allocated capacity of a `Vec`,
+    /// always use the [`capacity`] method after construction.
+    ///
+    /// For `Vec<T, A>` where `T` is a zero-sized type, there will be no allocation
+    /// and the capacity will always be `usize::MAX`.
+    ///
     /// [Capacity and reallocation]: #capacity-and-reallocation
+    /// [`capacity`]: Vec::capacity
     ///
     /// # Panics
     ///
@@ -594,19 +644,24 @@ impl<T, A: Allocator> Vec<T, A> {
     ///
     /// // The vector contains no items, even though it has capacity for more
     /// assert_eq!(vec.len(), 0);
-    /// assert_eq!(vec.capacity(), 10);
+    /// assert!(vec.capacity() >= 10);
     ///
     /// // These are all done without reallocating...
     /// for i in 0..10 {
     ///     vec.push(i);
     /// }
     /// assert_eq!(vec.len(), 10);
-    /// assert_eq!(vec.capacity(), 10);
+    /// assert!(vec.capacity() >= 10);
     ///
     /// // ...but this may make the vector reallocate
     /// vec.push(11);
     /// assert_eq!(vec.len(), 11);
     /// assert!(vec.capacity() >= 11);
+    ///
+    /// // A vector of a zero-sized type will always over-allocate, since no
+    /// // allocation is necessary
+    /// let vec_units = Vec::<(), System>::with_capacity_in(10, System);
+    /// assert_eq!(vec_units.capacity(), usize::MAX);
     /// ```
     #[cfg(not(no_global_oom_handling))]
     #[inline]
@@ -615,21 +670,31 @@ impl<T, A: Allocator> Vec<T, A> {
         Vec { buf: RawVec::with_capacity_in(capacity, alloc), len: 0 }
     }
 
-    /// Creates a `Vec<T, A>` directly from the raw components of another vector.
+    /// Creates a `Vec<T, A>` directly from a pointer, a capacity, a length,
+    /// and an allocator.
     ///
     /// # Safety
     ///
     /// This is highly unsafe, due to the number of invariants that aren't
     /// checked:
     ///
-    /// * `ptr` needs to have been previously allocated via [`String`]/`Vec<T>`
-    ///   (at least, it's highly likely to be incorrect if it wasn't).
-    /// * `T` needs to have the same size and alignment as what `ptr` was allocated with.
+    /// * `ptr` must be [*currently allocated*] via the given allocator `alloc`.
+    /// * `T` needs to have the same alignment as what `ptr` was allocated with.
     ///   (`T` having a less strict alignment is not sufficient, the alignment really
     ///   needs to be equal to satisfy the [`dealloc`] requirement that memory must be
     ///   allocated and deallocated with the same layout.)
+    /// * The size of `T` times the `capacity` (ie. the allocated size in bytes) needs
+    ///   to be the same size as the pointer was allocated with. (Because similar to
+    ///   alignment, [`dealloc`] must be called with the same layout `size`.)
     /// * `length` needs to be less than or equal to `capacity`.
-    /// * `capacity` needs to be the capacity that the pointer was allocated with.
+    /// * The first `length` values must be properly initialized values of type `T`.
+    /// * `capacity` needs to [*fit*] the layout size that the pointer was allocated with.
+    /// * The allocated size in bytes must be no larger than `isize::MAX`.
+    ///   See the safety documentation of [`pointer::offset`].
+    ///
+    /// These requirements are always upheld by any `ptr` that has been allocated
+    /// via `Vec<T, A>`. Other allocation sources are allowed if the invariants are
+    /// upheld.
     ///
     /// Violating these may cause problems like corrupting the allocator's
     /// internal data structures. For example it is **not** safe
@@ -647,6 +712,8 @@ impl<T, A: Allocator> Vec<T, A> {
     ///
     /// [`String`]: crate::string::String
     /// [`dealloc`]: crate::alloc::GlobalAlloc::dealloc
+    /// [*currently allocated*]: crate::alloc::Allocator#currently-allocated-memory
+    /// [*fit*]: crate::alloc::Allocator#memory-fitting
     ///
     /// # Examples
     ///
@@ -676,13 +743,39 @@ impl<T, A: Allocator> Vec<T, A> {
     ///
     /// unsafe {
     ///     // Overwrite memory with 4, 5, 6
-    ///     for i in 0..len as isize {
-    ///         ptr::write(p.offset(i), 4 + i);
+    ///     for i in 0..len {
+    ///         ptr::write(p.add(i), 4 + i);
     ///     }
     ///
     ///     // Put everything back together into a Vec
     ///     let rebuilt = Vec::from_raw_parts_in(p, len, cap, alloc.clone());
     ///     assert_eq!(rebuilt, [4, 5, 6]);
+    /// }
+    /// ```
+    ///
+    /// Using memory that was allocated elsewhere:
+    ///
+    /// ```rust
+    /// #![feature(allocator_api)]
+    ///
+    /// use std::alloc::{AllocError, Allocator, Global, Layout};
+    ///
+    /// fn main() {
+    ///     let layout = Layout::array::<u32>(16).expect("overflow cannot happen");
+    ///
+    ///     let vec = unsafe {
+    ///         let mem = match Global.allocate(layout) {
+    ///             Ok(mem) => mem.cast::<u32>().as_ptr(),
+    ///             Err(AllocError) => return,
+    ///         };
+    ///
+    ///         mem.write(1_000_000);
+    ///
+    ///         Vec::from_raw_parts_in(mem, 1, 16, Global)
+    ///     };
+    ///
+    ///     assert_eq!(vec, &[1_000_000]);
+    ///     assert_eq!(vec.capacity(), 16);
     /// }
     /// ```
     #[inline]
@@ -777,14 +870,15 @@ impl<T, A: Allocator> Vec<T, A> {
         (ptr, len, capacity, alloc)
     }
 
-    /// Returns the number of elements the vector can hold without
+    /// Returns the total number of elements the vector can hold without
     /// reallocating.
     ///
     /// # Examples
     ///
     /// ```
-    /// let vec: Vec<i32> = Vec::with_capacity(10);
-    /// assert_eq!(vec.capacity(), 10);
+    /// let mut vec: Vec<i32> = Vec::with_capacity(10);
+    /// vec.push(42);
+    /// assert!(vec.capacity() >= 10);
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -793,10 +887,10 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     /// Reserves capacity for at least `additional` more elements to be inserted
-    /// in the given `Vec<T>`. The collection may reserve more space to avoid
-    /// frequent reallocations. After calling `reserve`, capacity will be
-    /// greater than or equal to `self.len() + additional`. Does nothing if
-    /// capacity is already sufficient.
+    /// in the given `Vec<T>`. The collection may reserve more space to
+    /// speculatively avoid frequent reallocations. After calling `reserve`,
+    /// capacity will be greater than or equal to `self.len() + additional`.
+    /// Does nothing if capacity is already sufficient.
     ///
     /// # Panics
     ///
@@ -815,10 +909,12 @@ impl<T, A: Allocator> Vec<T, A> {
         self.buf.reserve(self.len, additional);
     }
 
-    /// Reserves the minimum capacity for exactly `additional` more elements to
-    /// be inserted in the given `Vec<T>`. After calling `reserve_exact`,
-    /// capacity will be greater than or equal to `self.len() + additional`.
-    /// Does nothing if the capacity is already sufficient.
+    /// Reserves the minimum capacity for at least `additional` more elements to
+    /// be inserted in the given `Vec<T>`. Unlike [`reserve`], this will not
+    /// deliberately over-allocate to speculatively avoid frequent allocations.
+    /// After calling `reserve_exact`, capacity will be greater than or equal to
+    /// `self.len() + additional`. Does nothing if the capacity is already
+    /// sufficient.
     ///
     /// Note that the allocator may give the collection more space than it
     /// requests. Therefore, capacity can not be relied upon to be precisely
@@ -844,10 +940,11 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     /// Tries to reserve capacity for at least `additional` more elements to be inserted
-    /// in the given `Vec<T>`. The collection may reserve more space to avoid
+    /// in the given `Vec<T>`. The collection may reserve more space to speculatively avoid
     /// frequent reallocations. After calling `try_reserve`, capacity will be
-    /// greater than or equal to `self.len() + additional`. Does nothing if
-    /// capacity is already sufficient.
+    /// greater than or equal to `self.len() + additional` if it returns
+    /// `Ok(())`. Does nothing if capacity is already sufficient. This method
+    /// preserves the contents even if an error occurs.
     ///
     /// # Errors
     ///
@@ -879,10 +976,11 @@ impl<T, A: Allocator> Vec<T, A> {
         self.buf.try_reserve(self.len, additional)
     }
 
-    /// Tries to reserve the minimum capacity for exactly `additional`
-    /// elements to be inserted in the given `Vec<T>`. After calling
-    /// `try_reserve_exact`, capacity will be greater than or equal to
-    /// `self.len() + additional` if it returns `Ok(())`.
+    /// Tries to reserve the minimum capacity for at least `additional`
+    /// elements to be inserted in the given `Vec<T>`. Unlike [`try_reserve`],
+    /// this will not deliberately over-allocate to speculatively avoid frequent
+    /// allocations. After calling `try_reserve_exact`, capacity will be greater
+    /// than or equal to `self.len() + additional` if it returns `Ok(())`.
     /// Does nothing if the capacity is already sufficient.
     ///
     /// Note that the allocator may give the collection more space than it
@@ -931,7 +1029,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// ```
     /// let mut vec = Vec::with_capacity(10);
     /// vec.extend([1, 2, 3]);
-    /// assert_eq!(vec.capacity(), 10);
+    /// assert!(vec.capacity() >= 10);
     /// vec.shrink_to_fit();
     /// assert!(vec.capacity() >= 3);
     /// ```
@@ -958,7 +1056,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// ```
     /// let mut vec = Vec::with_capacity(10);
     /// vec.extend([1, 2, 3]);
-    /// assert_eq!(vec.capacity(), 10);
+    /// assert!(vec.capacity() >= 10);
     /// vec.shrink_to(4);
     /// assert!(vec.capacity() >= 4);
     /// vec.shrink_to(0);
@@ -974,7 +1072,8 @@ impl<T, A: Allocator> Vec<T, A> {
 
     /// Converts the vector into [`Box<[T]>`][owned slice].
     ///
-    /// Note that this will drop any excess capacity.
+    /// If the vector has excess capacity, its items will be moved into a
+    /// newly-allocated buffer with exactly the right capacity.
     ///
     /// [owned slice]: Box
     ///
@@ -992,7 +1091,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// let mut vec = Vec::with_capacity(10);
     /// vec.extend([1, 2, 3]);
     ///
-    /// assert_eq!(vec.capacity(), 10);
+    /// assert!(vec.capacity() >= 10);
     /// let slice = vec.into_boxed_slice();
     /// assert_eq!(slice.into_vec().capacity(), 3);
     /// ```
@@ -1011,8 +1110,8 @@ impl<T, A: Allocator> Vec<T, A> {
     /// Shortens the vector, keeping the first `len` elements and dropping
     /// the rest.
     ///
-    /// If `len` is greater than the vector's current length, this has no
-    /// effect.
+    /// If `len` is greater or equal to the vector's current length, this has
+    /// no effect.
     ///
     /// The [`drain`] method can emulate `truncate`, but causes the excess
     /// elements to be returned instead of dropped.
@@ -1119,6 +1218,15 @@ impl<T, A: Allocator> Vec<T, A> {
     /// is never written to (except inside an `UnsafeCell`) using this pointer or any pointer
     /// derived from it. If you need to mutate the contents of the slice, use [`as_mut_ptr`].
     ///
+    /// This method guarantees that for the purpose of the aliasing model, this method
+    /// does not materialize a reference to the underlying slice, and thus the returned pointer
+    /// will remain valid when mixed with other calls to [`as_ptr`] and [`as_mut_ptr`].
+    /// Note that calling other methods that materialize mutable references to the slice,
+    /// or mutable references to specific elements you are planning on accessing through this pointer,
+    /// as well as writing to those elements, may still invalidate this pointer.
+    /// See the second example below for how this guarantee can be used.
+    ///
+    ///
     /// # Examples
     ///
     /// ```
@@ -1132,17 +1240,30 @@ impl<T, A: Allocator> Vec<T, A> {
     /// }
     /// ```
     ///
+    /// Due to the aliasing guarantee, the following code is legal:
+    ///
+    /// ```rust
+    /// unsafe {
+    ///     let mut v = vec![0, 1, 2];
+    ///     let ptr1 = v.as_ptr();
+    ///     let _ = ptr1.read();
+    ///     let ptr2 = v.as_mut_ptr().offset(2);
+    ///     ptr2.write(2);
+    ///     // Notably, the write to `ptr2` did *not* invalidate `ptr1`
+    ///     // because it mutated a different element:
+    ///     let _ = ptr1.read();
+    /// }
+    /// ```
+    ///
     /// [`as_mut_ptr`]: Vec::as_mut_ptr
+    /// [`as_ptr`]: Vec::as_ptr
     #[stable(feature = "vec_as_ptr", since = "1.37.0")]
+    #[cfg_attr(not(bootstrap), rustc_never_returns_null_ptr)]
     #[inline]
     pub fn as_ptr(&self) -> *const T {
         // We shadow the slice method of the same name to avoid going through
         // `deref`, which creates an intermediate reference.
-        let ptr = self.buf.ptr();
-        unsafe {
-            assume(!ptr.is_null());
-        }
-        ptr
+        self.buf.ptr()
     }
 
     /// Returns an unsafe mutable pointer to the vector's buffer, or a dangling
@@ -1152,6 +1273,15 @@ impl<T, A: Allocator> Vec<T, A> {
     /// function returns, or else it will end up pointing to garbage.
     /// Modifying the vector may cause its buffer to be reallocated,
     /// which would also make any pointers to it invalid.
+    ///
+    /// This method guarantees that for the purpose of the aliasing model, this method
+    /// does not materialize a reference to the underlying slice, and thus the returned pointer
+    /// will remain valid when mixed with other calls to [`as_ptr`] and [`as_mut_ptr`].
+    /// Note that calling other methods that materialize references to the slice,
+    /// or references to specific elements you are planning on accessing through this pointer,
+    /// may still invalidate this pointer.
+    /// See the second example below for how this guarantee can be used.
+    ///
     ///
     /// # Examples
     ///
@@ -1170,16 +1300,30 @@ impl<T, A: Allocator> Vec<T, A> {
     /// }
     /// assert_eq!(&*x, &[0, 1, 2, 3]);
     /// ```
+    ///
+    /// Due to the aliasing guarantee, the following code is legal:
+    ///
+    /// ```rust
+    /// unsafe {
+    ///     let mut v = vec![0];
+    ///     let ptr1 = v.as_mut_ptr();
+    ///     ptr1.write(1);
+    ///     let ptr2 = v.as_mut_ptr();
+    ///     ptr2.write(2);
+    ///     // Notably, the write to `ptr2` did *not* invalidate `ptr1`:
+    ///     ptr1.write(3);
+    /// }
+    /// ```
+    ///
+    /// [`as_mut_ptr`]: Vec::as_mut_ptr
+    /// [`as_ptr`]: Vec::as_ptr
     #[stable(feature = "vec_as_ptr", since = "1.37.0")]
+    #[cfg_attr(not(bootstrap), rustc_never_returns_null_ptr)]
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut T {
         // We shadow the slice method of the same name to avoid going through
         // `deref_mut`, which creates an intermediate reference.
-        let ptr = self.buf.ptr();
-        unsafe {
-            assume(!ptr.is_null());
-        }
-        ptr
+        self.buf.ptr()
     }
 
     /// Returns a reference to the underlying allocator.
@@ -1350,9 +1494,6 @@ impl<T, A: Allocator> Vec<T, A> {
         }
 
         let len = self.len();
-        if index > len {
-            assert_failed(index, len);
-        }
 
         // space for the new element
         if len == self.buf.capacity() {
@@ -1364,9 +1505,15 @@ impl<T, A: Allocator> Vec<T, A> {
             // The spot to put the new value
             {
                 let p = self.as_mut_ptr().add(index);
-                // Shift everything over to make space. (Duplicating the
-                // `index`th element into two consecutive places.)
-                ptr::copy(p, p.offset(1), len - index);
+                if index < len {
+                    // Shift everything over to make space. (Duplicating the
+                    // `index`th element into two consecutive places.)
+                    ptr::copy(p, p.add(1), len - index);
+                } else if index == len {
+                    // No elements need shifting.
+                } else {
+                    assert_failed(index, len);
+                }
                 // Write it in, overwriting the first copy of the `index`th
                 // element.
                 ptr::write(p, element);
@@ -1423,7 +1570,7 @@ impl<T, A: Allocator> Vec<T, A> {
                 ret = ptr::read(ptr);
 
                 // Shift everything down to fill in that spot.
-                ptr::copy(ptr.offset(1), ptr, len - index - 1);
+                ptr::copy(ptr.add(1), ptr, len - index - 1);
             }
             self.set_len(len - 1);
             ret
@@ -1741,6 +1888,51 @@ impl<T, A: Allocator> Vec<T, A> {
         }
     }
 
+    /// Appends an element if there is sufficient spare capacity, otherwise an error is returned
+    /// with the element.
+    ///
+    /// Unlike [`push`] this method will not reallocate when there's insufficient capacity.
+    /// The caller should use [`reserve`] or [`try_reserve`] to ensure that there is enough capacity.
+    ///
+    /// [`push`]: Vec::push
+    /// [`reserve`]: Vec::reserve
+    /// [`try_reserve`]: Vec::try_reserve
+    ///
+    /// # Examples
+    ///
+    /// A manual, panic-free alternative to [`FromIterator`]:
+    ///
+    /// ```
+    /// #![feature(vec_push_within_capacity)]
+    ///
+    /// use std::collections::TryReserveError;
+    /// fn from_iter_fallible<T>(iter: impl Iterator<Item=T>) -> Result<Vec<T>, TryReserveError> {
+    ///     let mut vec = Vec::new();
+    ///     for value in iter {
+    ///         if let Err(value) = vec.push_within_capacity(value) {
+    ///             vec.try_reserve(1)?;
+    ///             // this cannot fail, the previous line either returned or added at least 1 free slot
+    ///             let _ = vec.push_within_capacity(value);
+    ///         }
+    ///     }
+    ///     Ok(vec)
+    /// }
+    /// assert_eq!(from_iter_fallible(0..100), Ok(Vec::from_iter(0..100)));
+    /// ```
+    #[inline]
+    #[unstable(feature = "vec_push_within_capacity", issue = "100486")]
+    pub fn push_within_capacity(&mut self, value: T) -> Result<(), T> {
+        if self.len == self.buf.capacity() {
+            return Err(value);
+        }
+        unsafe {
+            let end = self.as_mut_ptr().add(self.len);
+            ptr::write(end, value);
+            self.len += 1;
+        }
+        Ok(())
+    }
+
     /// Removes the last element from a vector and returns it, or [`None`] if it
     /// is empty.
     ///
@@ -1856,9 +2048,7 @@ impl<T, A: Allocator> Vec<T, A> {
         unsafe {
             // set self.vec length's to start, to be safe in case Drain is leaked
             self.set_len(start);
-            // Use the borrow in the IterMut to indicate borrowing behavior of the
-            // whole Drain iterator (like &mut T).
-            let range_slice = slice::from_raw_parts_mut(self.as_mut_ptr().add(start), end - start);
+            let range_slice = slice::from_raw_parts(self.as_ptr().add(start), end - start);
             Drain {
                 tail_start: end,
                 tail_len: len - end,
@@ -2021,7 +2211,7 @@ impl<T, A: Allocator> Vec<T, A> {
     {
         let len = self.len();
         if new_len > len {
-            self.extend_with(new_len - len, ExtendFunc(f));
+            self.extend_trusted(iter::repeat_with(f).take(new_len - len));
         } else {
             self.truncate(new_len);
         }
@@ -2050,7 +2240,6 @@ impl<T, A: Allocator> Vec<T, A> {
     /// static_ref[0] += 1;
     /// assert_eq!(static_ref, &[2, 2, 3]);
     /// ```
-    #[cfg(not(no_global_oom_handling))]
     #[stable(feature = "vec_leak", since = "1.47.0")]
     #[inline]
     pub fn leak<'a>(self) -> &'a mut [T]
@@ -2220,7 +2409,7 @@ impl<T: Clone, A: Allocator> Vec<T, A> {
         let len = self.len();
 
         if new_len > len {
-            self.extend_with(new_len - len, ExtendElement(value))
+            self.extend_with(new_len - len, value)
         } else {
             self.truncate(new_len);
         }
@@ -2282,7 +2471,7 @@ impl<T: Clone, A: Allocator> Vec<T, A> {
         self.reserve(range.len());
 
         // SAFETY:
-        // - `slice::range` guarantees  that the given range is valid for indexing self
+        // - `slice::range` guarantees that the given range is valid for indexing self
         unsafe {
             self.spec_extend_from_within(range);
         }
@@ -2314,7 +2503,7 @@ impl<T, A: Allocator, const N: usize> Vec<[T; N], A> {
     #[unstable(feature = "slice_flatten", issue = "95629")]
     pub fn into_flattened(self) -> Vec<T, A> {
         let (ptr, len, cap, alloc) = self.into_raw_parts_with_alloc();
-        let (new_len, new_cap) = if mem::size_of::<T>() == 0 {
+        let (new_len, new_cap) = if T::IS_ZST {
             (len.checked_mul(N).expect("vec len overflow"), usize::MAX)
         } else {
             // SAFETY:
@@ -2334,36 +2523,10 @@ impl<T, A: Allocator, const N: usize> Vec<[T; N], A> {
     }
 }
 
-// This code generalizes `extend_with_{element,default}`.
-trait ExtendWith<T> {
-    fn next(&mut self) -> T;
-    fn last(self) -> T;
-}
-
-struct ExtendElement<T>(T);
-impl<T: Clone> ExtendWith<T> for ExtendElement<T> {
-    fn next(&mut self) -> T {
-        self.0.clone()
-    }
-    fn last(self) -> T {
-        self.0
-    }
-}
-
-struct ExtendFunc<F>(F);
-impl<T, F: FnMut() -> T> ExtendWith<T> for ExtendFunc<F> {
-    fn next(&mut self) -> T {
-        (self.0)()
-    }
-    fn last(mut self) -> T {
-        (self.0)()
-    }
-}
-
-impl<T, A: Allocator> Vec<T, A> {
+impl<T: Clone, A: Allocator> Vec<T, A> {
     #[cfg(not(no_global_oom_handling))]
-    /// Extend the vector by `n` values, using the given generator.
-    fn extend_with<E: ExtendWith<T>>(&mut self, n: usize, mut value: E) {
+    /// Extend the vector by `n` clones of value.
+    fn extend_with(&mut self, n: usize, value: T) {
         self.reserve(n);
 
         unsafe {
@@ -2375,15 +2538,15 @@ impl<T, A: Allocator> Vec<T, A> {
 
             // Write all elements except the last one
             for _ in 1..n {
-                ptr::write(ptr, value.next());
-                ptr = ptr.offset(1);
-                // Increment the length in every step in case next() panics
+                ptr::write(ptr, value.clone());
+                ptr = ptr.add(1);
+                // Increment the length in every step in case clone() panics
                 local_len.increment_len(1);
             }
 
             if n > 0 {
                 // We can write the last element directly without cloning needlessly
-                ptr::write(ptr, value.last());
+                ptr::write(ptr, value);
                 local_len.increment_len(1);
             }
 
@@ -2447,7 +2610,7 @@ impl<T: Clone, A: Allocator> ExtendFromWithinSpec for Vec<T, A> {
         let (this, spare, len) = unsafe { self.split_at_spare_mut_with_len() };
 
         // SAFETY:
-        // - caller guaratees that src is a valid index
+        // - caller guarantees that src is a valid index
         let to_clone = unsafe { this.get_unchecked(src) };
 
         iter::zip(to_clone, spare)
@@ -2466,7 +2629,7 @@ impl<T: Copy, A: Allocator> ExtendFromWithinSpec for Vec<T, A> {
             let (init, spare) = self.split_at_spare_mut();
 
             // SAFETY:
-            // - caller guaratees that `src` is a valid index
+            // - caller guarantees that `src` is a valid index
             let source = unsafe { init.get_unchecked(src) };
 
             // SAFETY:
@@ -2510,35 +2673,6 @@ impl<T, A: Allocator> ops::DerefMut for Vec<T, A> {
 }
 
 #[cfg(not(no_global_oom_handling))]
-trait SpecCloneFrom {
-    fn clone_from(this: &mut Self, other: &Self);
-}
-
-#[cfg(not(no_global_oom_handling))]
-impl<T: Clone, A: Allocator> SpecCloneFrom for Vec<T, A> {
-    default fn clone_from(this: &mut Self, other: &Self) {
-        // drop anything that will not be overwritten
-        this.truncate(other.len());
-
-        // self.len <= other.len due to the truncate above, so the
-        // slices here are always in-bounds.
-        let (init, tail) = other.split_at(this.len());
-
-        // reuse the contained values' allocations/resources.
-        this.clone_from_slice(init);
-        this.extend_from_slice(tail);
-    }
-}
-
-#[cfg(not(no_global_oom_handling))]
-impl<T: Copy, A: Allocator> SpecCloneFrom for Vec<T, A> {
-    fn clone_from(this: &mut Self, other: &Self) {
-        this.clear();
-        this.extend_from_slice(other);
-    }
-}
-
-#[cfg(not(no_global_oom_handling))]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Clone, A: Allocator + Clone> Clone for Vec<T, A> {
     #[cfg(not(test))]
@@ -2549,7 +2683,7 @@ impl<T: Clone, A: Allocator + Clone> Clone for Vec<T, A> {
 
     // HACK(japaric): with cfg(test) the inherent `[T]::to_vec` method, which is
     // required for this method definition, is not available. Instead use the
-    // `slice::to_vec`  function which is only available with cfg(test)
+    // `slice::to_vec` function which is only available with cfg(test)
     // NB see the slice::hack module in slice.rs for more information
     #[cfg(test)]
     fn clone(&self) -> Self {
@@ -2558,7 +2692,7 @@ impl<T: Clone, A: Allocator + Clone> Clone for Vec<T, A> {
     }
 
     fn clone_from(&mut self, other: &Self) {
-        SpecCloneFrom::clone_from(self, other)
+        crate::slice::SpecCloneIntoVec::clone_into(other.as_slice(), self);
     }
 }
 
@@ -2566,7 +2700,6 @@ impl<T: Clone, A: Allocator + Clone> Clone for Vec<T, A> {
 /// as required by the `core::borrow::Borrow` implementation.
 ///
 /// ```
-/// #![feature(build_hasher_simple_hash_one)]
 /// use std::hash::BuildHasher;
 ///
 /// let b = std::collections::hash_map::RandomState::new();
@@ -2639,13 +2772,13 @@ impl<T, A: Allocator> IntoIterator for Vec<T, A> {
     /// assert_eq!(v_iter.next(), None);
     /// ```
     #[inline]
-    fn into_iter(self) -> IntoIter<T, A> {
+    fn into_iter(self) -> Self::IntoIter {
         unsafe {
             let mut me = ManuallyDrop::new(self);
             let alloc = ManuallyDrop::new(ptr::read(me.allocator()));
             let begin = me.as_mut_ptr();
-            let end = if mem::size_of::<T>() == 0 {
-                arith_offset(begin as *const i8, me.len() as isize) as *const T
+            let end = if T::IS_ZST {
+                begin.wrapping_byte_add(me.len())
             } else {
                 begin.add(me.len()) as *const T
             };
@@ -2667,7 +2800,7 @@ impl<'a, T, A: Allocator> IntoIterator for &'a Vec<T, A> {
     type Item = &'a T;
     type IntoIter = slice::Iter<'a, T>;
 
-    fn into_iter(self) -> slice::Iter<'a, T> {
+    fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
@@ -2677,7 +2810,7 @@ impl<'a, T, A: Allocator> IntoIterator for &'a mut Vec<T, A> {
     type Item = &'a mut T;
     type IntoIter = slice::IterMut<'a, T>;
 
-    fn into_iter(self) -> slice::IterMut<'a, T> {
+    fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
     }
 }
@@ -2726,6 +2859,40 @@ impl<T, A: Allocator> Vec<T, A> {
                 // NB can't overflow since we would have had to alloc the address space
                 self.set_len(len + 1);
             }
+        }
+    }
+
+    // specific extend for `TrustedLen` iterators, called both by the specializations
+    // and internal places where resolving specialization makes compilation slower
+    #[cfg(not(no_global_oom_handling))]
+    fn extend_trusted(&mut self, iterator: impl iter::TrustedLen<Item = T>) {
+        let (low, high) = iterator.size_hint();
+        if let Some(additional) = high {
+            debug_assert_eq!(
+                low,
+                additional,
+                "TrustedLen iterator's size hint is not exact: {:?}",
+                (low, high)
+            );
+            self.reserve(additional);
+            unsafe {
+                let ptr = self.as_mut_ptr();
+                let mut local_len = SetLenOnDrop::new(&mut self.len);
+                iterator.for_each(move |element| {
+                    ptr::write(ptr.add(local_len.current_len()), element);
+                    // Since the loop executes user code which can panic we have to update
+                    // the length every step to correctly drop what we've written.
+                    // NB can't overflow since we would have had to alloc the address space
+                    local_len.increment_len(1);
+                });
+            }
+        } else {
+            // Per TrustedLen contract a `None` upper bound means that the iterator length
+            // truly exceeds usize::MAX, which would eventually lead to a capacity overflow anyway.
+            // Since the other branch already panics eagerly (via `reserve()`) we do the same here.
+            // This avoids additional codegen for a fallback code path which would eventually
+            // panic anyway.
+            panic!("capacity overflow");
         }
     }
 
@@ -2779,6 +2946,12 @@ impl<T, A: Allocator> Vec<T, A> {
     /// If the closure returns false, the element will remain in the vector and will not be yielded
     /// by the iterator.
     ///
+    /// If the returned `ExtractIf` is not exhausted, e.g. because it is dropped without iterating
+    /// or the iteration short-circuits, then the remaining elements will be retained.
+    /// Use [`retain`] with a negated predicate if you do not need the returned iterator.
+    ///
+    /// [`retain`]: Vec::retain
+    ///
     /// Using this method is equivalent to the following code:
     ///
     /// ```
@@ -2797,10 +2970,10 @@ impl<T, A: Allocator> Vec<T, A> {
     /// # assert_eq!(vec, vec![1, 4, 5]);
     /// ```
     ///
-    /// But `drain_filter` is easier to use. `drain_filter` is also more efficient,
+    /// But `extract_if` is easier to use. `extract_if` is also more efficient,
     /// because it can backshift the elements of the array in bulk.
     ///
-    /// Note that `drain_filter` also lets you mutate every element in the filter closure,
+    /// Note that `extract_if` also lets you mutate every element in the filter closure,
     /// regardless of whether you choose to keep or remove it.
     ///
     /// # Examples
@@ -2808,17 +2981,17 @@ impl<T, A: Allocator> Vec<T, A> {
     /// Splitting an array into evens and odds, reusing the original allocation:
     ///
     /// ```
-    /// #![feature(drain_filter)]
+    /// #![feature(extract_if)]
     /// let mut numbers = vec![1, 2, 3, 4, 5, 6, 8, 9, 11, 13, 14, 15];
     ///
-    /// let evens = numbers.drain_filter(|x| *x % 2 == 0).collect::<Vec<_>>();
+    /// let evens = numbers.extract_if(|x| *x % 2 == 0).collect::<Vec<_>>();
     /// let odds = numbers;
     ///
     /// assert_eq!(evens, vec![2, 4, 6, 8, 14]);
     /// assert_eq!(odds, vec![1, 3, 5, 9, 11, 13, 15]);
     /// ```
-    #[unstable(feature = "drain_filter", reason = "recently added", issue = "43244")]
-    pub fn drain_filter<F>(&mut self, filter: F) -> DrainFilter<'_, T, F, A>
+    #[unstable(feature = "extract_if", reason = "recently added", issue = "43244")]
+    pub fn extract_if<F>(&mut self, filter: F) -> ExtractIf<'_, T, F, A>
     where
         F: FnMut(&mut T) -> bool,
     {
@@ -2829,7 +3002,7 @@ impl<T, A: Allocator> Vec<T, A> {
             self.set_len(0);
         }
 
-        DrainFilter { vec: self, idx: 0, del: 0, old_len, pred: filter, panic_flag: false }
+        ExtractIf { vec: self, idx: 0, del: 0, old_len, pred: filter }
     }
 }
 
@@ -2841,7 +3014,7 @@ impl<T, A: Allocator> Vec<T, A> {
 /// [`copy_from_slice`]: slice::copy_from_slice
 #[cfg(not(no_global_oom_handling))]
 #[stable(feature = "extend_ref", since = "1.2.0")]
-impl<'a, T: Copy + 'a, A: Allocator + 'a> Extend<&'a T> for Vec<T, A> {
+impl<'a, T: Copy + 'a, A: Allocator> Extend<&'a T> for Vec<T, A> {
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
         self.spec_extend(iter.into_iter())
     }
@@ -2857,11 +3030,16 @@ impl<'a, T: Copy + 'a, A: Allocator + 'a> Extend<&'a T> for Vec<T, A> {
     }
 }
 
-/// Implements comparison of vectors, [lexicographically](core::cmp::Ord#lexicographical-comparison).
+/// Implements comparison of vectors, [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
-impl<T: PartialOrd, A: Allocator> PartialOrd for Vec<T, A> {
+impl<T, A1, A2> PartialOrd<Vec<T, A2>> for Vec<T, A1>
+where
+    T: PartialOrd,
+    A1: Allocator,
+    A2: Allocator,
+{
     #[inline]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Vec<T, A2>) -> Option<Ordering> {
         PartialOrd::partial_cmp(&**self, &**other)
     }
 }
@@ -2869,7 +3047,7 @@ impl<T: PartialOrd, A: Allocator> PartialOrd for Vec<T, A> {
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Eq, A: Allocator> Eq for Vec<T, A> {}
 
-/// Implements ordering of vectors, [lexicographically](core::cmp::Ord#lexicographical-comparison).
+/// Implements ordering of vectors, [lexicographically](Ord#lexicographical-comparison).
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T: Ord, A: Allocator> Ord for Vec<T, A> {
     #[inline]
@@ -2892,9 +3070,10 @@ unsafe impl<#[may_dangle] T, A: Allocator> Drop for Vec<T, A> {
 }
 
 #[stable(feature = "rust1", since = "1.0.0")]
-#[rustc_const_unstable(feature = "const_default_impls", issue = "87864")]
-impl<T> const Default for Vec<T> {
+impl<T> Default for Vec<T> {
     /// Creates an empty `Vec<T>`.
+    ///
+    /// The vector will not allocate until elements are pushed onto it.
     fn default() -> Vec<T> {
         Vec::new()
     }
@@ -2987,10 +3166,7 @@ impl<T, const N: usize> From<[T; N]> for Vec<T> {
     /// ```
     #[cfg(not(test))]
     fn from(s: [T; N]) -> Vec<T> {
-        <[T]>::into_vec(
-            #[cfg_attr(not(bootstrap), rustc_box)]
-            Box::new(s),
-        )
+        <[T]>::into_vec(Box::new(s))
     }
 
     #[cfg(test)]
@@ -3014,8 +3190,8 @@ where
     ///
     /// ```
     /// # use std::borrow::Cow;
-    /// let o: Cow<[i32]> = Cow::Owned(vec![1, 2, 3]);
-    /// let b: Cow<[i32]> = Cow::Borrowed(&[1, 2, 3]);
+    /// let o: Cow<'_, [i32]> = Cow::Owned(vec![1, 2, 3]);
+    /// let b: Cow<'_, [i32]> = Cow::Borrowed(&[1, 2, 3]);
     /// assert_eq!(Vec::from(o), Vec::from(b));
     /// ```
     fn from(s: Cow<'a, [T]>) -> Vec<T> {
@@ -3023,7 +3199,7 @@ where
     }
 }
 
-// note: test pulls in libstd, which causes errors here
+// note: test pulls in std, which causes errors here
 #[cfg(not(test))]
 #[stable(feature = "vec_from_box", since = "1.18.0")]
 impl<T, A: Allocator> From<Box<[T], A>> for Vec<T, A> {
@@ -3041,7 +3217,7 @@ impl<T, A: Allocator> From<Box<[T], A>> for Vec<T, A> {
     }
 }
 
-// note: test pulls in libstd, which causes errors here
+// note: test pulls in std, which causes errors here
 #[cfg(not(no_global_oom_handling))]
 #[cfg(not(test))]
 #[stable(feature = "box_from_vec", since = "1.20.0")]
@@ -3055,6 +3231,14 @@ impl<T, A: Allocator> From<Vec<T, A>> for Box<[T], A> {
     ///
     /// ```
     /// assert_eq!(Box::from(vec![1, 2, 3]), vec![1, 2, 3].into_boxed_slice());
+    /// ```
+    ///
+    /// Any excess capacity is removed:
+    /// ```
+    /// let mut vec = Vec::with_capacity(10);
+    /// vec.extend([1, 2, 3]);
+    ///
+    /// assert_eq!(Box::from(vec), vec![1, 2, 3].into_boxed_slice());
     /// ```
     fn from(v: Vec<T, A>) -> Self {
         v.into_boxed_slice()

@@ -56,55 +56,13 @@ pub enum Target {
     GenericParam(GenericParamKind),
     MacroDef,
     Param,
+    PatField,
+    ExprField,
 }
 
 impl Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match *self {
-                Target::ExternCrate => "extern crate",
-                Target::Use => "use",
-                Target::Static => "static item",
-                Target::Const => "constant item",
-                Target::Fn => "function",
-                Target::Closure => "closure",
-                Target::Mod => "module",
-                Target::ForeignMod => "foreign module",
-                Target::GlobalAsm => "global asm",
-                Target::TyAlias => "type alias",
-                Target::OpaqueTy => "opaque type",
-                Target::Enum => "enum",
-                Target::Variant => "enum variant",
-                Target::Struct => "struct",
-                Target::Field => "struct field",
-                Target::Union => "union",
-                Target::Trait => "trait",
-                Target::TraitAlias => "trait alias",
-                Target::Impl => "item",
-                Target::Expression => "expression",
-                Target::Statement => "statement",
-                Target::Arm => "match arm",
-                Target::AssocConst => "associated const",
-                Target::Method(kind) => match kind {
-                    MethodKind::Inherent => "inherent method",
-                    MethodKind::Trait { body: false } => "required trait method",
-                    MethodKind::Trait { body: true } => "provided trait method",
-                },
-                Target::AssocTy => "associated type",
-                Target::ForeignFn => "foreign function",
-                Target::ForeignStatic => "foreign static item",
-                Target::ForeignTy => "foreign type",
-                Target::GenericParam(kind) => match kind {
-                    GenericParamKind::Type => "type parameter",
-                    GenericParamKind::Lifetime => "lifetime parameter",
-                    GenericParamKind::Const => "const parameter",
-                },
-                Target::MacroDef => "macro def",
-                Target::Param => "function param",
-            }
-        )
+        write!(f, "{}", Self::name(*self))
     }
 }
 
@@ -143,14 +101,14 @@ impl Target {
             DefKind::Mod => Target::Mod,
             DefKind::ForeignMod => Target::ForeignMod,
             DefKind::GlobalAsm => Target::GlobalAsm,
-            DefKind::TyAlias => Target::TyAlias,
+            DefKind::TyAlias { .. } => Target::TyAlias,
             DefKind::OpaqueTy => Target::OpaqueTy,
             DefKind::Enum => Target::Enum,
             DefKind::Struct => Target::Struct,
             DefKind::Union => Target::Union,
             DefKind::Trait => Target::Trait,
             DefKind::TraitAlias => Target::TraitAlias,
-            DefKind::Impl => Target::Impl,
+            DefKind::Impl { .. } => Target::Impl,
             _ => panic!("impossible case reached"),
         }
     }
@@ -183,6 +141,52 @@ impl Target {
                 Target::GenericParam(GenericParamKind::Lifetime)
             }
             hir::GenericParamKind::Const { .. } => Target::GenericParam(GenericParamKind::Const),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Target::ExternCrate => "extern crate",
+            Target::Use => "use",
+            Target::Static => "static item",
+            Target::Const => "constant item",
+            Target::Fn => "function",
+            Target::Closure => "closure",
+            Target::Mod => "module",
+            Target::ForeignMod => "foreign module",
+            Target::GlobalAsm => "global asm",
+            Target::TyAlias => "type alias",
+            Target::OpaqueTy => "opaque type",
+            Target::Enum => "enum",
+            Target::Variant => "enum variant",
+            Target::Struct => "struct",
+            Target::Field => "struct field",
+            Target::Union => "union",
+            Target::Trait => "trait",
+            Target::TraitAlias => "trait alias",
+            Target::Impl => "implementation block",
+            Target::Expression => "expression",
+            Target::Statement => "statement",
+            Target::Arm => "match arm",
+            Target::AssocConst => "associated const",
+            Target::Method(kind) => match kind {
+                MethodKind::Inherent => "inherent method",
+                MethodKind::Trait { body: false } => "required trait method",
+                MethodKind::Trait { body: true } => "provided trait method",
+            },
+            Target::AssocTy => "associated type",
+            Target::ForeignFn => "foreign function",
+            Target::ForeignStatic => "foreign static item",
+            Target::ForeignTy => "foreign type",
+            Target::GenericParam(kind) => match kind {
+                GenericParamKind::Type => "type parameter",
+                GenericParamKind::Lifetime => "lifetime parameter",
+                GenericParamKind::Const => "const parameter",
+            },
+            Target::MacroDef => "macro def",
+            Target::Param => "function param",
+            Target::PatField => "pattern field",
+            Target::ExprField => "struct field",
         }
     }
 }

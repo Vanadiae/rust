@@ -1,25 +1,28 @@
-use crate::mem;
-use crate::slice;
-
 pub fn hashmap_random_keys() -> (u64, u64) {
-    let mut v = (0, 0);
-    unsafe {
-        let view = slice::from_raw_parts_mut(&mut v as *mut _ as *mut u8, mem::size_of_val(&v));
-        imp::fill_bytes(view);
-    }
-    v
+    const KEY_LEN: usize = core::mem::size_of::<u64>();
+
+    let mut v = [0u8; KEY_LEN * 2];
+    imp::fill_bytes(&mut v);
+
+    let key1 = v[0..KEY_LEN].try_into().unwrap();
+    let key2 = v[KEY_LEN..].try_into().unwrap();
+
+    (u64::from_ne_bytes(key1), u64::from_ne_bytes(key2))
 }
 
 #[cfg(all(
     unix,
     not(target_os = "macos"),
     not(target_os = "ios"),
+    not(target_os = "tvos"),
+    not(target_os = "watchos"),
     not(target_os = "openbsd"),
-    not(target_os = "freebsd"),
     not(target_os = "netbsd"),
     not(target_os = "fuchsia"),
     not(target_os = "redox"),
-    not(target_os = "vxworks")
+    not(target_os = "vxworks"),
+    not(target_os = "emscripten"),
+    not(target_os = "vita"),
 ))]
 mod imp {
     use crate::fs::File;
@@ -59,17 +62,42 @@ mod imp {
         unsafe { getrandom(buf.as_mut_ptr().cast(), buf.len(), libc::GRND_NONBLOCK) }
     }
 
-    #[cfg(target_os = "espidf")]
+    #[cfg(any(target_os = "espidf", target_os = "horizon"))]
     fn getrandom(buf: &mut [u8]) -> libc::ssize_t {
         unsafe { libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "espidf")))]
+    #[cfg(target_os = "freebsd")]
+    fn getrandom(buf: &mut [u8]) -> libc::ssize_t {
+        // FIXME: using the above when libary std's libc is updated
+        extern "C" {
+            fn getrandom(
+                buffer: *mut libc::c_void,
+                length: libc::size_t,
+                flags: libc::c_uint,
+            ) -> libc::ssize_t;
+        }
+        unsafe { getrandom(buf.as_mut_ptr().cast(), buf.len(), 0) }
+    }
+
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "freebsd"
+    )))]
     fn getrandom_fill_bytes(_buf: &mut [u8]) -> bool {
         false
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "espidf"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "freebsd"
+    ))]
     fn getrandom_fill_bytes(v: &mut [u8]) -> bool {
         use crate::sync::atomic::{AtomicBool, Ordering};
         use crate::sys::os::errno;
@@ -163,7 +191,7 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "openbsd")]
+#[cfg(any(target_os = "openbsd", target_os = "emscripten", target_os = "vita"))]
 mod imp {
     use crate::sys::os::errno;
 
@@ -185,7 +213,7 @@ mod imp {
 // once per thread in `hashmap_random_keys`. Therefore `SecRandomCopyBytes` is
 // only used on iOS where direct access to `/dev/urandom` is blocked by the
 // sandbox.
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))]
 mod imp {
     use crate::io;
     use crate::ptr;
@@ -208,7 +236,7 @@ mod imp {
     }
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+#[cfg(target_os = "netbsd")]
 mod imp {
     use crate::ptr;
 

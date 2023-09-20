@@ -11,11 +11,13 @@ use crate::ffi::{OsStr, OsString};
 use crate::fmt;
 use crate::io::{self, Error, ErrorKind};
 use crate::mem;
+use crate::mem::MaybeUninit;
 use crate::num::NonZeroI32;
 use crate::os::windows::ffi::{OsStrExt, OsStringExt};
 use crate::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle};
 use crate::path::{Path, PathBuf};
 use crate::ptr;
+use crate::sync::Mutex;
 use crate::sys::args::{self, Arg};
 use crate::sys::c;
 use crate::sys::c::NonZeroDWORD;
@@ -25,7 +27,6 @@ use crate::sys::handle::Handle;
 use crate::sys::path;
 use crate::sys::pipe::{self, AnonPipe};
 use crate::sys::stdio;
-use crate::sys_common::mutex::StaticMutex;
 use crate::sys_common::process::{CommandEnv, CommandEnvs};
 use crate::sys_common::IntoInner;
 
@@ -166,10 +167,12 @@ pub struct Command {
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
     force_quotes_enabled: bool,
+    proc_thread_attributes: BTreeMap<usize, ProcThreadAttributeValue>,
 }
 
 pub enum Stdio {
     Inherit,
+    InheritSpecific { from_stdio_id: c::DWORD },
     Null,
     MakePipe,
     Pipe(AnonPipe),
@@ -195,6 +198,7 @@ impl Command {
             stdout: None,
             stderr: None,
             force_quotes_enabled: false,
+            proc_thread_attributes: Default::default(),
         }
     }
 
@@ -245,16 +249,23 @@ impl Command {
         self.cwd.as_ref().map(|cwd| Path::new(cwd))
     }
 
+    pub unsafe fn raw_attribute<T: Copy + Send + Sync + 'static>(
+        &mut self,
+        attribute: usize,
+        value: T,
+    ) {
+        self.proc_thread_attributes.insert(
+            attribute,
+            ProcThreadAttributeValue { size: mem::size_of::<T>(), data: Box::new(value) },
+        );
+    }
+
     pub fn spawn(
         &mut self,
         default: Stdio,
         needs_stdin: bool,
     ) -> io::Result<(Process, StdioPipes)> {
         let maybe_env = self.env.capture_if_changed();
-
-        let mut si = zeroed_startupinfo();
-        si.cb = mem::size_of::<c::STARTUPINFO>() as c::DWORD;
-        si.dwFlags = c::STARTF_USESTDHANDLES;
 
         let child_paths = if let Some(env) = maybe_env.as_ref() {
             env.get(&EnvKey::new("PATH")).map(|s| s.as_os_str())
@@ -270,11 +281,7 @@ impl Command {
         let (program, mut cmd_str) = if is_batch_file {
             (
                 command_prompt()?,
-                args::make_bat_command_line(
-                    &args::to_user_path(program)?,
-                    &self.args,
-                    self.force_quotes_enabled,
-                )?,
+                args::make_bat_command_line(&program, &self.args, self.force_quotes_enabled)?,
             )
         } else {
             let cmd_str = make_command_line(&self.program, &self.args, self.force_quotes_enabled)?;
@@ -301,9 +308,9 @@ impl Command {
         //
         // For more information, msdn also has an article about this race:
         // https://support.microsoft.com/kb/315939
-        static CREATE_PROCESS_LOCK: StaticMutex = StaticMutex::new();
+        static CREATE_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
-        let _guard = unsafe { CREATE_PROCESS_LOCK.lock() };
+        let _guard = CREATE_PROCESS_LOCK.lock();
 
         let mut pipes = StdioPipes { stdin: None, stdout: None, stderr: None };
         let null = Stdio::Null;
@@ -314,9 +321,41 @@ impl Command {
         let stdin = stdin.to_handle(c::STD_INPUT_HANDLE, &mut pipes.stdin)?;
         let stdout = stdout.to_handle(c::STD_OUTPUT_HANDLE, &mut pipes.stdout)?;
         let stderr = stderr.to_handle(c::STD_ERROR_HANDLE, &mut pipes.stderr)?;
-        si.hStdInput = stdin.as_raw_handle();
-        si.hStdOutput = stdout.as_raw_handle();
-        si.hStdError = stderr.as_raw_handle();
+
+        let mut si = zeroed_startupinfo();
+
+        // If at least one of stdin, stdout or stderr are set (i.e. are non null)
+        // then set the `hStd` fields in `STARTUPINFO`.
+        // Otherwise skip this and allow the OS to apply its default behaviour.
+        // This provides more consistent behaviour between Win7 and Win8+.
+        let is_set = |stdio: &Handle| !stdio.as_raw_handle().is_null();
+        if is_set(&stderr) || is_set(&stdout) || is_set(&stdin) {
+            si.dwFlags |= c::STARTF_USESTDHANDLES;
+            si.hStdInput = stdin.as_raw_handle();
+            si.hStdOutput = stdout.as_raw_handle();
+            si.hStdError = stderr.as_raw_handle();
+        }
+
+        let si_ptr: *mut c::STARTUPINFOW;
+
+        let mut proc_thread_attribute_list;
+        let mut si_ex;
+
+        if !self.proc_thread_attributes.is_empty() {
+            si.cb = mem::size_of::<c::STARTUPINFOEXW>() as u32;
+            flags |= c::EXTENDED_STARTUPINFO_PRESENT;
+
+            proc_thread_attribute_list =
+                make_proc_thread_attribute_list(&self.proc_thread_attributes)?;
+            si_ex = c::STARTUPINFOEXW {
+                StartupInfo: si,
+                lpAttributeList: proc_thread_attribute_list.0.as_mut_ptr() as _,
+            };
+            si_ptr = &mut si_ex as *mut _ as _;
+        } else {
+            si.cb = mem::size_of::<c::STARTUPINFOW>() as c::DWORD;
+            si_ptr = &mut si as *mut _ as _;
+        }
 
         unsafe {
             cvt(c::CreateProcessW(
@@ -328,7 +367,7 @@ impl Command {
                 flags,
                 envp,
                 dirp,
-                &mut si,
+                si_ptr,
                 &mut pi,
             ))
         }?;
@@ -342,6 +381,11 @@ impl Command {
                 pipes,
             ))
         }
+    }
+
+    pub fn output(&mut self) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+        let (proc, pipes) = self.spawn(Stdio::MakePipe, false)?;
+        crate::sys_common::process::wait_with_output(proc, pipes)
     }
 }
 
@@ -386,7 +430,7 @@ fn resolve_exe<'a>(
     // Test if the file name has the `exe` extension.
     // This does a case-insensitive `ends_with`.
     let has_exe_suffix = if exe_path.len() >= EXE_SUFFIX.len() {
-        exe_path.bytes()[exe_path.len() - EXE_SUFFIX.len()..]
+        exe_path.as_encoded_bytes()[exe_path.len() - EXE_SUFFIX.len()..]
             .eq_ignore_ascii_case(EXE_SUFFIX.as_bytes())
     } else {
         false
@@ -397,7 +441,7 @@ fn resolve_exe<'a>(
         if has_exe_suffix {
             // The application name is a path to a `.exe` file.
             // Let `CreateProcessW` figure out if it exists or not.
-            return path::maybe_verbatim(Path::new(exe_path));
+            return args::to_user_path(Path::new(exe_path));
         }
         let mut path = PathBuf::from(exe_path);
 
@@ -409,14 +453,14 @@ fn resolve_exe<'a>(
             // It's ok to use `set_extension` here because the intent is to
             // remove the extension that was just added.
             path.set_extension("");
-            return path::maybe_verbatim(&path);
+            return args::to_user_path(&path);
         }
     } else {
         ensure_no_nuls(exe_path)?;
         // From the `CreateProcessW` docs:
         // > If the file name does not contain an extension, .exe is appended.
         // Note that this rule only applies when searching paths.
-        let has_extension = exe_path.bytes().contains(&b'.');
+        let has_extension = exe_path.as_encoded_bytes().contains(&b'.');
 
         // Search the directories given by `search_paths`.
         let result = search_paths(parent_paths, child_paths, |mut path| {
@@ -497,7 +541,7 @@ where
 /// Check if a file exists without following symlinks.
 fn program_exists(path: &Path) -> Option<Vec<u16>> {
     unsafe {
-        let path = path::maybe_verbatim(path).ok()?;
+        let path = args::to_user_path(path).ok()?;
         // Getting attributes using `GetFileAttributesW` does not follow symlinks
         // and it will almost always be successful if the link exists.
         // There are some exceptions for special system files (e.g. the pagefile)
@@ -512,19 +556,19 @@ fn program_exists(path: &Path) -> Option<Vec<u16>> {
 
 impl Stdio {
     fn to_handle(&self, stdio_id: c::DWORD, pipe: &mut Option<AnonPipe>) -> io::Result<Handle> {
-        match *self {
-            // If no stdio handle is available, then inherit means that it
-            // should still be unavailable so propagate the
-            // INVALID_HANDLE_VALUE.
-            Stdio::Inherit => match stdio::get_handle(stdio_id) {
-                Ok(io) => unsafe {
-                    let io = Handle::from_raw_handle(io);
-                    let ret = io.duplicate(0, true, c::DUPLICATE_SAME_ACCESS);
-                    io.into_raw_handle();
-                    ret
-                },
-                Err(..) => unsafe { Ok(Handle::from_raw_handle(c::INVALID_HANDLE_VALUE)) },
+        let use_stdio_id = |stdio_id| match stdio::get_handle(stdio_id) {
+            Ok(io) => unsafe {
+                let io = Handle::from_raw_handle(io);
+                let ret = io.duplicate(0, true, c::DUPLICATE_SAME_ACCESS);
+                io.into_raw_handle();
+                ret
             },
+            // If no stdio handle is available, then propagate the null value.
+            Err(..) => unsafe { Ok(Handle::from_raw_handle(ptr::null_mut())) },
+        };
+        match *self {
+            Stdio::Inherit => use_stdio_id(stdio_id),
+            Stdio::InheritSpecific { from_stdio_id } => use_stdio_id(from_stdio_id),
 
             Stdio::MakePipe => {
                 let ours_readable = stdio_id != c::STD_INPUT_HANDLE;
@@ -572,6 +616,18 @@ impl From<File> for Stdio {
     }
 }
 
+impl From<io::Stdout> for Stdio {
+    fn from(_: io::Stdout) -> Stdio {
+        Stdio::InheritSpecific { from_stdio_id: c::STD_OUTPUT_HANDLE }
+    }
+}
+
+impl From<io::Stderr> for Stdio {
+    fn from(_: io::Stderr) -> Stdio {
+        Stdio::InheritSpecific { from_stdio_id: c::STD_ERROR_HANDLE }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Processes
 ////////////////////////////////////////////////////////////////////////////////
@@ -588,7 +644,16 @@ pub struct Process {
 
 impl Process {
     pub fn kill(&mut self) -> io::Result<()> {
-        cvt(unsafe { c::TerminateProcess(self.handle.as_raw_handle(), 1) })?;
+        let result = unsafe { c::TerminateProcess(self.handle.as_raw_handle(), 1) };
+        if result == c::FALSE {
+            let error = unsafe { c::GetLastError() };
+            // TerminateProcess returns ERROR_ACCESS_DENIED if the process has already been
+            // terminated (by us, or for any other reason). So check if the process was actually
+            // terminated, and if so, do not return an error.
+            if error != c::ERROR_ACCESS_DENIED || self.try_wait().is_err() {
+                return Err(crate::io::Error::from_raw_os_error(error as i32));
+            }
+        }
         Ok(())
     }
 
@@ -636,7 +701,7 @@ impl Process {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
 pub struct ExitStatus(c::DWORD);
 
 impl ExitStatus {
@@ -707,8 +772,14 @@ impl From<u8> for ExitCode {
     }
 }
 
-fn zeroed_startupinfo() -> c::STARTUPINFO {
-    c::STARTUPINFO {
+impl From<u32> for ExitCode {
+    fn from(code: u32) -> Self {
+        ExitCode(c::DWORD::from(code))
+    }
+}
+
+fn zeroed_startupinfo() -> c::STARTUPINFOW {
+    c::STARTUPINFOW {
         cb: 0,
         lpReserved: ptr::null_mut(),
         lpDesktop: ptr::null_mut(),
@@ -718,15 +789,15 @@ fn zeroed_startupinfo() -> c::STARTUPINFO {
         dwXSize: 0,
         dwYSize: 0,
         dwXCountChars: 0,
-        dwYCountCharts: 0,
+        dwYCountChars: 0,
         dwFillAttribute: 0,
         dwFlags: 0,
         wShowWindow: 0,
         cbReserved2: 0,
         lpReserved2: ptr::null_mut(),
-        hStdInput: c::INVALID_HANDLE_VALUE,
-        hStdOutput: c::INVALID_HANDLE_VALUE,
-        hStdError: c::INVALID_HANDLE_VALUE,
+        hStdInput: ptr::null_mut(),
+        hStdOutput: ptr::null_mut(),
+        hStdError: ptr::null_mut(),
     }
 }
 
@@ -807,6 +878,80 @@ fn make_dirp(d: Option<&OsString>) -> io::Result<(*const u16, Vec<u16>)> {
         }
         None => Ok((ptr::null(), Vec::new())),
     }
+}
+
+struct ProcThreadAttributeList(Box<[MaybeUninit<u8>]>);
+
+impl Drop for ProcThreadAttributeList {
+    fn drop(&mut self) {
+        let lp_attribute_list = self.0.as_mut_ptr() as _;
+        unsafe { c::DeleteProcThreadAttributeList(lp_attribute_list) }
+    }
+}
+
+/// Wrapper around the value data to be used as a Process Thread Attribute.
+struct ProcThreadAttributeValue {
+    data: Box<dyn Send + Sync>,
+    size: usize,
+}
+
+fn make_proc_thread_attribute_list(
+    attributes: &BTreeMap<usize, ProcThreadAttributeValue>,
+) -> io::Result<ProcThreadAttributeList> {
+    // To initialize our ProcThreadAttributeList, we need to determine
+    // how many bytes to allocate for it. The Windows API simplifies this process
+    // by allowing us to call `InitializeProcThreadAttributeList` with
+    // a null pointer to retrieve the required size.
+    let mut required_size = 0;
+    let Ok(attribute_count) = attributes.len().try_into() else {
+        return Err(io::const_io_error!(
+            ErrorKind::InvalidInput,
+            "maximum number of ProcThreadAttributes exceeded",
+        ));
+    };
+    unsafe {
+        c::InitializeProcThreadAttributeList(
+            ptr::null_mut(),
+            attribute_count,
+            0,
+            &mut required_size,
+        )
+    };
+
+    let mut proc_thread_attribute_list = ProcThreadAttributeList(
+        vec![MaybeUninit::uninit(); required_size as usize].into_boxed_slice(),
+    );
+
+    // Once we've allocated the necessary memory, it's safe to invoke
+    // `InitializeProcThreadAttributeList` to properly initialize the list.
+    cvt(unsafe {
+        c::InitializeProcThreadAttributeList(
+            proc_thread_attribute_list.0.as_mut_ptr() as *mut _,
+            attribute_count,
+            0,
+            &mut required_size,
+        )
+    })?;
+
+    // # Add our attributes to the buffer.
+    // It's theoretically possible for the attribute count to exceed a u32 value.
+    // Therefore, we ensure that we don't add more attributes than the buffer was initialized for.
+    for (&attribute, value) in attributes.iter().take(attribute_count as usize) {
+        let value_ptr = &*value.data as *const (dyn Send + Sync) as _;
+        cvt(unsafe {
+            c::UpdateProcThreadAttribute(
+                proc_thread_attribute_list.0.as_mut_ptr() as _,
+                0,
+                attribute,
+                value_ptr,
+                value.size,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        })?;
+    }
+
+    Ok(proc_thread_attribute_list)
 }
 
 pub struct CommandArgs<'a> {

@@ -22,7 +22,6 @@
 //!   Moreover, a switch to, e.g., `P<'a, T>` would be easy and mostly automated.
 
 use std::fmt::{self, Debug, Display};
-use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut};
 use std::{slice, vec};
 
@@ -121,13 +120,14 @@ impl<D: Decoder, T: 'static + Decodable<D>> Decodable<D> for P<T> {
 }
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for P<T> {
-    fn encode(&self, s: &mut S) -> Result<(), S::Error> {
-        (**self).encode(s)
+    fn encode(&self, s: &mut S) {
+        (**self).encode(s);
     }
 }
 
 impl<T> P<[T]> {
-    pub const fn new() -> P<[T]> {
+    // FIXME(const-hack) make this const again
+    pub fn new() -> P<[T]> {
         P { ptr: Box::default() }
     }
 
@@ -191,8 +191,8 @@ impl<'a, T> IntoIterator for &'a P<[T]> {
 }
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for P<[T]> {
-    fn encode(&self, s: &mut S) -> Result<(), S::Error> {
-        Encodable::encode(&**self, s)
+    fn encode(&self, s: &mut S) {
+        Encodable::encode(&**self, s);
     }
 }
 

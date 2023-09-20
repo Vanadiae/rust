@@ -8,12 +8,11 @@ pub struct Condvar {
     inner: UnsafeCell<c::CONDITION_VARIABLE>,
 }
 
-pub type MovableCondvar = Condvar;
-
 unsafe impl Send for Condvar {}
 unsafe impl Sync for Condvar {}
 
 impl Condvar {
+    #[inline]
     pub const fn new() -> Condvar {
         Condvar { inner: UnsafeCell::new(c::CONDITION_VARIABLE_INIT) }
     }
@@ -40,12 +39,12 @@ impl Condvar {
     }
 
     #[inline]
-    pub unsafe fn notify_one(&self) {
-        c::WakeConditionVariable(self.inner.get())
+    pub fn notify_one(&self) {
+        unsafe { c::WakeConditionVariable(self.inner.get()) }
     }
 
     #[inline]
-    pub unsafe fn notify_all(&self) {
-        c::WakeAllConditionVariable(self.inner.get())
+    pub fn notify_all(&self) {
+        unsafe { c::WakeAllConditionVariable(self.inner.get()) }
     }
 }

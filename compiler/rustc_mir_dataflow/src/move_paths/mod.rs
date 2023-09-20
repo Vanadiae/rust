@@ -1,5 +1,7 @@
+use crate::move_paths::builder::MoveDat;
+use crate::un_derefer::UnDerefer;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_index::vec::IndexVec;
+use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{ParamEnv, Ty, TyCtxt};
 use rustc_span::Span;
@@ -13,27 +15,24 @@ use self::abs_domain::{AbstractElem, Lift};
 mod abs_domain;
 
 rustc_index::newtype_index! {
-    pub struct MovePathIndex {
-        DEBUG_FORMAT = "mp{}"
-    }
+    #[debug_format = "mp{}"]
+    pub struct MovePathIndex {}
 }
 
 impl polonius_engine::Atom for MovePathIndex {
     fn index(self) -> usize {
-        rustc_index::vec::Idx::index(self)
+        rustc_index::Idx::index(self)
     }
 }
 
 rustc_index::newtype_index! {
-    pub struct MoveOutIndex {
-        DEBUG_FORMAT = "mo{}"
-    }
+    #[debug_format = "mo{}"]
+    pub struct MoveOutIndex {}
 }
 
 rustc_index::newtype_index! {
-    pub struct InitIndex {
-        DEBUG_FORMAT = "in{}"
-    }
+    #[debug_format = "in{}"]
+    pub struct InitIndex {}
 }
 
 impl MoveOutIndex {
@@ -66,7 +65,7 @@ impl<'tcx> MovePath<'tcx> {
     /// Returns an iterator over the parents of `self`.
     pub fn parents<'a>(
         &self,
-        move_paths: &'a IndexVec<MovePathIndex, MovePath<'tcx>>,
+        move_paths: &'a IndexSlice<MovePathIndex, MovePath<'tcx>>,
     ) -> impl 'a + Iterator<Item = (MovePathIndex, &'a MovePath<'tcx>)> {
         let first = self.parent.map(|mpi| (mpi, &move_paths[mpi]));
         MovePathLinearIter {
@@ -80,7 +79,7 @@ impl<'tcx> MovePath<'tcx> {
     /// Returns an iterator over the immediate children of `self`.
     pub fn children<'a>(
         &self,
-        move_paths: &'a IndexVec<MovePathIndex, MovePath<'tcx>>,
+        move_paths: &'a IndexSlice<MovePathIndex, MovePath<'tcx>>,
     ) -> impl 'a + Iterator<Item = (MovePathIndex, &'a MovePath<'tcx>)> {
         let first = self.first_child.map(|mpi| (mpi, &move_paths[mpi]));
         MovePathLinearIter {
@@ -97,7 +96,7 @@ impl<'tcx> MovePath<'tcx> {
     /// `f` will **not** be called on `self`.
     pub fn find_descendant(
         &self,
-        move_paths: &IndexVec<MovePathIndex, MovePath<'_>>,
+        move_paths: &IndexSlice<MovePathIndex, MovePath<'_>>,
         f: impl Fn(MovePathIndex) -> bool,
     ) -> Option<MovePathIndex> {
         let mut todo = if let Some(child) = self.first_child {
@@ -131,13 +130,13 @@ impl<'tcx> fmt::Debug for MovePath<'tcx> {
     fn fmt(&self, w: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(w, "MovePath {{")?;
         if let Some(parent) = self.parent {
-            write!(w, " parent: {:?},", parent)?;
+            write!(w, " parent: {parent:?},")?;
         }
         if let Some(first_child) = self.first_child {
-            write!(w, " first_child: {:?},", first_child)?;
+            write!(w, " first_child: {first_child:?},")?;
         }
         if let Some(next_sibling) = self.next_sibling {
-            write!(w, " next_sibling: {:?}", next_sibling)?;
+            write!(w, " next_sibling: {next_sibling:?}")?;
         }
         write!(w, " place: {:?} }}", self.place)
     }
@@ -177,7 +176,7 @@ pub struct MoveData<'tcx> {
     /// particular path being moved.)
     pub loc_map: LocationMap<SmallVec<[MoveOutIndex; 4]>>,
     pub path_map: IndexVec<MovePathIndex, SmallVec<[MoveOutIndex; 4]>>,
-    pub rev_lookup: MovePathLookup,
+    pub rev_lookup: MovePathLookup<'tcx>,
     pub inits: IndexVec<InitIndex, Init>,
     /// Each Location `l` is mapped to the Inits that are effects
     /// of executing the code at `l`.
@@ -216,7 +215,7 @@ where
     fn new(body: &Body<'_>) -> Self {
         LocationMap {
             map: body
-                .basic_blocks()
+                .basic_blocks
                 .iter()
                 .map(|block| vec![T::default(); block.statements.len() + 1])
                 .collect(),
@@ -291,7 +290,7 @@ impl Init {
 
 /// Tables mapping from a place to its MovePathIndex.
 #[derive(Debug)]
-pub struct MovePathLookup {
+pub struct MovePathLookup<'tcx> {
     locals: IndexVec<Local, MovePathIndex>,
 
     /// projections are made from a base-place and a projection
@@ -301,6 +300,8 @@ pub struct MovePathLookup {
     /// base-place). For the remaining lookup, we map the projection
     /// elem to the associated MovePathIndex.
     projections: FxHashMap<(MovePathIndex, AbstractElem), MovePathIndex>,
+
+    un_derefer: UnDerefer<'tcx>,
 }
 
 mod builder;
@@ -311,15 +312,15 @@ pub enum LookupResult {
     Parent(Option<MovePathIndex>),
 }
 
-impl MovePathLookup {
+impl<'tcx> MovePathLookup<'tcx> {
     // Unlike the builder `fn move_path_for` below, this lookup
     // alternative will *not* create a MovePath on the fly for an
     // unknown place, but will rather return the nearest available
     // parent.
-    pub fn find(&self, place: PlaceRef<'_>) -> LookupResult {
-        let mut result = self.locals[place.local];
+    pub fn find(&self, place: PlaceRef<'tcx>) -> LookupResult {
+        let mut result = self.find_local(place.local);
 
-        for elem in place.projection.iter() {
+        for (_, elem) in self.un_derefer.iter_projections(place) {
             if let Some(&subpath) = self.projections.get(&(result, elem.lift())) {
                 result = subpath;
             } else {
@@ -330,6 +331,7 @@ impl MovePathLookup {
         LookupResult::Exact(result)
     }
 
+    #[inline]
     pub fn find_local(&self, local: Local) -> MovePathIndex {
         self.locals[local]
     }
@@ -386,7 +388,7 @@ impl<'tcx> MoveData<'tcx> {
         body: &Body<'tcx>,
         tcx: TyCtxt<'tcx>,
         param_env: ParamEnv<'tcx>,
-    ) -> Result<Self, (Self, Vec<(Place<'tcx>, MoveError<'tcx>)>)> {
+    ) -> MoveDat<'tcx> {
         builder::gather_moves(body, tcx, param_env)
     }
 

@@ -20,7 +20,7 @@ pub struct MismatchedProjectionTypes<'tcx> {
     pub err: ty::error::TypeError<'tcx>,
 }
 
-#[derive(Clone, TypeFoldable)]
+#[derive(Clone)]
 pub struct Normalized<'tcx, T> {
     pub value: T,
     pub obligations: Vec<PredicateObligation<'tcx>>,
@@ -77,11 +77,11 @@ pub struct ProjectionCacheStorage<'tcx> {
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ProjectionCacheKey<'tcx> {
-    ty: ty::ProjectionTy<'tcx>,
+    ty: ty::AliasTy<'tcx>,
 }
 
 impl<'tcx> ProjectionCacheKey<'tcx> {
-    pub fn new(ty: ty::ProjectionTy<'tcx>) -> Self {
+    pub fn new(ty: ty::AliasTy<'tcx>) -> Self {
         Self { ty }
     }
 }
@@ -103,7 +103,7 @@ pub enum ProjectionCacheEntry<'tcx> {
         /// if this field is set. Evaluation only
         /// cares about the final result, so we don't
         /// care about any region constraint side-effects
-        /// produced by evaluating the sub-boligations.
+        /// produced by evaluating the sub-obligations.
         ///
         /// Additionally, we will clear out the sub-obligations
         /// entirely if we ever evaluate the cache entry (along
@@ -190,7 +190,7 @@ impl<'tcx> ProjectionCache<'_, 'tcx> {
         }
         let fresh_key =
             map.insert(key, ProjectionCacheEntry::NormalizedTy { ty: value, complete: None });
-        assert!(!fresh_key, "never started projecting `{:?}`", key);
+        assert!(!fresh_key, "never started projecting `{key:?}`");
     }
 
     /// Mark the relevant projection cache key as having its derived obligations
@@ -200,10 +200,10 @@ impl<'tcx> ProjectionCache<'_, 'tcx> {
     pub fn complete(&mut self, key: ProjectionCacheKey<'tcx>, result: EvaluationResult) {
         let mut map = self.map();
         match map.get(&key) {
-            Some(&ProjectionCacheEntry::NormalizedTy { ref ty, complete: _ }) => {
+            Some(ProjectionCacheEntry::NormalizedTy { ty, complete: _ }) => {
                 info!("ProjectionCacheEntry::complete({:?}) - completing {:?}", key, ty);
                 let mut ty = ty.clone();
-                if result == EvaluationResult::EvaluatedToOk {
+                if result.must_apply_considering_regions() {
                     ty.obligations = vec![];
                 }
                 map.insert(key, ProjectionCacheEntry::NormalizedTy { ty, complete: Some(result) });
@@ -229,7 +229,7 @@ impl<'tcx> ProjectionCache<'_, 'tcx> {
     /// be different).
     pub fn ambiguous(&mut self, key: ProjectionCacheKey<'tcx>) {
         let fresh = self.map().insert(key, ProjectionCacheEntry::Ambiguous);
-        assert!(!fresh, "never started projecting `{:?}`", key);
+        assert!(!fresh, "never started projecting `{key:?}`");
     }
 
     /// Indicates that while trying to normalize `key`, `key` was required to
@@ -237,14 +237,14 @@ impl<'tcx> ProjectionCache<'_, 'tcx> {
     /// an error here.
     pub fn recur(&mut self, key: ProjectionCacheKey<'tcx>) {
         let fresh = self.map().insert(key, ProjectionCacheEntry::Recur);
-        assert!(!fresh, "never started projecting `{:?}`", key);
+        assert!(!fresh, "never started projecting `{key:?}`");
     }
 
     /// Indicates that trying to normalize `key` resulted in
     /// error.
     pub fn error(&mut self, key: ProjectionCacheKey<'tcx>) {
         let fresh = self.map().insert(key, ProjectionCacheEntry::Error);
-        assert!(!fresh, "never started projecting `{:?}`", key);
+        assert!(!fresh, "never started projecting `{key:?}`");
     }
 }
 

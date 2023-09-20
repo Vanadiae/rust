@@ -30,17 +30,20 @@ mod write;
 
 pub use self::abi::AbiBuilderMethods;
 pub use self::asm::{AsmBuilderMethods, AsmMethods, GlobalAsmOperandRef, InlineAsmOperandRef};
-pub use self::backend::{Backend, BackendTypes, CodegenBackend, ExtraBackendMethods};
+pub use self::backend::{
+    Backend, BackendTypes, CodegenBackend, ExtraBackendMethods, PrintBackendInfo,
+};
 pub use self::builder::{BuilderMethods, OverflowOp};
 pub use self::consts::ConstMethods;
-pub use self::coverageinfo::{CoverageInfoBuilderMethods, CoverageInfoMethods};
+pub use self::coverageinfo::CoverageInfoBuilderMethods;
 pub use self::debuginfo::{DebugInfoBuilderMethods, DebugInfoMethods};
 pub use self::declare::PreDefineMethods;
 pub use self::intrinsic::IntrinsicCallMethods;
 pub use self::misc::MiscMethods;
 pub use self::statics::{StaticBuilderMethods, StaticMethods};
 pub use self::type_::{
-    ArgAbiMethods, BaseTypeMethods, DerivedTypeMethods, LayoutTypeMethods, TypeMethods,
+    ArgAbiMethods, BaseTypeMethods, DerivedTypeMethods, LayoutTypeMethods, TypeMembershipMethods,
+    TypeMethods,
 };
 pub use self::write::{ModuleBufferMethods, ThinBufferMethods, WriteBackendMethods};
 
@@ -58,7 +61,6 @@ pub trait CodegenMethods<'tcx>:
     + MiscMethods<'tcx>
     + ConstMethods<'tcx>
     + StaticMethods
-    + CoverageInfoMethods<'tcx>
     + DebugInfoMethods<'tcx>
     + AsmMethods<'tcx>
     + PreDefineMethods<'tcx>
@@ -74,7 +76,6 @@ impl<'tcx, T> CodegenMethods<'tcx> for T where
         + MiscMethods<'tcx>
         + ConstMethods<'tcx>
         + StaticMethods
-        + CoverageInfoMethods<'tcx>
         + DebugInfoMethods<'tcx>
         + AsmMethods<'tcx>
         + PreDefineMethods<'tcx>

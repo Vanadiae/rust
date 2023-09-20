@@ -1,6 +1,6 @@
 use crate::builder::{Builder, RunConfig, ShouldRun, Step};
 use crate::util::t;
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
@@ -69,7 +69,6 @@ static STABLE_TOOLS: &[(&str, &str)] = &[
     ("reference", "src/doc/reference"),
     ("rust-by-example", "src/doc/rust-by-example"),
     ("edition-guide", "src/doc/edition-guide"),
-    ("rls", "src/tools/rls"),
 ];
 
 // These tools are permitted to not build on the beta/stable channels.
@@ -78,22 +77,21 @@ static STABLE_TOOLS: &[(&str, &str)] = &[
 // though, as otherwise we will be unable to file an issue if they start
 // failing.
 static NIGHTLY_TOOLS: &[(&str, &str)] = &[
-    ("miri", "src/tools/miri"),
     ("embedded-book", "src/doc/embedded-book"),
     // ("rustc-dev-guide", "src/doc/rustc-dev-guide"),
 ];
 
 fn print_error(tool: &str, submodule: &str) {
     eprintln!();
-    eprintln!("We detected that this PR updated '{}', but its tests failed.", tool);
+    eprintln!("We detected that this PR updated '{tool}', but its tests failed.");
     eprintln!();
-    eprintln!("If you do intend to update '{}', please check the error messages above and", tool);
+    eprintln!("If you do intend to update '{tool}', please check the error messages above and");
     eprintln!("commit another update.");
     eprintln!();
-    eprintln!("If you do NOT intend to update '{}', please ensure you did not accidentally", tool);
-    eprintln!("change the submodule at '{}'. You may ask your reviewer for the", submodule);
+    eprintln!("If you do NOT intend to update '{tool}', please ensure you did not accidentally");
+    eprintln!("change the submodule at '{submodule}'. You may ask your reviewer for the");
     eprintln!("proper steps.");
-    std::process::exit(3);
+    crate::exit!(3);
 }
 
 fn check_changed_files(toolstates: &HashMap<Box<str>, ToolState>) {
@@ -107,8 +105,8 @@ fn check_changed_files(toolstates: &HashMap<Box<str>, ToolState>) {
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("Failed to get changed files: {:?}", e);
-            std::process::exit(1);
+            eprintln!("Failed to get changed files: {e:?}");
+            crate::exit!(1);
         }
     };
 
@@ -116,12 +114,12 @@ fn check_changed_files(toolstates: &HashMap<Box<str>, ToolState>) {
 
     for (tool, submodule) in STABLE_TOOLS.iter().chain(NIGHTLY_TOOLS.iter()) {
         let changed = output.lines().any(|l| l.starts_with('M') && l.ends_with(submodule));
-        eprintln!("Verifying status of {}...", tool);
+        eprintln!("Verifying status of {tool}...");
         if !changed {
             continue;
         }
 
-        eprintln!("This PR updated '{}', verifying if status is 'test-pass'...", submodule);
+        eprintln!("This PR updated '{submodule}', verifying if status is 'test-pass'...");
         if toolstates[*tool] != ToolState::TestPass {
             print_error(tool, submodule);
         }
@@ -160,7 +158,7 @@ impl Step for ToolStateCheck {
     ///   stable tool. That is, the status is not allowed to get worse
     ///   (test-pass to test-fail or build-fail).
     fn run(self, builder: &Builder<'_>) {
-        if builder.config.dry_run {
+        if builder.config.dry_run() {
             return;
         }
 
@@ -174,12 +172,12 @@ impl Step for ToolStateCheck {
         for (tool, _) in STABLE_TOOLS.iter().chain(NIGHTLY_TOOLS.iter()) {
             if !toolstates.contains_key(*tool) {
                 did_error = true;
-                eprintln!("error: Tool `{}` was not recorded in tool state.", tool);
+                eprintln!("error: Tool `{tool}` was not recorded in tool state.");
             }
         }
 
         if did_error {
-            std::process::exit(1);
+            crate::exit!(1);
         }
 
         check_changed_files(&toolstates);
@@ -192,7 +190,7 @@ impl Step for ToolStateCheck {
             if state != ToolState::TestPass {
                 if !is_nightly {
                     did_error = true;
-                    eprintln!("error: Tool `{}` should be test-pass but is {}", tool, state);
+                    eprintln!("error: Tool `{tool}` should be test-pass but is {state}");
                 } else if in_beta_week {
                     let old_state = old_toolstate
                         .iter()
@@ -202,17 +200,15 @@ impl Step for ToolStateCheck {
                     if state < old_state {
                         did_error = true;
                         eprintln!(
-                            "error: Tool `{}` has regressed from {} to {} during beta week.",
-                            tool, old_state, state
+                            "error: Tool `{tool}` has regressed from {old_state} to {state} during beta week."
                         );
                     } else {
                         // This warning only appears in the logs, which most
                         // people won't read. It's mostly here for testing and
                         // debugging.
                         eprintln!(
-                            "warning: Tool `{}` is not test-pass (is `{}`), \
-                            this should be fixed before beta is branched.",
-                            tool, state
+                            "warning: Tool `{tool}` is not test-pass (is `{state}`), \
+                            this should be fixed before beta is branched."
                         );
                     }
                 }
@@ -225,7 +221,7 @@ impl Step for ToolStateCheck {
         }
 
         if did_error {
-            std::process::exit(1);
+            crate::exit!(1);
         }
 
         if builder.config.channel == "nightly" && env::var_os("TOOLSTATE_PUBLISH").is_some() {
@@ -264,10 +260,12 @@ impl Builder<'_> {
     /// `rust.save-toolstates` in `config.toml`. If unspecified, nothing will be
     /// done. The file is updated immediately after this function completes.
     pub fn save_toolstate(&self, tool: &str, state: ToolState) {
+        use std::io::Write;
+
         // If we're in a dry run setting we don't want to save toolstates as
         // that means if we e.g. panic down the line it'll look like we tested
         // everything (but we actually haven't).
-        if self.config.dry_run {
+        if self.config.dry_run() {
             return;
         }
         // Toolstate isn't tracked for clippy or rustfmt, but since most tools do, we avoid checking
@@ -288,7 +286,8 @@ impl Builder<'_> {
             current_toolstates.insert(tool.into(), state);
             t!(file.seek(SeekFrom::Start(0)));
             t!(file.set_len(0));
-            t!(serde_json::to_writer(file, &current_toolstates));
+            t!(serde_json::to_writer(&file, &current_toolstates));
+            t!(writeln!(file)); // make sure this ends in a newline
         }
     }
 }
@@ -322,7 +321,7 @@ fn checkout_toolstate_repo() {
         Err(_) => false,
     };
     if !success {
-        panic!("git clone unsuccessful (status: {:?})", status);
+        panic!("git clone unsuccessful (status: {status:?})");
     }
 }
 
@@ -335,7 +334,7 @@ fn prepare_toolstate_config(token: &str) {
             Err(_) => false,
         };
         if !success {
-            panic!("git config key={} value={} failed (status: {:?})", key, value, status);
+            panic!("git config key={key} value={value} failed (status: {status:?})");
         }
     }
 
@@ -345,7 +344,7 @@ fn prepare_toolstate_config(token: &str) {
     git_config("user.name", "Rust Toolstate Update");
     git_config("credential.helper", "store");
 
-    let credential = format!("https://{}:x-oauth-basic@github.com\n", token,);
+    let credential = format!("https://{token}:x-oauth-basic@github.com\n",);
     let git_credential_path = PathBuf::from(t!(env::var("HOME"))).join(".git-credentials");
     t!(fs::write(&git_credential_path, credential));
 }

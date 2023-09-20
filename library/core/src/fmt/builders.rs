@@ -28,27 +28,25 @@ impl<'buf, 'state> PadAdapter<'buf, 'state> {
 }
 
 impl fmt::Write for PadAdapter<'_, '_> {
-    fn write_str(&mut self, mut s: &str) -> fmt::Result {
-        while !s.is_empty() {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for s in s.split_inclusive('\n') {
             if self.state.on_newline {
                 self.buf.write_str("    ")?;
             }
 
-            let split = match s.find('\n') {
-                Some(pos) => {
-                    self.state.on_newline = true;
-                    pos + 1
-                }
-                None => {
-                    self.state.on_newline = false;
-                    s.len()
-                }
-            };
-            self.buf.write_str(&s[..split])?;
-            s = &s[split..];
+            self.state.on_newline = s.ends_with('\n');
+            self.buf.write_str(s)?;
         }
 
         Ok(())
+    }
+
+    fn write_char(&mut self, c: char) -> fmt::Result {
+        if self.state.on_newline {
+            self.buf.write_str("    ")?;
+        }
+        self.state.on_newline = c == '\n';
+        self.buf.write_char(c)
     }
 }
 
@@ -70,7 +68,7 @@ impl fmt::Write for PadAdapter<'_, '_> {
 /// }
 ///
 /// impl fmt::Debug for Foo {
-///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
 ///         fmt.debug_struct("Foo")
 ///            .field("bar", &self.bar)
 ///            .field("baz", &self.baz)
@@ -119,14 +117,14 @@ impl<'a, 'b: 'a> DebugStruct<'a, 'b> {
     ///            .field("bar", &self.bar) // We add `bar` field.
     ///            .field("another", &self.another) // We add `another` field.
     ///            // We even add a field which doesn't exist (because why not?).
-    ///            .field("not_existing_field", &1)
+    ///            .field("nonexistent_field", &1)
     ///            .finish() // We're good to go!
     ///     }
     /// }
     ///
     /// assert_eq!(
     ///     format!("{:?}", Bar { bar: 10, another: "Hello World".to_string() }),
-    ///     "Bar { bar: 10, another: \"Hello World\", not_existing_field: 1 }",
+    ///     "Bar { bar: 10, another: \"Hello World\", nonexistent_field: 1 }",
     /// );
     /// ```
     #[stable(feature = "debug_builders", since = "1.2.0")]
@@ -259,7 +257,7 @@ impl<'a, 'b: 'a> DebugStruct<'a, 'b> {
 /// struct Foo(i32, String);
 ///
 /// impl fmt::Debug for Foo {
-///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
 ///         fmt.debug_tuple("Foo")
 ///            .field(&self.0)
 ///            .field(&self.1)
@@ -428,7 +426,7 @@ impl<'a, 'b: 'a> DebugInner<'a, 'b> {
 /// struct Foo(Vec<i32>);
 ///
 /// impl fmt::Debug for Foo {
-///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
 ///         fmt.debug_set().entries(self.0.iter()).finish()
 ///     }
 /// }
@@ -528,7 +526,7 @@ impl<'a, 'b: 'a> DebugSet<'a, 'b> {
     ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         fmt.debug_set()
     ///            .entries(self.0.iter())
-    ///            .finish() // Ends the struct formatting.
+    ///            .finish() // Ends the set formatting.
     ///     }
     /// }
     ///
@@ -558,7 +556,7 @@ impl<'a, 'b: 'a> DebugSet<'a, 'b> {
 /// struct Foo(Vec<i32>);
 ///
 /// impl fmt::Debug for Foo {
-///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
 ///         fmt.debug_list().entries(self.0.iter()).finish()
 ///     }
 /// }
@@ -658,7 +656,7 @@ impl<'a, 'b: 'a> DebugList<'a, 'b> {
     ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         fmt.debug_list()
     ///            .entries(self.0.iter())
-    ///            .finish() // Ends the struct formatting.
+    ///            .finish() // Ends the list formatting.
     ///     }
     /// }
     ///
@@ -688,7 +686,7 @@ impl<'a, 'b: 'a> DebugList<'a, 'b> {
 /// struct Foo(Vec<(String, i32)>);
 ///
 /// impl fmt::Debug for Foo {
-///     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
 ///         fmt.debug_map().entries(self.0.iter().map(|&(ref k, ref v)| (k, v))).finish()
 ///     }
 /// }
@@ -915,7 +913,7 @@ impl<'a, 'b: 'a> DebugMap<'a, 'b> {
     ///     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
     ///         fmt.debug_map()
     ///            .entries(self.0.iter().map(|&(ref k, ref v)| (k, v)))
-    ///            .finish() // Ends the struct formatting.
+    ///            .finish() // Ends the map formatting.
     ///     }
     /// }
     ///

@@ -22,7 +22,8 @@ pub(super) fn check<'tcx>(
 
     if let (ty::Ref(_, ty_from, from_mutbl), ty::Ref(_, ty_to, to_mutbl)) = (&from_ty.kind(), &to_ty.kind()) {
         if_chain! {
-            if let (&ty::Slice(slice_ty), &ty::Str) = (&ty_from.kind(), &ty_to.kind());
+            if let ty::Slice(slice_ty) = *ty_from.kind();
+            if ty_to.is_str();
             if let ty::Uint(ty::UintTy::U8) = slice_ty.kind();
             if from_mutbl == to_mutbl;
             then {
@@ -38,7 +39,7 @@ pub(super) fn check<'tcx>(
                     cx,
                     TRANSMUTE_BYTES_TO_STR,
                     e.span,
-                    &format!("transmute from a `{}` to a `{}`", from_ty, to_ty),
+                    &format!("transmute from a `{from_ty}` to a `{to_ty}`"),
                     "consider using",
                     if const_context {
                         format!("std::str::from_utf8_unchecked{postfix}({snippet})")
@@ -63,8 +64,8 @@ pub(super) fn check<'tcx>(
                             };
                             let ty_to_and_mut = ty::TypeAndMut { ty: *ty_to, mutbl: *to_mutbl };
                             let sugg_paren = arg
-                                .as_ty(cx.tcx.mk_ptr(ty_from_and_mut))
-                                .as_ty(cx.tcx.mk_ptr(ty_to_and_mut));
+                                .as_ty(Ty::new_ptr(cx.tcx,ty_from_and_mut))
+                                .as_ty(Ty::new_ptr(cx.tcx,ty_to_and_mut));
                             let sugg = if *to_mutbl == Mutability::Mut {
                                 sugg_paren.mut_addr_deref()
                             } else {
@@ -73,7 +74,7 @@ pub(super) fn check<'tcx>(
                             diag.span_suggestion(
                                 e.span,
                                 "try",
-                                sugg.to_string(),
+                                sugg,
                                 Applicability::Unspecified,
                             );
                         },

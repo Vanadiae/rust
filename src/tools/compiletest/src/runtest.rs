@@ -6,19 +6,19 @@ use crate::common::{Assembly, Incremental, JsDocTest, MirOpt, RunMake, RustdocJs
 use crate::common::{Codegen, CodegenUnits, DebugInfo, Debugger, Rustdoc};
 use crate::common::{CompareMode, FailMode, PassMode};
 use crate::common::{Config, TestPaths};
-use crate::common::{Pretty, RunPassValgrind};
-use crate::common::{UI_RUN_STDERR, UI_RUN_STDOUT};
+use crate::common::{CoverageMap, Pretty, RunCoverage, RunPassValgrind};
+use crate::common::{UI_COVERAGE, UI_COVERAGE_MAP, UI_RUN_STDERR, UI_RUN_STDOUT};
 use crate::compute_diff::{write_diff, write_filtered_diff};
 use crate::errors::{self, Error, ErrorKind};
 use crate::header::TestProps;
 use crate::json;
-use crate::read2::read2_abbreviated;
-use crate::util::get_pointer_width;
-use crate::util::{logv, PathBufExt};
+use crate::read2::{read2_abbreviated, Truncated};
+use crate::util::{add_dylib_path, dylib_env_var, logv, PathBufExt};
 use crate::ColorConfig;
 use regex::{Captures, Regex};
 use rustfix::{apply_suggestions, get_suggestions_from_json, Filter};
 
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -27,32 +27,38 @@ use std::fs::{self, create_dir_all, File, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::prelude::*;
 use std::io::{self, BufReader};
+use std::iter;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::str;
+use std::sync::Arc;
 
+use anyhow::Context;
 use glob::glob;
-use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
 use tracing::*;
 
 use crate::extract_gdb_version;
 use crate::is_android_gdb_target;
 
 mod debugger;
-use debugger::{check_debugger_output, DebuggerCommands};
+use debugger::DebuggerCommands;
 
 #[cfg(test)]
 mod tests;
 
+const FAKE_SRC_BASE: &str = "fake-test-src-base";
+
 #[cfg(windows)]
 fn disable_error_reporting<F: FnOnce() -> R, R>(f: F) -> R {
     use std::sync::Mutex;
-    use winapi::um::errhandlingapi::SetErrorMode;
-    use winapi::um::winbase::SEM_NOGPFAULTERRORBOX;
 
-    lazy_static! {
-        static ref LOCK: Mutex<()> = Mutex::new(());
-    }
+    use windows::Win32::System::Diagnostics::Debug::{
+        SetErrorMode, SEM_NOGPFAULTERRORBOX, THREAD_ERROR_MODE,
+    };
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
     // Error mode is a global variable, so lock it so only one thread will change it
     let _lock = LOCK.lock().unwrap();
 
@@ -61,6 +67,7 @@ fn disable_error_reporting<F: FnOnce() -> R, R>(f: F) -> R {
     // termination by design. This mode is inherited by all child processes.
     unsafe {
         let old_mode = SetErrorMode(SEM_NOGPFAULTERRORBOX); // read inherited flags
+        let old_mode = THREAD_ERROR_MODE(old_mode);
         SetErrorMode(old_mode | SEM_NOGPFAULTERRORBOX);
         let r = f();
         SetErrorMode(old_mode);
@@ -71,19 +78,6 @@ fn disable_error_reporting<F: FnOnce() -> R, R>(f: F) -> R {
 #[cfg(not(windows))]
 fn disable_error_reporting<F: FnOnce() -> R, R>(f: F) -> R {
     f()
-}
-
-/// The name of the environment variable that holds dynamic library locations.
-pub fn dylib_env_var() -> &'static str {
-    if cfg!(windows) {
-        "PATH"
-    } else if cfg!(target_os = "macos") {
-        "DYLD_LIBRARY_PATH"
-    } else if cfg!(target_os = "haiku") {
-        "LIBRARY_PATH"
-    } else {
-        "LD_LIBRARY_PATH"
-    }
 }
 
 /// The platform-specific library name
@@ -105,7 +99,7 @@ pub fn get_lib_name(lib: &str, dylib: bool) -> String {
     }
 }
 
-pub fn run(config: Config, testpaths: &TestPaths, revision: Option<&str>) {
+pub fn run(config: Arc<Config>, testpaths: &TestPaths, revision: Option<&str>) {
     match &*config.target {
         "arm-linux-androideabi"
         | "armv7-linux-androideabi"
@@ -130,12 +124,20 @@ pub fn run(config: Config, testpaths: &TestPaths, revision: Option<&str>) {
     }
     debug!("running {:?}", testpaths.file.display());
     let mut props = TestProps::from_file(&testpaths.file, revision, &config);
+
+    // For non-incremental (i.e. regular UI) tests, the incremental directory
+    // takes into account the revision name, since the revisions are independent
+    // of each other and can race.
     if props.incremental {
-        props.incremental_dir = Some(incremental_dir(&config, testpaths));
+        props.incremental_dir = Some(incremental_dir(&config, testpaths, revision));
     }
 
     let cx = TestCx { config: &config, props: &props, testpaths, revision };
-    create_dir_all(&cx.output_base_dir()).unwrap();
+    create_dir_all(&cx.output_base_dir())
+        .with_context(|| {
+            format!("failed to create output base directory {}", cx.output_base_dir().display())
+        })
+        .unwrap();
     if props.incremental {
         cx.init_incremental_test();
     }
@@ -221,11 +223,14 @@ enum WillExecute {
     Disabled,
 }
 
-/// Should `--emit metadata` be used?
+/// What value should be passed to `--emit`?
 #[derive(Copy, Clone)]
-enum EmitMetadata {
-    Yes,
-    No,
+enum Emit {
+    None,
+    Metadata,
+    LlvmIr,
+    Asm,
+    LinkArgsAsm,
 }
 
 impl<'test> TestCx<'test> {
@@ -249,6 +254,8 @@ impl<'test> TestCx<'test> {
             MirOpt => self.run_mir_opt_test(),
             Assembly => self.run_assembly_test(),
             JsDocTest => self.run_js_doc_test(),
+            CoverageMap => self.run_coverage_map_test(),
+            RunCoverage => self.run_coverage_test(),
         }
     }
 
@@ -284,13 +291,15 @@ impl<'test> TestCx<'test> {
             Incremental => {
                 let revision =
                     self.revision.expect("incremental tests require a list of revisions");
-                if revision.starts_with("rpass") || revision.starts_with("rfail") {
+                if revision.starts_with("cpass")
+                    || revision.starts_with("rpass")
+                    || revision.starts_with("rfail")
+                {
                     true
                 } else if revision.starts_with("cfail") {
-                    // FIXME: would be nice if incremental revs could start with "cpass"
                     pm.is_some()
                 } else {
-                    panic!("revision name must begin with rpass, rfail, or cfail");
+                    panic!("revision name must begin with cpass, rpass, rfail, or cfail");
                 }
             }
             mode => panic!("unimplemented for mode {:?}", mode),
@@ -310,7 +319,9 @@ impl<'test> TestCx<'test> {
                 );
             }
 
-            self.check_correct_failure_status(proc_res);
+            if !self.props.dont_check_failure_status {
+                self.check_correct_failure_status(proc_res);
+            }
         }
     }
 
@@ -323,12 +334,13 @@ impl<'test> TestCx<'test> {
         let output_to_check = self.get_output(&proc_res);
         let expected_errors = errors::load_errors(&self.testpaths.file, self.revision);
         if !expected_errors.is_empty() {
-            if !self.props.error_patterns.is_empty() {
+            if !self.props.error_patterns.is_empty() || !self.props.regex_error_patterns.is_empty()
+            {
                 self.fatal("both error pattern and expected errors specified");
             }
             self.check_expected_errors(expected_errors, &proc_res);
         } else {
-            self.check_error_patterns(&output_to_check, &proc_res, pm);
+            self.check_all_error_patterns(&output_to_check, &proc_res, pm);
         }
         if self.props.should_ice {
             match proc_res.status.code() {
@@ -363,7 +375,7 @@ impl<'test> TestCx<'test> {
 
         let output_to_check = self.get_output(&proc_res);
         self.check_correct_failure_status(&proc_res);
-        self.check_error_patterns(&output_to_check, &proc_res, pm);
+        self.check_all_error_patterns(&output_to_check, &proc_res, pm);
     }
 
     fn get_output(&self, proc_res: &ProcRes) -> String {
@@ -375,7 +387,7 @@ impl<'test> TestCx<'test> {
     }
 
     fn check_correct_failure_status(&self, proc_res: &ProcRes) {
-        let expected_status = Some(self.props.failure_status);
+        let expected_status = Some(self.props.failure_status.unwrap_or(1));
         let received_status = proc_res.status.code();
 
         if expected_status != received_status {
@@ -389,6 +401,20 @@ impl<'test> TestCx<'test> {
         }
     }
 
+    fn run_cpass_test(&self) {
+        let emit_metadata = self.should_emit_metadata(self.pass_mode());
+        let proc_res = self.compile_test(WillExecute::No, emit_metadata);
+
+        if !proc_res.status.success() {
+            self.fatal_proc_rec("compilation failed!", &proc_res);
+        }
+
+        // FIXME(#41968): Move this check to tidy?
+        if !errors::load_errors(&self.testpaths.file, self.revision).is_empty() {
+            self.fatal("compile-pass tests with expected warnings should be moved to ui/");
+        }
+    }
+
     fn run_rpass_test(&self) {
         let emit_metadata = self.should_emit_metadata(self.pass_mode());
         let should_run = self.run_if_enabled();
@@ -398,16 +424,14 @@ impl<'test> TestCx<'test> {
             self.fatal_proc_rec("compilation failed!", &proc_res);
         }
 
+        // FIXME(#41968): Move this check to tidy?
+        if !errors::load_errors(&self.testpaths.file, self.revision).is_empty() {
+            self.fatal("run-pass tests with expected warnings should be moved to ui/");
+        }
+
         if let WillExecute::Disabled = should_run {
             return;
         }
-
-        // FIXME(#41968): Move this check to tidy?
-        let expected_errors = errors::load_errors(&self.testpaths.file, self.revision);
-        assert!(
-            expected_errors.is_empty(),
-            "run-pass tests with expected warnings should be moved to ui/"
-        );
 
         let proc_res = self.exec_compiled_test();
         if !proc_res.status.success() {
@@ -424,7 +448,7 @@ impl<'test> TestCx<'test> {
         }
 
         let should_run = self.run_if_enabled();
-        let mut proc_res = self.compile_test(should_run, EmitMetadata::No);
+        let mut proc_res = self.compile_test(should_run, Emit::None);
 
         if !proc_res.status.success() {
             self.fatal_proc_rec("compilation failed!", &proc_res);
@@ -442,6 +466,357 @@ impl<'test> TestCx<'test> {
         if !proc_res.status.success() {
             self.fatal_proc_rec("test run failed!", &proc_res);
         }
+    }
+
+    fn run_coverage_map_test(&self) {
+        let Some(coverage_dump_path) = &self.config.coverage_dump_path else {
+            self.fatal("missing --coverage-dump");
+        };
+
+        let proc_res = self.compile_test_and_save_ir();
+        if !proc_res.status.success() {
+            self.fatal_proc_rec("compilation failed!", &proc_res);
+        }
+        drop(proc_res);
+
+        let llvm_ir_path = self.output_base_name().with_extension("ll");
+
+        let mut dump_command = Command::new(coverage_dump_path);
+        dump_command.arg(llvm_ir_path);
+        let proc_res = self.run_command_to_procres(&mut dump_command);
+        if !proc_res.status.success() {
+            self.fatal_proc_rec("coverage-dump failed!", &proc_res);
+        }
+
+        let kind = UI_COVERAGE_MAP;
+
+        let expected_coverage_dump = self.load_expected_output(kind);
+        let actual_coverage_dump = self.normalize_output(&proc_res.stdout, &[]);
+
+        let coverage_dump_errors = self.compare_output(
+            kind,
+            &actual_coverage_dump,
+            &expected_coverage_dump,
+            self.props.compare_output_lines_by_subset,
+        );
+
+        if coverage_dump_errors > 0 {
+            self.fatal_proc_rec(
+                &format!("{coverage_dump_errors} errors occurred comparing coverage output."),
+                &proc_res,
+            );
+        }
+    }
+
+    fn run_coverage_test(&self) {
+        let should_run = self.run_if_enabled();
+        let proc_res = self.compile_test(should_run, Emit::None);
+
+        if !proc_res.status.success() {
+            self.fatal_proc_rec("compilation failed!", &proc_res);
+        }
+        drop(proc_res);
+
+        if let WillExecute::Disabled = should_run {
+            return;
+        }
+
+        let profraw_path = self.output_base_dir().join("default.profraw");
+        let profdata_path = self.output_base_dir().join("default.profdata");
+
+        // Delete any existing profraw/profdata files to rule out unintended
+        // interference between repeated test runs.
+        if profraw_path.exists() {
+            std::fs::remove_file(&profraw_path).unwrap();
+        }
+        if profdata_path.exists() {
+            std::fs::remove_file(&profdata_path).unwrap();
+        }
+
+        let proc_res = self.exec_compiled_test_general(
+            &[("LLVM_PROFILE_FILE", &profraw_path.to_str().unwrap())],
+            false,
+        );
+        if self.props.failure_status.is_some() {
+            self.check_correct_failure_status(&proc_res);
+        } else if !proc_res.status.success() {
+            self.fatal_proc_rec("test run failed!", &proc_res);
+        }
+        drop(proc_res);
+
+        let mut profraw_paths = vec![profraw_path];
+        let mut bin_paths = vec![self.make_exe_name()];
+
+        if self.config.suite == "run-coverage-rustdoc" {
+            self.run_doctests_for_coverage(&mut profraw_paths, &mut bin_paths);
+        }
+
+        // Run `llvm-profdata merge` to index the raw coverage output.
+        let proc_res = self.run_llvm_tool("llvm-profdata", |cmd| {
+            cmd.args(["merge", "--sparse", "--output"]);
+            cmd.arg(&profdata_path);
+            cmd.args(&profraw_paths);
+        });
+        if !proc_res.status.success() {
+            self.fatal_proc_rec("llvm-profdata merge failed!", &proc_res);
+        }
+        drop(proc_res);
+
+        // Run `llvm-cov show` to produce a coverage report in text format.
+        let proc_res = self.run_llvm_tool("llvm-cov", |cmd| {
+            cmd.args(["show", "--format=text", "--show-line-counts-or-regions"]);
+
+            cmd.arg("--Xdemangler");
+            cmd.arg(self.config.rust_demangler_path.as_ref().unwrap());
+
+            cmd.arg("--instr-profile");
+            cmd.arg(&profdata_path);
+
+            for bin in &bin_paths {
+                cmd.arg("--object");
+                cmd.arg(bin);
+            }
+        });
+        if !proc_res.status.success() {
+            self.fatal_proc_rec("llvm-cov show failed!", &proc_res);
+        }
+
+        let kind = UI_COVERAGE;
+
+        let expected_coverage = self.load_expected_output(kind);
+        let normalized_actual_coverage =
+            self.normalize_coverage_output(&proc_res.stdout).unwrap_or_else(|err| {
+                self.fatal_proc_rec(&err, &proc_res);
+            });
+
+        let coverage_errors = self.compare_output(
+            kind,
+            &normalized_actual_coverage,
+            &expected_coverage,
+            self.props.compare_output_lines_by_subset,
+        );
+
+        if coverage_errors > 0 {
+            self.fatal_proc_rec(
+                &format!("{} errors occurred comparing coverage output.", coverage_errors),
+                &proc_res,
+            );
+        }
+    }
+
+    /// Run any doctests embedded in this test file, and add any resulting
+    /// `.profraw` files and doctest executables to the given vectors.
+    fn run_doctests_for_coverage(
+        &self,
+        profraw_paths: &mut Vec<PathBuf>,
+        bin_paths: &mut Vec<PathBuf>,
+    ) {
+        // Put .profraw files and doctest executables in dedicated directories,
+        // to make it easier to glob them all later.
+        let profraws_dir = self.output_base_dir().join("doc_profraws");
+        let bins_dir = self.output_base_dir().join("doc_bins");
+
+        // Remove existing directories to prevent cross-run interference.
+        if profraws_dir.try_exists().unwrap() {
+            std::fs::remove_dir_all(&profraws_dir).unwrap();
+        }
+        if bins_dir.try_exists().unwrap() {
+            std::fs::remove_dir_all(&bins_dir).unwrap();
+        }
+
+        let mut rustdoc_cmd =
+            Command::new(self.config.rustdoc_path.as_ref().expect("--rustdoc-path not passed"));
+
+        // In general there will be multiple doctest binaries running, so we
+        // tell the profiler runtime to write their coverage data into separate
+        // profraw files.
+        rustdoc_cmd.env("LLVM_PROFILE_FILE", profraws_dir.join("%p-%m.profraw"));
+
+        rustdoc_cmd.args(["--test", "-Cinstrument-coverage"]);
+
+        // Without this, the doctests complain about not being able to find
+        // their enclosing file's crate for some reason.
+        rustdoc_cmd.args(["--crate-name", "workaround_for_79771"]);
+
+        // Persist the doctest binaries so that `llvm-cov show` can read their
+        // embedded coverage mappings later.
+        rustdoc_cmd.arg("-Zunstable-options");
+        rustdoc_cmd.arg("--persist-doctests");
+        rustdoc_cmd.arg(&bins_dir);
+
+        rustdoc_cmd.arg("-L");
+        rustdoc_cmd.arg(self.aux_output_dir_name());
+
+        rustdoc_cmd.arg(&self.testpaths.file);
+
+        let proc_res = self.compose_and_run_compiler(rustdoc_cmd, None);
+        if !proc_res.status.success() {
+            self.fatal_proc_rec("rustdoc --test failed!", &proc_res)
+        }
+
+        fn glob_iter(path: impl AsRef<Path>) -> impl Iterator<Item = PathBuf> {
+            let path_str = path.as_ref().to_str().unwrap();
+            let iter = glob(path_str).unwrap();
+            iter.map(Result::unwrap)
+        }
+
+        // Find all profraw files in the profraw directory.
+        for p in glob_iter(profraws_dir.join("*.profraw")) {
+            profraw_paths.push(p);
+        }
+        // Find all executables in the `--persist-doctests` directory, while
+        // avoiding other file types (e.g. `.pdb` on Windows). This doesn't
+        // need to be perfect, as long as it can handle the files actually
+        // produced by `rustdoc --test`.
+        for p in glob_iter(bins_dir.join("**/*")) {
+            let is_bin = p.is_file()
+                && match p.extension() {
+                    None => true,
+                    Some(ext) => ext == OsStr::new("exe"),
+                };
+            if is_bin {
+                bin_paths.push(p);
+            }
+        }
+    }
+
+    fn run_llvm_tool(&self, name: &str, configure_cmd_fn: impl FnOnce(&mut Command)) -> ProcRes {
+        let tool_path = self
+            .config
+            .llvm_bin_dir
+            .as_ref()
+            .expect("this test expects the LLVM bin dir to be available")
+            .join(name);
+
+        let mut cmd = Command::new(tool_path);
+        configure_cmd_fn(&mut cmd);
+
+        self.run_command_to_procres(&mut cmd)
+    }
+
+    fn run_command_to_procres(&self, cmd: &mut Command) -> ProcRes {
+        let output = cmd.output().unwrap_or_else(|e| panic!("failed to exec `{cmd:?}`: {e:?}"));
+
+        let proc_res = ProcRes {
+            status: output.status,
+            stdout: String::from_utf8(output.stdout).unwrap(),
+            stderr: String::from_utf8(output.stderr).unwrap(),
+            truncated: Truncated::No,
+            cmdline: format!("{cmd:?}"),
+        };
+        self.dump_output(&proc_res.stdout, &proc_res.stderr);
+
+        proc_res
+    }
+
+    fn normalize_coverage_output(&self, coverage: &str) -> Result<String, String> {
+        let normalized = self.normalize_output(coverage, &[]);
+        let normalized = Self::anonymize_coverage_line_numbers(&normalized);
+
+        let mut lines = normalized.lines().collect::<Vec<_>>();
+
+        Self::sort_coverage_file_sections(&mut lines)?;
+        Self::sort_coverage_subviews(&mut lines)?;
+
+        let joined_lines = lines.iter().flat_map(|line| [line, "\n"]).collect::<String>();
+        Ok(joined_lines)
+    }
+
+    /// Replace line numbers in coverage reports with the placeholder `LL`,
+    /// so that the tests are less sensitive to lines being added/removed.
+    fn anonymize_coverage_line_numbers(coverage: &str) -> Cow<'_, str> {
+        // The coverage reporter prints line numbers at the start of a line.
+        // They are truncated or left-padded to occupy exactly 5 columns.
+        // (`LineNumberColumnWidth` in `SourceCoverageViewText.cpp`.)
+        // A pipe character `|` appears immediately after the final digit.
+        //
+        // Line numbers that appear inside expansion/instantiation subviews
+        // have an additional prefix of `  |` for each nesting level.
+        static LINE_NUMBER_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"(?m:^)(?<prefix>(?:  \|)*) *[0-9]+\|").unwrap());
+        LINE_NUMBER_RE.replace_all(coverage, "$prefix   LL|")
+    }
+
+    /// Coverage reports can describe multiple source files, separated by
+    /// blank lines. The order of these files is unpredictable (since it
+    /// depends on implementation details), so we need to sort the file
+    /// sections into a consistent order before comparing against a snapshot.
+    fn sort_coverage_file_sections(coverage_lines: &mut Vec<&str>) -> Result<(), String> {
+        // Group the lines into file sections, separated by blank lines.
+        let mut sections = coverage_lines.split(|line| line.is_empty()).collect::<Vec<_>>();
+
+        // The last section should be empty, representing an extra trailing blank line.
+        if !sections.last().is_some_and(|last| last.is_empty()) {
+            return Err("coverage report should end with an extra blank line".to_owned());
+        }
+
+        // Sort the file sections (not including the final empty "section").
+        let except_last = sections.len() - 1;
+        (&mut sections[..except_last]).sort();
+
+        // Join the file sections back into a flat list of lines, with
+        // sections separated by blank lines.
+        let joined = sections.join(&[""] as &[_]);
+        assert_eq!(joined.len(), coverage_lines.len());
+        *coverage_lines = joined;
+
+        Ok(())
+    }
+
+    fn sort_coverage_subviews(coverage_lines: &mut Vec<&str>) -> Result<(), String> {
+        let mut output_lines = Vec::new();
+
+        // We accumulate a list of zero or more "subviews", where each
+        // subview is a list of one or more lines.
+        let mut subviews: Vec<Vec<&str>> = Vec::new();
+
+        fn flush<'a>(subviews: &mut Vec<Vec<&'a str>>, output_lines: &mut Vec<&'a str>) {
+            if subviews.is_empty() {
+                return;
+            }
+
+            // Take and clear the list of accumulated subviews.
+            let mut subviews = std::mem::take(subviews);
+
+            // The last "subview" should be just a boundary line on its own,
+            // so exclude it when sorting the other subviews.
+            let except_last = subviews.len() - 1;
+            (&mut subviews[..except_last]).sort();
+
+            for view in subviews {
+                for line in view {
+                    output_lines.push(line);
+                }
+            }
+        }
+
+        for (line, line_num) in coverage_lines.iter().zip(1..) {
+            if line.starts_with("  ------------------") {
+                // This is a subview boundary line, so start a new subview.
+                subviews.push(vec![line]);
+            } else if line.starts_with("  |") {
+                // Add this line to the current subview.
+                subviews
+                    .last_mut()
+                    .ok_or(format!(
+                        "unexpected subview line outside of a subview on line {line_num}"
+                    ))?
+                    .push(line);
+            } else {
+                // This line is not part of a subview, so sort and print any
+                // accumulated subviews, and then print the line as-is.
+                flush(&mut subviews, &mut output_lines);
+                output_lines.push(line);
+            }
+        }
+
+        flush(&mut subviews, &mut output_lines);
+        assert!(subviews.is_empty());
+
+        assert_eq!(output_lines.len(), coverage_lines.len());
+        *coverage_lines = output_lines;
+
+        Ok(())
     }
 
     fn run_pretty_test(&self) {
@@ -556,12 +931,11 @@ impl<'test> TestCx<'test> {
             .args(&["--target", &self.config.target])
             .arg("-L")
             .arg(&aux_dir)
+            .arg("-A")
+            .arg("internal_features")
             .args(&self.props.compile_flags)
             .envs(self.props.rustc_env.clone());
-        self.maybe_add_external_args(
-            &mut rustc,
-            self.split_maybe_args(&self.config.target_rustcflags),
-        );
+        self.maybe_add_external_args(&mut rustc, &self.config.target_rustcflags);
 
         let src = match read_from {
             ReadFrom::Stdin(src) => Some(src),
@@ -627,12 +1001,11 @@ impl<'test> TestCx<'test> {
             .arg("-L")
             .arg(&self.config.build_base)
             .arg("-L")
-            .arg(aux_dir);
+            .arg(aux_dir)
+            .arg("-A")
+            .arg("internal_features");
         self.set_revision_flags(&mut rustc);
-        self.maybe_add_external_args(
-            &mut rustc,
-            self.split_maybe_args(&self.config.target_rustcflags),
-        );
+        self.maybe_add_external_args(&mut rustc, &self.config.target_rustcflags);
         rustc.args(&self.props.compile_flags);
 
         self.compose_and_run_compiler(rustc, Some(src))
@@ -647,8 +1020,6 @@ impl<'test> TestCx<'test> {
     }
 
     fn run_debuginfo_cdb_test(&self) {
-        assert!(self.revision.is_none(), "revisions not relevant here");
-
         let config = Config {
             target_rustcflags: self.cleanup_debug_info_options(&self.config.target_rustcflags),
             host_rustcflags: self.cleanup_debug_info_options(&self.config.host_rustcflags),
@@ -678,7 +1049,7 @@ impl<'test> TestCx<'test> {
 
         // compile test file (it should have 'compile-flags:-g' in the header)
         let should_run = self.run_if_enabled();
-        let compile_result = self.compile_test(should_run, EmitMetadata::No);
+        let compile_result = self.compile_test(should_run, Emit::None);
         if !compile_result.status.success() {
             self.fatal_proc_rec("compilation failed!", &compile_result);
         }
@@ -693,11 +1064,13 @@ impl<'test> TestCx<'test> {
         };
 
         // Parse debugger commands etc from test files
-        let DebuggerCommands { commands, check_lines, breakpoint_lines, .. } =
-            match DebuggerCommands::parse_from(&self.testpaths.file, self.config, prefixes) {
-                Ok(cmds) => cmds,
-                Err(e) => self.fatal(&e),
-            };
+        let dbg_cmds = DebuggerCommands::parse_from(
+            &self.testpaths.file,
+            self.config,
+            prefixes,
+            self.revision,
+        )
+        .unwrap_or_else(|e| self.fatal(&e));
 
         // https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/debugger-commands
         let mut script_str = String::with_capacity(2048);
@@ -714,17 +1087,17 @@ impl<'test> TestCx<'test> {
 
         // Set breakpoints on every line that contains the string "#break"
         let source_file_name = self.testpaths.file.file_name().unwrap().to_string_lossy();
-        for line in &breakpoint_lines {
+        for line in &dbg_cmds.breakpoint_lines {
             script_str.push_str(&format!("bp `{}:{}`\n", source_file_name, line));
         }
 
         // Append the other `cdb-command:`s
-        for line in &commands {
+        for line in &dbg_cmds.commands {
             script_str.push_str(line);
             script_str.push_str("\n");
         }
 
-        script_str.push_str("\nqq\n"); // Quit the debugger (including remote debugger, if any)
+        script_str.push_str("qq\n"); // Quit the debugger (including remote debugger, if any)
 
         // Write the script into a file
         debug!("script_str = {}", script_str);
@@ -749,14 +1122,12 @@ impl<'test> TestCx<'test> {
             self.fatal_proc_rec("Error while running CDB", &debugger_run_result);
         }
 
-        if let Err(e) = check_debugger_output(&debugger_run_result, &check_lines) {
+        if let Err(e) = dbg_cmds.check_output(&debugger_run_result) {
             self.fatal_proc_rec(&e, &debugger_run_result);
         }
     }
 
     fn run_debuginfo_gdb_test(&self) {
-        assert!(self.revision.is_none(), "revisions not relevant here");
-
         let config = Config {
             target_rustcflags: self.cleanup_debug_info_options(&self.config.target_rustcflags),
             host_rustcflags: self.cleanup_debug_info_options(&self.config.host_rustcflags),
@@ -781,16 +1152,18 @@ impl<'test> TestCx<'test> {
             PREFIXES
         };
 
-        let DebuggerCommands { commands, check_lines, breakpoint_lines } =
-            match DebuggerCommands::parse_from(&self.testpaths.file, self.config, prefixes) {
-                Ok(cmds) => cmds,
-                Err(e) => self.fatal(&e),
-            };
-        let mut cmds = commands.join("\n");
+        let dbg_cmds = DebuggerCommands::parse_from(
+            &self.testpaths.file,
+            self.config,
+            prefixes,
+            self.revision,
+        )
+        .unwrap_or_else(|e| self.fatal(&e));
+        let mut cmds = dbg_cmds.commands.join("\n");
 
         // compile test file (it should have 'compile-flags:-g' in the header)
         let should_run = self.run_if_enabled();
-        let compiler_run_result = self.compile_test(should_run, EmitMetadata::No);
+        let compiler_run_result = self.compile_test(should_run, Emit::None);
         if !compiler_run_result.status.success() {
             self.fatal_proc_rec("compilation failed!", &compiler_run_result);
         }
@@ -820,13 +1193,14 @@ impl<'test> TestCx<'test> {
                  ./{}/stage2/lib/rustlib/{}/lib/\n",
                 self.config.host, self.config.target
             ));
-            for line in &breakpoint_lines {
+            for line in &dbg_cmds.breakpoint_lines {
                 script_str.push_str(
-                    &format!(
+                    format!(
                         "break {:?}:{}\n",
                         self.testpaths.file.file_name().unwrap().to_string_lossy(),
                         *line
-                    )[..],
+                    )
+                    .as_str(),
                 );
             }
             script_str.push_str(&cmds);
@@ -842,12 +1216,12 @@ impl<'test> TestCx<'test> {
                 .arg(&exe_file)
                 .arg(&self.config.adb_test_dir)
                 .status()
-                .unwrap_or_else(|_| panic!("failed to exec `{:?}`", adb_path));
+                .unwrap_or_else(|e| panic!("failed to exec `{adb_path:?}`: {e:?}"));
 
             Command::new(adb_path)
                 .args(&["forward", "tcp:5039", "tcp:5039"])
                 .status()
-                .unwrap_or_else(|_| panic!("failed to exec `{:?}`", adb_path));
+                .unwrap_or_else(|e| panic!("failed to exec `{adb_path:?}`: {e:?}"));
 
             let adb_arg = format!(
                 "export LD_LIBRARY_PATH={}; \
@@ -864,7 +1238,7 @@ impl<'test> TestCx<'test> {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
                 .spawn()
-                .unwrap_or_else(|_| panic!("failed to exec `{:?}`", adb_path));
+                .unwrap_or_else(|e| panic!("failed to exec `{adb_path:?}`: {e:?}"));
 
             // Wait for the gdbserver to print out "Listening on port ..."
             // at which point we know that it's started and then we can
@@ -889,7 +1263,7 @@ impl<'test> TestCx<'test> {
             let Output { status, stdout, stderr } = Command::new(&gdb_path)
                 .args(debugger_opts)
                 .output()
-                .unwrap_or_else(|_| panic!("failed to exec `{:?}`", gdb_path));
+                .unwrap_or_else(|e| panic!("failed to exec `{gdb_path:?}`: {e:?}"));
             let cmdline = {
                 let mut gdb = Command::new(&format!("{}-gdb", self.config.target));
                 gdb.args(debugger_opts);
@@ -902,6 +1276,7 @@ impl<'test> TestCx<'test> {
                 status,
                 stdout: String::from_utf8(stdout).unwrap(),
                 stderr: String::from_utf8(stderr).unwrap(),
+                truncated: Truncated::No,
                 cmdline,
             };
             if adb.kill().is_err() {
@@ -967,7 +1342,7 @@ impl<'test> TestCx<'test> {
             }
 
             // Add line breakpoints
-            for line in &breakpoint_lines {
+            for line in &dbg_cmds.breakpoint_lines {
                 script_str.push_str(&format!(
                     "break '{}':{}\n",
                     self.testpaths.file.file_name().unwrap().to_string_lossy(),
@@ -988,7 +1363,12 @@ impl<'test> TestCx<'test> {
                 &["-quiet".as_ref(), "-batch".as_ref(), "-nx".as_ref(), &debugger_script];
 
             let mut gdb = Command::new(self.config.gdb.as_ref().unwrap());
-            gdb.args(debugger_opts).env("PYTHONPATH", rust_pp_module_abs_path);
+            let pythonpath = if let Ok(pp) = std::env::var("PYTHONPATH") {
+                format!("{pp}:{rust_pp_module_abs_path}")
+            } else {
+                rust_pp_module_abs_path
+            };
+            gdb.args(debugger_opts).env("PYTHONPATH", pythonpath);
 
             debugger_run_result =
                 self.compose_and_run(gdb, self.config.run_lib_path.to_str().unwrap(), None, None);
@@ -998,14 +1378,12 @@ impl<'test> TestCx<'test> {
             self.fatal_proc_rec("gdb failed to execute", &debugger_run_result);
         }
 
-        if let Err(e) = check_debugger_output(&debugger_run_result, &check_lines) {
+        if let Err(e) = dbg_cmds.check_output(&debugger_run_result) {
             self.fatal_proc_rec(&e, &debugger_run_result);
         }
     }
 
     fn run_debuginfo_lldb_test(&self) {
-        assert!(self.revision.is_none(), "revisions not relevant here");
-
         if self.config.lldb_python_dir.is_none() {
             self.fatal("Can't run LLDB test because LLDB's python path is not set.");
         }
@@ -1024,7 +1402,7 @@ impl<'test> TestCx<'test> {
     fn run_debuginfo_lldb_test_no_opt(&self) {
         // compile test file (it should have 'compile-flags:-g' in the header)
         let should_run = self.run_if_enabled();
-        let compile_result = self.compile_test(should_run, EmitMetadata::No);
+        let compile_result = self.compile_test(should_run, Emit::None);
         if !compile_result.status.success() {
             self.fatal_proc_rec("compilation failed!", &compile_result);
         }
@@ -1057,11 +1435,13 @@ impl<'test> TestCx<'test> {
         };
 
         // Parse debugger commands etc from test files
-        let DebuggerCommands { commands, check_lines, breakpoint_lines, .. } =
-            match DebuggerCommands::parse_from(&self.testpaths.file, self.config, prefixes) {
-                Ok(cmds) => cmds,
-                Err(e) => self.fatal(&e),
-            };
+        let dbg_cmds = DebuggerCommands::parse_from(
+            &self.testpaths.file,
+            self.config,
+            prefixes,
+            self.revision,
+        )
+        .unwrap_or_else(|e| self.fatal(&e));
 
         // Write debugger script:
         // We don't want to hang when calling `quit` while the process is still running
@@ -1094,7 +1474,17 @@ impl<'test> TestCx<'test> {
             "^(core::([a-z_]+::)+)Ref<.+>$",
             "^(core::([a-z_]+::)+)RefMut<.+>$",
             "^(core::([a-z_]+::)+)RefCell<.+>$",
+            "^core::num::([a-z_]+::)*NonZero.+$",
         ];
+
+        // In newer versions of lldb, persistent results (the `$N =` part at the start of
+        // expressions you have evaluated that let you re-use the result) aren't printed, but lots
+        // of rustc's debuginfo tests rely on these, so re-enable this.
+        // See <https://reviews.llvm.org/rG385496385476fc9735da5fa4acabc34654e8b30d>.
+        script_str.push_str("command unalias print\n");
+        script_str.push_str("command alias print expr --\n");
+        script_str.push_str("command unalias p\n");
+        script_str.push_str("command alias p expr --\n");
 
         script_str
             .push_str(&format!("command script import {}\n", &rust_pp_module_abs_path[..])[..]);
@@ -1109,7 +1499,7 @@ impl<'test> TestCx<'test> {
 
         // Set breakpoints on every line that contains the string "#break"
         let source_file_name = self.testpaths.file.file_name().unwrap().to_string_lossy();
-        for line in &breakpoint_lines {
+        for line in &dbg_cmds.breakpoint_lines {
             script_str.push_str(&format!(
                 "breakpoint set --file '{}' --line {}\n",
                 source_file_name, line
@@ -1117,7 +1507,7 @@ impl<'test> TestCx<'test> {
         }
 
         // Append the other commands
-        for line in &commands {
+        for line in &dbg_cmds.commands {
             script_str.push_str(line);
             script_str.push_str("\n");
         }
@@ -1137,7 +1527,7 @@ impl<'test> TestCx<'test> {
             self.fatal_proc_rec("Error while running LLDB", &debugger_run_result);
         }
 
-        if let Err(e) = check_debugger_output(&debugger_run_result, &check_lines) {
+        if let Err(e) = dbg_cmds.check_output(&debugger_run_result) {
             self.fatal_proc_rec(&e, &debugger_run_result);
         }
     }
@@ -1150,13 +1540,18 @@ impl<'test> TestCx<'test> {
     ) -> ProcRes {
         // Prepare the lldb_batchmode which executes the debugger script
         let lldb_script_path = rust_src_root.join("src/etc/lldb_batchmode.py");
+        let pythonpath = if let Ok(pp) = std::env::var("PYTHONPATH") {
+            format!("{pp}:{}", self.config.lldb_python_dir.as_ref().unwrap())
+        } else {
+            self.config.lldb_python_dir.as_ref().unwrap().to_string()
+        };
         self.cmd2procres(
             Command::new(&self.config.python)
                 .arg(&lldb_script_path)
                 .arg(test_executable)
                 .arg(debugger_script)
                 .env("PYTHONUNBUFFERED", "1") // Help debugging #78665
-                .env("PYTHONPATH", self.config.lldb_python_dir.as_ref().unwrap()),
+                .env("PYTHONPATH", pythonpath),
         )
     }
 
@@ -1173,26 +1568,23 @@ impl<'test> TestCx<'test> {
         };
 
         self.dump_output(&out, &err);
-        ProcRes { status, stdout: out, stderr: err, cmdline: format!("{:?}", cmd) }
+        ProcRes {
+            status,
+            stdout: out,
+            stderr: err,
+            truncated: Truncated::No,
+            cmdline: format!("{:?}", cmd),
+        }
     }
 
-    fn cleanup_debug_info_options(&self, options: &Option<String>) -> Option<String> {
-        if options.is_none() {
-            return None;
-        }
-
+    fn cleanup_debug_info_options(&self, options: &Vec<String>) -> Vec<String> {
         // Remove options that are either unwanted (-O) or may lead to duplicates due to RUSTFLAGS.
         let options_to_remove = ["-O".to_owned(), "-g".to_owned(), "--debuginfo".to_owned()];
-        let new_options = self
-            .split_maybe_args(options)
-            .into_iter()
-            .filter(|x| !options_to_remove.contains(x))
-            .collect::<Vec<String>>();
 
-        Some(new_options.join(" "))
+        options.iter().filter(|x| !options_to_remove.contains(x)).map(|x| x.clone()).collect()
     }
 
-    fn maybe_add_external_args(&self, cmd: &mut Command, args: Vec<String>) {
+    fn maybe_add_external_args(&self, cmd: &mut Command, args: &Vec<String>) {
         // Filter out the arguments that should not be added by runtest here.
         //
         // Notable use-cases are: do not add our optimisation flag if
@@ -1222,14 +1614,13 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn check_error_patterns(
+    fn check_all_error_patterns(
         &self,
         output_to_check: &str,
         proc_res: &ProcRes,
         pm: Option<PassMode>,
     ) {
-        debug!("check_error_patterns");
-        if self.props.error_patterns.is_empty() {
+        if self.props.error_patterns.is_empty() && self.props.regex_error_patterns.is_empty() {
             if pm.is_some() {
                 // FIXME(#65865)
                 return;
@@ -1243,13 +1634,8 @@ impl<'test> TestCx<'test> {
 
         let mut missing_patterns: Vec<String> = Vec::new();
 
-        for pattern in &self.props.error_patterns {
-            if output_to_check.contains(pattern.trim()) {
-                debug!("found error pattern {}", pattern);
-            } else {
-                missing_patterns.push(pattern.to_string());
-            }
-        }
+        self.check_error_patterns(output_to_check, &mut missing_patterns);
+        self.check_regex_error_patterns(output_to_check, proc_res, &mut missing_patterns);
 
         if missing_patterns.is_empty() {
             return;
@@ -1265,6 +1651,44 @@ impl<'test> TestCx<'test> {
                 self.error(&format!("error pattern '{}' not found!", pattern));
             }
             self.fatal_proc_rec("multiple error patterns not found", proc_res);
+        }
+    }
+
+    fn check_error_patterns(&self, output_to_check: &str, missing_patterns: &mut Vec<String>) {
+        debug!("check_error_patterns");
+        for pattern in &self.props.error_patterns {
+            if output_to_check.contains(pattern.trim()) {
+                debug!("found error pattern {}", pattern);
+            } else {
+                missing_patterns.push(pattern.to_string());
+            }
+        }
+    }
+
+    fn check_regex_error_patterns(
+        &self,
+        output_to_check: &str,
+        proc_res: &ProcRes,
+        missing_patterns: &mut Vec<String>,
+    ) {
+        debug!("check_regex_error_patterns");
+
+        for pattern in &self.props.regex_error_patterns {
+            let pattern = pattern.trim();
+            let re = match Regex::new(pattern) {
+                Ok(re) => re,
+                Err(err) => {
+                    self.fatal_proc_rec(
+                        &format!("invalid regex error pattern '{}': {:?}", pattern, err),
+                        proc_res,
+                    );
+                }
+            };
+            if re.is_match(output_to_check) {
+                debug!("found regex error pattern {}", pattern);
+            } else {
+                missing_patterns.push(pattern.to_string());
+            }
         }
     }
 
@@ -1300,19 +1724,26 @@ impl<'test> TestCx<'test> {
         if self.props.known_bug {
             if !expected_errors.is_empty() {
                 self.fatal_proc_rec(
-                    "`known_bug` tests should not have an expected errors",
+                    "`known_bug` tests should not have an expected error",
                     proc_res,
                 );
             }
             return;
         }
 
+        // On Windows, translate all '\' path separators to '/'
+        let file_name = format!("{}", self.testpaths.file.display()).replace(r"\", "/");
+
         // On Windows, keep all '\' path separators to match the paths reported in the JSON output
         // from the compiler
-        let os_file_name = self.testpaths.file.display().to_string();
-
-        // on windows, translate all '\' path separators to '/'
-        let file_name = format!("{}", self.testpaths.file.display()).replace(r"\", "/");
+        let diagnostic_file_name = if self.props.remap_src_base {
+            let mut p = PathBuf::from(FAKE_SRC_BASE);
+            p.push(&self.testpaths.relative_dir);
+            p.push(self.testpaths.file.file_name().unwrap());
+            p.display().to_string()
+        } else {
+            self.testpaths.file.display().to_string()
+        };
 
         // If the testcase being checked contains at least one expected "help"
         // message, then we'll ensure that all "help" messages are expected.
@@ -1322,10 +1753,12 @@ impl<'test> TestCx<'test> {
         let expect_note = expected_errors.iter().any(|ee| ee.kind == Some(ErrorKind::Note));
 
         // Parse the JSON output from the compiler and extract out the messages.
-        let actual_errors = json::parse_output(&os_file_name, &proc_res.stderr, proc_res);
+        let actual_errors = json::parse_output(&diagnostic_file_name, &proc_res.stderr, proc_res);
         let mut unexpected = Vec::new();
         let mut found = vec![false; expected_errors.len()];
-        for actual_error in &actual_errors {
+        for mut actual_error in actual_errors {
+            actual_error.msg = self.normalize_output(&actual_error.msg, &[]);
+
             let opt_index =
                 expected_errors.iter().enumerate().position(|(index, expected_error)| {
                     !found[index]
@@ -1344,7 +1777,8 @@ impl<'test> TestCx<'test> {
 
                 None => {
                     // If the test is a known bug, don't require that the error is annotated
-                    if self.is_unexpected_compiler_message(actual_error, expect_help, expect_note) {
+                    if self.is_unexpected_compiler_message(&actual_error, expect_help, expect_note)
+                    {
                         self.error(&format!(
                             "{}:{}: unexpected {}: '{}'",
                             file_name,
@@ -1403,30 +1837,41 @@ impl<'test> TestCx<'test> {
         expect_help: bool,
         expect_note: bool,
     ) -> bool {
-        match actual_error.kind {
-            Some(ErrorKind::Help) => expect_help,
-            Some(ErrorKind::Note) => expect_note,
-            Some(ErrorKind::Error) | Some(ErrorKind::Warning) => true,
-            Some(ErrorKind::Suggestion) | None => false,
-        }
+        !actual_error.msg.is_empty()
+            && match actual_error.kind {
+                Some(ErrorKind::Help) => expect_help,
+                Some(ErrorKind::Note) => expect_note,
+                Some(ErrorKind::Error) | Some(ErrorKind::Warning) => true,
+                Some(ErrorKind::Suggestion) | None => false,
+            }
     }
 
-    fn should_emit_metadata(&self, pm: Option<PassMode>) -> EmitMetadata {
+    fn should_emit_metadata(&self, pm: Option<PassMode>) -> Emit {
         match (pm, self.props.fail_mode, self.config.mode) {
-            (Some(PassMode::Check), ..) | (_, Some(FailMode::Check), Ui) => EmitMetadata::Yes,
-            _ => EmitMetadata::No,
+            (Some(PassMode::Check), ..) | (_, Some(FailMode::Check), Ui) => Emit::Metadata,
+            _ => Emit::None,
         }
     }
 
-    fn compile_test(&self, will_execute: WillExecute, emit_metadata: EmitMetadata) -> ProcRes {
-        self.compile_test_general(will_execute, emit_metadata, self.props.local_pass_mode())
+    fn compile_test(&self, will_execute: WillExecute, emit: Emit) -> ProcRes {
+        self.compile_test_general(will_execute, emit, self.props.local_pass_mode(), Vec::new())
+    }
+
+    fn compile_test_with_passes(
+        &self,
+        will_execute: WillExecute,
+        emit: Emit,
+        passes: Vec<String>,
+    ) -> ProcRes {
+        self.compile_test_general(will_execute, emit, self.props.local_pass_mode(), passes)
     }
 
     fn compile_test_general(
         &self,
         will_execute: WillExecute,
-        emit_metadata: EmitMetadata,
+        emit: Emit,
         local_pm: Option<PassMode>,
+        passes: Vec<String>,
     ) -> ProcRes {
         // Only use `make_exe_name` when the test ends up being executed.
         let output_file = match will_execute {
@@ -1457,10 +1902,14 @@ impl<'test> TestCx<'test> {
             _ => AllowUnused::No,
         };
 
-        let mut rustc =
-            self.make_compile_args(&self.testpaths.file, output_file, emit_metadata, allow_unused);
-
-        rustc.arg("-L").arg(&self.aux_output_dir_name());
+        let rustc = self.make_compile_args(
+            &self.testpaths.file,
+            output_file,
+            emit,
+            allow_unused,
+            LinkToAux::Yes,
+            passes,
+        );
 
         self.compose_and_run_compiler(rustc, None)
     }
@@ -1501,13 +1950,15 @@ impl<'test> TestCx<'test> {
             .arg("--deny")
             .arg("warnings")
             .arg(&self.testpaths.file)
+            .arg("-A")
+            .arg("internal_features")
             .args(&self.props.compile_flags);
 
         if self.config.mode == RustdocJson {
             rustdoc.arg("--output-format").arg("json").arg("-Zunstable-options");
         }
 
-        if let Some(ref linker) = self.config.linker {
+        if let Some(ref linker) = self.config.target_linker {
             rustdoc.arg(format!("-Clinker={}", linker));
         }
 
@@ -1515,7 +1966,26 @@ impl<'test> TestCx<'test> {
     }
 
     fn exec_compiled_test(&self) -> ProcRes {
-        let env = &self.props.exec_env;
+        self.exec_compiled_test_general(&[], true)
+    }
+
+    fn exec_compiled_test_general(
+        &self,
+        env_extra: &[(&str, &str)],
+        delete_after_success: bool,
+    ) -> ProcRes {
+        let prepare_env = |cmd: &mut Command| {
+            for key in &self.props.unset_exec_env {
+                cmd.env_remove(key);
+            }
+
+            for (key, val) in &self.props.exec_env {
+                cmd.env(key, val);
+            }
+            for (key, val) in env_extra {
+                cmd.env(key, val);
+            }
+        };
 
         let proc_res = match &*self.config.target {
             // This is pretty similar to below, we're transforming:
@@ -1548,10 +2018,13 @@ impl<'test> TestCx<'test> {
                 let mut test_client =
                     Command::new(self.config.remote_test_client.as_ref().unwrap());
                 test_client
-                    .args(&["run", &support_libs.len().to_string(), &prog])
+                    .args(&["run", &support_libs.len().to_string()])
+                    .arg(&prog)
                     .args(support_libs)
-                    .args(args)
-                    .envs(env.clone());
+                    .args(args);
+
+                prepare_env(&mut test_client);
+
                 self.compose_and_run(
                     test_client,
                     self.config.run_lib_path.to_str().unwrap(),
@@ -1563,7 +2036,10 @@ impl<'test> TestCx<'test> {
                 let aux_dir = self.aux_output_dir_name();
                 let ProcArgs { prog, args } = self.make_run_args();
                 let mut wr_run = Command::new("wr-run");
-                wr_run.args(&[&prog]).args(args).envs(env.clone());
+                wr_run.args(&[&prog]).args(args);
+
+                prepare_env(&mut wr_run);
+
                 self.compose_and_run(
                     wr_run,
                     self.config.run_lib_path.to_str().unwrap(),
@@ -1575,7 +2051,10 @@ impl<'test> TestCx<'test> {
                 let aux_dir = self.aux_output_dir_name();
                 let ProcArgs { prog, args } = self.make_run_args();
                 let mut program = Command::new(&prog);
-                program.args(args).current_dir(&self.output_base_dir()).envs(env.clone());
+                program.args(args).current_dir(&self.output_base_dir());
+
+                prepare_env(&mut program);
+
                 self.compose_and_run(
                     program,
                     self.config.run_lib_path.to_str().unwrap(),
@@ -1585,7 +2064,7 @@ impl<'test> TestCx<'test> {
             }
         };
 
-        if proc_res.status.success() {
+        if delete_after_success && proc_res.status.success() {
             // delete the executable after running it to save space.
             // it is ok if the deletion failed.
             let _ = fs::remove_file(self.make_exe_name());
@@ -1661,7 +2140,7 @@ impl<'test> TestCx<'test> {
 
     fn compose_and_run_compiler(&self, mut rustc: Command, input: Option<String>) -> ProcRes {
         let aux_dir = self.build_all_auxiliary(&mut rustc);
-        self.props.unset_rustc_env.clone().iter().fold(&mut rustc, |rustc, v| rustc.env_remove(v));
+        self.props.unset_rustc_env.iter().fold(&mut rustc, Command::env_remove);
         rustc.envs(self.props.rustc_env.clone());
         self.compose_and_run(
             rustc,
@@ -1687,8 +2166,14 @@ impl<'test> TestCx<'test> {
         // Create the directory for the stdout/stderr files.
         create_dir_all(aux_cx.output_base_dir()).unwrap();
         let input_file = &aux_testpaths.file;
-        let mut aux_rustc =
-            aux_cx.make_compile_args(input_file, aux_output, EmitMetadata::No, AllowUnused::No);
+        let mut aux_rustc = aux_cx.make_compile_args(
+            input_file,
+            aux_output,
+            Emit::None,
+            AllowUnused::No,
+            LinkToAux::No,
+            Vec::new(),
+        );
 
         for key in &aux_props.unset_rustc_env {
             aux_rustc.env_remove(key);
@@ -1704,8 +2189,9 @@ impl<'test> TestCx<'test> {
             || self.config.target.contains("wasm32")
             || self.config.target.contains("nvptx")
             || self.is_vxworks_pure_static()
-            || self.config.target.contains("sgx")
             || self.config.target.contains("bpf")
+            || !self.config.target_cfg().dynamic_linking
+            || self.config.mode == RunCoverage
         {
             // We primarily compile all auxiliary libraries as dynamic libraries
             // to avoid code size bloat and large binaries as much as possible
@@ -1716,6 +2202,10 @@ impl<'test> TestCx<'test> {
             // dynamic libraries so we just go back to building a normal library. Note,
             // however, that for MUSL if the library is built with `force_host` then
             // it's ok to be a dylib as the host should always support dylibs.
+            //
+            // Coverage tests want static linking by default so that coverage
+            // mappings in auxiliary libraries can be merged into the final
+            // executable.
             (false, Some("lib"))
         } else {
             (true, Some("dylib"))
@@ -1745,6 +2235,28 @@ impl<'test> TestCx<'test> {
         dylib
     }
 
+    fn read2_abbreviated(&self, child: Child) -> (Output, Truncated) {
+        let mut filter_paths_from_len = Vec::new();
+        let mut add_path = |path: &Path| {
+            let path = path.display().to_string();
+            let windows = path.replace("\\", "\\\\");
+            if windows != path {
+                filter_paths_from_len.push(windows);
+            }
+            filter_paths_from_len.push(path);
+        };
+
+        // List of paths that will not be measured when determining whether the output is larger
+        // than the output truncation threshold.
+        //
+        // Note: avoid adding a subdirectory of an already filtered directory here, otherwise the
+        // same slice of text will be double counted and the truncation might not happen.
+        add_path(&self.config.src_base);
+        add_path(&self.config.build_base);
+
+        read2_abbreviated(child, &filter_paths_from_len).expect("failed to read output")
+    }
+
     fn compose_and_run(
         &self,
         mut command: Command,
@@ -1762,30 +2274,21 @@ impl<'test> TestCx<'test> {
 
         // Need to be sure to put both the lib_path and the aux path in the dylib
         // search path for the child.
-        let mut path =
-            env::split_paths(&env::var_os(dylib_env_var()).unwrap_or_default()).collect::<Vec<_>>();
-        if let Some(p) = aux_path {
-            path.insert(0, PathBuf::from(p))
-        }
-        path.insert(0, PathBuf::from(lib_path));
-
-        // Add the new dylib search path var
-        let newpath = env::join_paths(&path).unwrap();
-        command.env(dylib_env_var(), newpath);
+        add_dylib_path(&mut command, iter::once(lib_path).chain(aux_path));
 
         let mut child = disable_error_reporting(|| command.spawn())
-            .unwrap_or_else(|_| panic!("failed to exec `{:?}`", &command));
+            .unwrap_or_else(|e| panic!("failed to exec `{command:?}`: {e:?}"));
         if let Some(input) = input {
             child.stdin.as_mut().unwrap().write_all(input.as_bytes()).unwrap();
         }
 
-        let Output { status, stdout, stderr } =
-            read2_abbreviated(child).expect("failed to read output");
+        let (Output { status, stdout, stderr }, truncated) = self.read2_abbreviated(child);
 
         let result = ProcRes {
             status,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            truncated,
             cmdline,
         };
 
@@ -1804,8 +2307,10 @@ impl<'test> TestCx<'test> {
         &self,
         input_file: &Path,
         output_file: TargetLocation,
-        emit_metadata: EmitMetadata,
+        emit: Emit,
         allow_unused: AllowUnused,
+        link_to_aux: LinkToAux,
+        passes: Vec<String>, // Vec of passes under mir-opt test to be dumped
     ) -> Command {
         let is_aux = input_file.components().map(|c| c.as_os_str()).any(|c| c == "auxiliary");
         let is_rustdoc = self.is_rustdoc() && !is_aux;
@@ -1818,6 +2323,34 @@ impl<'test> TestCx<'test> {
 
         // Use a single thread for efficiency and a deterministic error message order
         rustc.arg("-Zthreads=1");
+
+        // Hide libstd sources from ui tests to make sure we generate the stderr
+        // output that users will see.
+        // Without this, we may be producing good diagnostics in-tree but users
+        // will not see half the information.
+        //
+        // This also has the benefit of more effectively normalizing output between different
+        // compilers, so that we don't have to know the `/rustc/$sha` output to normalize after the
+        // fact.
+        rustc.arg("-Zsimulate-remapped-rust-src-base=/rustc/FAKE_PREFIX");
+        rustc.arg("-Ztranslate-remapped-path-to-local-path=no");
+
+        // Hide Cargo dependency sources from ui tests to make sure the error message doesn't
+        // change depending on whether $CARGO_HOME is remapped or not. If this is not present,
+        // when $CARGO_HOME is remapped the source won't be shown, and when it's not remapped the
+        // source will be shown, causing a blessing hell.
+        rustc.arg("-Z").arg(format!(
+            "ignore-directory-in-diagnostics-source-blocks={}",
+            home::cargo_home().expect("failed to find cargo home").to_str().unwrap()
+        ));
+
+        // Optionally prevent default --sysroot if specified in test compile-flags.
+        if !self.props.compile_flags.iter().any(|flag| flag.starts_with("--sysroot"))
+            && !self.config.host_rustcflags.iter().any(|flag| flag == "--sysroot")
+        {
+            // In stage 0, make sure we use `stage0-sysroot` instead of the bootstrap sysroot.
+            rustc.arg("--sysroot").arg(&self.config.sysroot_base);
+        }
 
         // Optionally prevent default --target if specified in test compile-flags.
         let custom_target = self.props.compile_flags.iter().any(|x| x.starts_with("--target"));
@@ -1841,12 +2374,45 @@ impl<'test> TestCx<'test> {
             }
         }
 
+        if self.config.optimize_tests && !is_rustdoc {
+            match self.config.mode {
+                Ui => {
+                    // If optimize-tests is true we still only want to optimize tests that actually get
+                    // executed and that don't specify their own optimization levels.
+                    // Note: aux libs don't have a pass-mode, so they won't get optimized
+                    // unless compile-flags are set in the aux file.
+                    if self.config.optimize_tests
+                        && self.props.pass_mode(&self.config) == Some(PassMode::Run)
+                        && !self
+                            .props
+                            .compile_flags
+                            .iter()
+                            .any(|arg| arg == "-O" || arg.contains("opt-level"))
+                    {
+                        rustc.arg("-O");
+                    }
+                }
+                DebugInfo => { /* debuginfo tests must be unoptimized */ }
+                CoverageMap | RunCoverage => {
+                    // Coverage mappings and coverage reports are affected by
+                    // optimization level, so they ignore the optimize-tests
+                    // setting and set an optimization level in their mode's
+                    // compile flags (below) or in per-test `compile-flags`.
+                }
+                _ => {
+                    rustc.arg("-O");
+                }
+            }
+        }
+
         match self.config.mode {
             Incremental => {
                 // If we are extracting and matching errors in the new
                 // fashion, then you want JSON mode. Old-skool error
                 // patterns still match the raw compiler output.
-                if self.props.error_patterns.is_empty() {
+                if self.props.error_patterns.is_empty()
+                    && self.props.regex_error_patterns.is_empty()
+                {
                     rustc.args(&["--error-format", "json"]);
                     rustc.args(&["--json", "future-incompat"]);
                 }
@@ -1859,20 +2425,36 @@ impl<'test> TestCx<'test> {
                     rustc.args(&["--json", "future-incompat"]);
                 }
                 rustc.arg("-Ccodegen-units=1");
+                // Hide line numbers to reduce churn
                 rustc.arg("-Zui-testing");
                 rustc.arg("-Zdeduplicate-diagnostics=no");
+                rustc.arg("-Zwrite-long-types-to-disk=no");
+                // FIXME: use this for other modes too, for perf?
+                rustc.arg("-Cstrip=debuginfo");
             }
             MirOpt => {
+                // We check passes under test to minimize the mir-opt test dump
+                // if files_for_miropt_test parses the passes, we dump only those passes
+                // otherwise we conservatively pass -Zdump-mir=all
+                let zdump_arg = if !passes.is_empty() {
+                    format!("-Zdump-mir={}", passes.join(" | "))
+                } else {
+                    "-Zdump-mir=all".to_string()
+                };
+
                 rustc.args(&[
                     "-Copt-level=1",
-                    "-Zdump-mir=all",
+                    &zdump_arg,
                     "-Zvalidate-mir",
                     "-Zdump-mir-exclude-pass-number",
                 ]);
                 if let Some(pass) = &self.props.mir_unit_test {
                     rustc.args(&["-Zmir-opt-level=0", &format!("-Zmir-enable-passes=+{}", pass)]);
                 } else {
-                    rustc.arg("-Zmir-opt-level=4");
+                    rustc.args(&[
+                        "-Zmir-opt-level=4",
+                        "-Zmir-enable-passes=+ReorderBasicBlocks,+ReorderLocals",
+                    ]);
                 }
 
                 let mir_dump_dir = self.get_mir_dump_dir();
@@ -1884,14 +2466,52 @@ impl<'test> TestCx<'test> {
 
                 rustc.arg(dir_opt);
             }
+            CoverageMap => {
+                rustc.arg("-Cinstrument-coverage");
+                // These tests only compile to MIR, so they don't need the
+                // profiler runtime to be present.
+                rustc.arg("-Zno-profiler-runtime");
+                // Coverage mappings are sensitive to MIR optimizations, and
+                // the current snapshots assume `opt-level=2` unless overridden
+                // by `compile-flags`.
+                rustc.arg("-Copt-level=2");
+            }
+            RunCoverage => {
+                rustc.arg("-Cinstrument-coverage");
+                // Coverage reports are sometimes sensitive to optimizations,
+                // and the current snapshots assume no optimization unless
+                // overridden by `compile-flags`.
+                rustc.arg("-Copt-level=0");
+            }
             RunPassValgrind | Pretty | DebugInfo | Codegen | Rustdoc | RustdocJson | RunMake
             | CodegenUnits | JsDocTest | Assembly => {
                 // do not use JSON output
             }
         }
 
-        if let (false, EmitMetadata::Yes) = (is_rustdoc, emit_metadata) {
-            rustc.args(&["--emit", "metadata"]);
+        if self.props.remap_src_base {
+            rustc.arg(format!(
+                "--remap-path-prefix={}={}",
+                self.config.src_base.display(),
+                FAKE_SRC_BASE,
+            ));
+        }
+
+        match emit {
+            Emit::None => {}
+            Emit::Metadata if is_rustdoc => {}
+            Emit::Metadata => {
+                rustc.args(&["--emit", "metadata"]);
+            }
+            Emit::LlvmIr => {
+                rustc.args(&["--emit", "llvm-ir"]);
+            }
+            Emit::Asm => {
+                rustc.args(&["--emit", "asm"]);
+            }
+            Emit::LinkArgsAsm => {
+                rustc.args(&["-Clink-args=--emit=asm"]);
+            }
         }
 
         if !is_rustdoc {
@@ -1917,20 +2537,23 @@ impl<'test> TestCx<'test> {
         }
 
         match self.config.compare_mode {
-            Some(CompareMode::Nll) => {
-                rustc.args(&["-Zborrowck=mir"]);
-            }
             Some(CompareMode::Polonius) => {
-                rustc.args(&["-Zpolonius", "-Zborrowck=mir"]);
+                rustc.args(&["-Zpolonius"]);
             }
-            Some(CompareMode::Chalk) => {
-                rustc.args(&["-Zchalk"]);
+            Some(CompareMode::NextSolver) => {
+                rustc.args(&["-Ztrait-solver=next"]);
             }
-            Some(CompareMode::SplitDwarf) => {
+            Some(CompareMode::NextSolverCoherence) => {
+                rustc.args(&["-Ztrait-solver=next-coherence"]);
+            }
+            Some(CompareMode::SplitDwarf) if self.config.target.contains("windows") => {
                 rustc.args(&["-Csplit-debuginfo=unpacked", "-Zunstable-options"]);
             }
+            Some(CompareMode::SplitDwarf) => {
+                rustc.args(&["-Csplit-debuginfo=unpacked"]);
+            }
             Some(CompareMode::SplitDwarfSingle) => {
-                rustc.args(&["-Csplit-debuginfo=packed", "-Zunstable-options"]);
+                rustc.args(&["-Csplit-debuginfo=packed"]);
             }
             None => {}
         }
@@ -1941,18 +2564,20 @@ impl<'test> TestCx<'test> {
             rustc.args(&["-A", "unused"]);
         }
 
+        // Allow tests to use internal features.
+        rustc.args(&["-A", "internal_features"]);
+
         if self.props.force_host {
-            self.maybe_add_external_args(
-                &mut rustc,
-                self.split_maybe_args(&self.config.host_rustcflags),
-            );
-        } else {
-            self.maybe_add_external_args(
-                &mut rustc,
-                self.split_maybe_args(&self.config.target_rustcflags),
-            );
+            self.maybe_add_external_args(&mut rustc, &self.config.host_rustcflags);
             if !is_rustdoc {
-                if let Some(ref linker) = self.config.linker {
+                if let Some(ref linker) = self.config.host_linker {
+                    rustc.arg(format!("-Clinker={}", linker));
+                }
+            }
+        } else {
+            self.maybe_add_external_args(&mut rustc, &self.config.target_rustcflags);
+            if !is_rustdoc {
+                if let Some(ref linker) = self.config.target_linker {
                     rustc.arg(format!("-Clinker={}", linker));
                 }
             }
@@ -1961,6 +2586,10 @@ impl<'test> TestCx<'test> {
         // Use dynamic musl for tests because static doesn't allow creating dylibs
         if self.config.host.contains("musl") || self.is_vxworks_pure_dynamic() {
             rustc.arg("-Ctarget-feature=-crt-static");
+        }
+
+        if let LinkToAux::Yes = link_to_aux {
+            rustc.arg("-L").arg(self.aux_output_dir_name());
         }
 
         rustc.args(&self.props.compile_flags);
@@ -1995,17 +2624,17 @@ impl<'test> TestCx<'test> {
         // If this is emscripten, then run tests under nodejs
         if self.config.target.contains("emscripten") {
             if let Some(ref p) = self.config.nodejs {
-                args.push(p.clone());
+                args.push(p.into());
             } else {
-                self.fatal("no NodeJS binary found (--nodejs)");
+                self.fatal("emscripten target requested and no NodeJS binary found (--nodejs)");
             }
         // If this is otherwise wasm, then run tests under nodejs with our
         // shim
         } else if self.config.target.contains("wasm32") {
             if let Some(ref p) = self.config.nodejs {
-                args.push(p.clone());
+                args.push(p.into());
             } else {
-                self.fatal("no NodeJS binary found (--nodejs)");
+                self.fatal("wasm32 target requested and no NodeJS binary found (--nodejs)");
             }
 
             let src = self
@@ -2014,16 +2643,13 @@ impl<'test> TestCx<'test> {
                 .parent()
                 .unwrap() // chop off `ui`
                 .parent()
-                .unwrap() // chop off `test`
-                .parent()
-                .unwrap(); // chop off `src`
-            args.push(src.join("src/etc/wasm32-shim.js").display().to_string());
+                .unwrap(); // chop off `tests`
+            args.push(src.join("src/etc/wasm32-shim.js").into_os_string());
         }
 
         let exe_file = self.make_exe_name();
 
-        // FIXME (#9639): This needs to handle non-utf8 paths
-        args.push(exe_file.to_str().unwrap().to_owned());
+        args.push(exe_file.into_os_string());
 
         // Add the arguments in the run_flags directive
         args.extend(self.split_maybe_args(&self.props.run_flags));
@@ -2032,12 +2658,16 @@ impl<'test> TestCx<'test> {
         ProcArgs { prog, args }
     }
 
-    fn split_maybe_args(&self, argstr: &Option<String>) -> Vec<String> {
+    fn split_maybe_args(&self, argstr: &Option<String>) -> Vec<OsString> {
         match *argstr {
             Some(ref s) => s
                 .split(' ')
                 .filter_map(|s| {
-                    if s.chars().all(|c| c.is_whitespace()) { None } else { Some(s.to_owned()) }
+                    if s.chars().all(|c| c.is_whitespace()) {
+                        None
+                    } else {
+                        Some(OsString::from(s))
+                    }
                 })
                 .collect(),
             None => Vec::new(),
@@ -2154,13 +2784,16 @@ impl<'test> TestCx<'test> {
     // codegen tests (using FileCheck)
 
     fn compile_test_and_save_ir(&self) -> ProcRes {
-        let aux_dir = self.aux_output_dir_name();
-
         let output_file = TargetLocation::ThisDirectory(self.output_base_dir());
         let input_file = &self.testpaths.file;
-        let mut rustc =
-            self.make_compile_args(input_file, output_file, EmitMetadata::No, AllowUnused::No);
-        rustc.arg("-L").arg(aux_dir).arg("--emit=llvm-ir");
+        let rustc = self.make_compile_args(
+            input_file,
+            output_file,
+            Emit::LlvmIr,
+            AllowUnused::No,
+            LinkToAux::Yes,
+            Vec::new(),
+        );
 
         self.compose_and_run_compiler(rustc, None)
     }
@@ -2172,23 +2805,33 @@ impl<'test> TestCx<'test> {
 
         let output_file = TargetLocation::ThisFile(output_path.clone());
         let input_file = &self.testpaths.file;
-        let mut rustc =
-            self.make_compile_args(input_file, output_file, EmitMetadata::No, AllowUnused::No);
 
-        rustc.arg("-L").arg(self.aux_output_dir_name());
-
+        let mut emit = Emit::None;
         match self.props.assembly_output.as_ref().map(AsRef::as_ref) {
             Some("emit-asm") => {
-                rustc.arg("--emit=asm");
+                emit = Emit::Asm;
+            }
+
+            Some("bpf-linker") => {
+                emit = Emit::LinkArgsAsm;
             }
 
             Some("ptx-linker") => {
                 // No extra flags needed.
             }
 
-            Some(_) => self.fatal("unknown 'assembly-output' header"),
+            Some(header) => self.fatal(&format!("unknown 'assembly-output' header: {header}")),
             None => self.fatal("missing 'assembly-output' header"),
         }
+
+        let rustc = self.make_compile_args(
+            input_file,
+            output_file,
+            emit,
+            AllowUnused::No,
+            LinkToAux::Yes,
+            Vec::new(),
+        );
 
         (self.compose_and_run_compiler(rustc, None), output_path)
     }
@@ -2213,6 +2856,8 @@ impl<'test> TestCx<'test> {
         } else {
             filecheck.args(&["--check-prefixes", &prefixes]);
         }
+        // Provide more context on failures.
+        filecheck.args(&["--dump-input-context", "100"]);
         self.compose_and_run(filecheck, "", None, None)
     }
 
@@ -2224,6 +2869,10 @@ impl<'test> TestCx<'test> {
         let proc_res = self.compile_test_and_save_ir();
         if !proc_res.status.success() {
             self.fatal_proc_rec("compilation failed!", &proc_res);
+        }
+
+        if let Some(PassMode::Build) = self.pass_mode() {
+            return;
         }
 
         let output_path = self.output_base_name().with_extension("ll");
@@ -2314,10 +2963,11 @@ impl<'test> TestCx<'test> {
         let mut rustc = new_rustdoc.make_compile_args(
             &new_rustdoc.testpaths.file,
             output_file,
-            EmitMetadata::No,
+            Emit::None,
             AllowUnused::Yes,
+            LinkToAux::Yes,
+            Vec::new(),
         );
-        rustc.arg("-L").arg(&new_rustdoc.aux_output_dir_name());
         new_rustdoc.build_all_auxiliary(&mut rustc);
 
         let proc_res = new_rustdoc.document(&compare_dir);
@@ -2470,14 +3120,13 @@ impl<'test> TestCx<'test> {
 
         let mut json_out = out_dir.join(self.testpaths.file.file_stem().unwrap());
         json_out.set_extension("json");
+
         let res = self.cmd2procres(
-            Command::new(&self.config.python)
-                .arg(root.join("src/etc/check_missing_items.py"))
-                .arg(&json_out),
+            Command::new(self.config.jsondoclint_path.as_ref().unwrap()).arg(&json_out),
         );
 
         if !res.status.success() {
-            self.fatal_proc_rec("check_missing_items failed!", &res);
+            self.fatal_proc_rec("jsondoclint failed!", &res);
         }
     }
 
@@ -2501,7 +3150,7 @@ impl<'test> TestCx<'test> {
                     }
                     None
                 } else {
-                    let sline = line.split("///").last().unwrap_or("");
+                    let sline = line.rsplit("///").next().unwrap();
                     let line = sline.trim_start();
                     if line.starts_with("```") {
                         if ignore {
@@ -2591,7 +3240,7 @@ impl<'test> TestCx<'test> {
     fn run_codegen_units_test(&self) {
         assert!(self.revision.is_none(), "revisions not relevant here");
 
-        let proc_res = self.compile_test(WillExecute::No, EmitMetadata::No);
+        let proc_res = self.compile_test(WillExecute::No, Emit::None);
 
         if !proc_res.status.success() {
             self.fatal_proc_rec("compilation failed!", &proc_res);
@@ -2739,11 +3388,10 @@ impl<'test> TestCx<'test> {
         // the form <crate-name1>.<crate-disambiguator1>-in-<crate-name2>.<crate-disambiguator2>,
         // remove all crate-disambiguators.
         fn remove_crate_disambiguator_from_cgu(cgu: &str) -> String {
-            lazy_static! {
-                static ref RE: Regex =
-                    Regex::new(r"^[^\.]+(?P<d1>\.[[:alnum:]]+)(-in-[^\.]+(?P<d2>\.[[:alnum:]]+))?")
-                        .unwrap();
-            }
+            static RE: Lazy<Regex> = Lazy::new(|| {
+                Regex::new(r"^[^\.]+(?P<d1>\.[[:alnum:]]+)(-in-[^\.]+(?P<d2>\.[[:alnum:]]+))?")
+                    .unwrap()
+            });
 
             let captures =
                 RE.captures(cgu).unwrap_or_else(|| panic!("invalid cgu name encountered: {}", cgu));
@@ -2795,10 +3443,11 @@ impl<'test> TestCx<'test> {
     fn run_incremental_test(&self) {
         // Basic plan for a test incremental/foo/bar.rs:
         // - load list of revisions rpass1, cfail2, rpass3
-        //   - each should begin with `rpass`, `cfail`, or `rfail`
-        //   - if `rpass`, expect compile and execution to succeed
+        //   - each should begin with `cpass`, `rpass`, `cfail`, or `rfail`
+        //   - if `cpass`, expect compilation to succeed, don't execute
+        //   - if `rpass`, expect compilation and execution to succeed
         //   - if `cfail`, expect compilation to fail
-        //   - if `rfail`, expect execution to fail
+        //   - if `rfail`, expect compilation to succeed and execution to fail
         // - create a directory build/foo/bar.incremental
         // - compile foo/bar.rs with -C incremental=.../foo/bar.incremental and -C rpass1
         //   - because name of revision starts with "rpass", expect success
@@ -2822,7 +3471,12 @@ impl<'test> TestCx<'test> {
             print!("revision={:?} props={:#?}", revision, self.props);
         }
 
-        if revision.starts_with("rpass") {
+        if revision.starts_with("cpass") {
+            if self.props.should_ice {
+                self.fatal("can only use should-ice in cfail tests");
+            }
+            self.run_cpass_test();
+        } else if revision.starts_with("rpass") {
             if self.props.should_ice {
                 self.fatal("can only use should-ice in cfail tests");
             }
@@ -2835,13 +3489,13 @@ impl<'test> TestCx<'test> {
         } else if revision.starts_with("cfail") {
             self.run_cfail_test();
         } else {
-            self.fatal("revision name must begin with rpass, rfail, or cfail");
+            self.fatal("revision name must begin with cpass, rpass, rfail, or cfail");
         }
     }
 
     fn run_rmake_test(&self) {
         let cwd = env::current_dir().unwrap();
-        let src_root = self.config.src_base.parent().unwrap().parent().unwrap().parent().unwrap();
+        let src_root = self.config.src_base.parent().unwrap().parent().unwrap();
         let src_root = cwd.join(&src_root);
 
         let tmpdir = cwd.join(self.output_base_name());
@@ -2855,6 +3509,7 @@ impl<'test> TestCx<'test> {
             || host.contains("freebsd")
             || host.contains("netbsd")
             || host.contains("openbsd")
+            || host.contains("aix")
         {
             "gmake"
         } else {
@@ -2894,7 +3549,7 @@ impl<'test> TestCx<'test> {
             cmd.env("NODE", node);
         }
 
-        if let Some(ref linker) = self.config.linker {
+        if let Some(ref linker) = self.config.target_linker {
             cmd.env("RUSTC_LINKER", linker);
         }
 
@@ -2908,6 +3563,10 @@ impl<'test> TestCx<'test> {
 
         if let Some(ref llvm_bin_dir) = self.config.llvm_bin_dir {
             cmd.env("LLVM_BIN_DIR", llvm_bin_dir);
+        }
+
+        if let Some(ref remote_test_client) = self.config.remote_test_client {
+            cmd.env("REMOTE_TEST_CLIENT", remote_test_client);
         }
 
         // We don't want RUSTFLAGS set from the outside to interfere with
@@ -2969,12 +3628,14 @@ impl<'test> TestCx<'test> {
             }
         }
 
-        let output = cmd.spawn().and_then(read2_abbreviated).expect("failed to spawn `make`");
+        let (output, truncated) =
+            self.read2_abbreviated(cmd.spawn().expect("failed to spawn `make`"));
         if !output.status.success() {
             let res = ProcRes {
                 status: output.status,
                 stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                truncated,
                 cmdline: format!("{:?}", cmd),
             };
             self.fatal_proc_rec("make failed", &res);
@@ -3037,7 +3698,7 @@ impl<'test> TestCx<'test> {
         output_kind: TestOutput,
         explicit_format: bool,
     ) -> usize {
-        let stderr_bits = format!("{}.stderr", get_pointer_width(&self.config.target));
+        let stderr_bits = format!("{}bit.stderr", self.config.get_pointer_width());
         let (stderr_kind, stdout_kind) = match output_kind {
             TestOutput::Compile => (
                 {
@@ -3051,26 +3712,30 @@ impl<'test> TestCx<'test> {
         let expected_stderr = self.load_expected_output(stderr_kind);
         let expected_stdout = self.load_expected_output(stdout_kind);
 
-        let normalized_stdout = match output_kind {
+        let mut normalized_stdout =
+            self.normalize_output(&proc_res.stdout, &self.props.normalize_stdout);
+        match output_kind {
             TestOutput::Run if self.config.remote_test_client.is_some() => {
                 // When tests are run using the remote-test-client, the string
                 // 'uploaded "$TEST_BUILD_DIR/<test_executable>, waiting for result"'
                 // is printed to stdout by the client and then captured in the ProcRes,
-                // so it needs to be removed when comparing the run-pass test execution output
-                lazy_static! {
-                    static ref REMOTE_TEST_RE: Regex = Regex::new(
+                // so it needs to be removed when comparing the run-pass test execution output.
+                static REMOTE_TEST_RE: Lazy<Regex> = Lazy::new(|| {
+                    Regex::new(
                         "^uploaded \"\\$TEST_BUILD_DIR(/[[:alnum:]_\\-.]+)+\", waiting for result\n"
                     )
-                    .unwrap();
-                }
-                REMOTE_TEST_RE
-                    .replace(
-                        &self.normalize_output(&proc_res.stdout, &self.props.normalize_stdout),
-                        "",
-                    )
-                    .to_string()
+                    .unwrap()
+                });
+                normalized_stdout = REMOTE_TEST_RE.replace(&normalized_stdout, "").to_string();
+                // When there is a panic, the remote-test-client also prints "died due to signal";
+                // that needs to be removed as well.
+                static SIGNAL_DIED_RE: Lazy<Regex> =
+                    Lazy::new(|| Regex::new("^died due to signal [0-9]+\n").unwrap());
+                normalized_stdout = SIGNAL_DIED_RE.replace(&normalized_stdout, "").to_string();
+                // FIXME: it would be much nicer if we could just tell the remote-test-client to not
+                // print these things.
             }
-            _ => self.normalize_output(&proc_res.stdout, &self.props.normalize_stdout),
+            _ => {}
         };
 
         let stderr = if explicit_format {
@@ -3084,17 +3749,35 @@ impl<'test> TestCx<'test> {
         match output_kind {
             TestOutput::Compile => {
                 if !self.props.dont_check_compiler_stdout {
-                    errors +=
-                        self.compare_output(stdout_kind, &normalized_stdout, &expected_stdout);
+                    errors += self.compare_output(
+                        stdout_kind,
+                        &normalized_stdout,
+                        &expected_stdout,
+                        self.props.compare_output_lines_by_subset,
+                    );
                 }
                 if !self.props.dont_check_compiler_stderr {
-                    errors +=
-                        self.compare_output(stderr_kind, &normalized_stderr, &expected_stderr);
+                    errors += self.compare_output(
+                        stderr_kind,
+                        &normalized_stderr,
+                        &expected_stderr,
+                        self.props.compare_output_lines_by_subset,
+                    );
                 }
             }
             TestOutput::Run => {
-                errors += self.compare_output(stdout_kind, &normalized_stdout, &expected_stdout);
-                errors += self.compare_output(stderr_kind, &normalized_stderr, &expected_stderr);
+                errors += self.compare_output(
+                    stdout_kind,
+                    &normalized_stdout,
+                    &expected_stdout,
+                    self.props.compare_output_lines_by_subset,
+                );
+                errors += self.compare_output(
+                    stderr_kind,
+                    &normalized_stderr,
+                    &expected_stderr,
+                    self.props.compare_output_lines_by_subset,
+                );
             }
         }
         errors
@@ -3104,7 +3787,8 @@ impl<'test> TestCx<'test> {
         if let Some(FailMode::Build) = self.props.fail_mode {
             // Make sure a build-fail test cannot fail due to failing analysis (e.g. typeck).
             let pm = Some(PassMode::Check);
-            let proc_res = self.compile_test_general(WillExecute::No, EmitMetadata::Yes, pm);
+            let proc_res =
+                self.compile_test_general(WillExecute::No, Emit::Metadata, pm, Vec::new());
             self.check_if_test_should_compile(&proc_res, pm);
         }
 
@@ -3113,6 +3797,15 @@ impl<'test> TestCx<'test> {
         let emit_metadata = self.should_emit_metadata(pm);
         let proc_res = self.compile_test(should_run, emit_metadata);
         self.check_if_test_should_compile(&proc_res, pm);
+        if matches!(proc_res.truncated, Truncated::Yes)
+            && !self.props.dont_check_compiler_stdout
+            && !self.props.dont_check_compiler_stderr
+        {
+            self.fatal_proc_rec(
+                &format!("compiler output got truncated, cannot compare with reference file"),
+                &proc_res,
+            );
+        }
 
         // if the user specified a format in the ui test
         // print the output to the stderr file, otherwise extract
@@ -3121,8 +3814,7 @@ impl<'test> TestCx<'test> {
 
         let expected_fixed = self.load_expected_output(UI_FIXED);
 
-        let modes_to_prune = vec![CompareMode::Nll];
-        self.check_and_prune_duplicate_outputs(&proc_res, &[], &modes_to_prune);
+        self.check_and_prune_duplicate_outputs(&proc_res, &[], &[]);
 
         let mut errors = self.load_compare_outputs(&proc_res, TestOutput::Compile, explicit);
         let rustfix_input = json::rustfix_diagnostics_only(&proc_res.stderr);
@@ -3155,8 +3847,8 @@ impl<'test> TestCx<'test> {
                     .open(coverage_file_path.as_path())
                     .expect("could not create or open file");
 
-                if writeln!(file, "{}", self.testpaths.file.display()).is_err() {
-                    panic!("couldn't write to {}", coverage_file_path.display());
+                if let Err(e) = writeln!(file, "{}", self.testpaths.file.display()) {
+                    panic!("couldn't write to {}: {e:?}", coverage_file_path.display());
                 }
             }
         } else if self.props.run_rustfix {
@@ -3179,7 +3871,12 @@ impl<'test> TestCx<'test> {
                 )
             });
 
-            errors += self.compare_output("fixed", &fixed_code, &expected_fixed);
+            errors += self.compare_output(
+                "fixed",
+                &fixed_code,
+                &expected_fixed,
+                self.props.compare_output_lines_by_subset,
+            );
         } else if !expected_fixed.is_empty() {
             panic!(
                 "the `// run-rustfix` directive wasn't found but a `*.fixed` \
@@ -3224,9 +3921,11 @@ impl<'test> TestCx<'test> {
                 self.fatal_proc_rec("test run succeeded!", &proc_res);
             }
 
-            if !self.props.error_patterns.is_empty() {
+            if !self.props.error_patterns.is_empty() || !self.props.regex_error_patterns.is_empty()
+            {
                 // "// error-pattern" comments
-                self.check_error_patterns(&proc_res.stderr, &proc_res, pm);
+                let output_to_check = self.get_output(&proc_res);
+                self.check_all_error_patterns(&output_to_check, &proc_res, pm);
             }
         }
 
@@ -3240,14 +3939,16 @@ impl<'test> TestCx<'test> {
             self.props.error_patterns
         );
         if !explicit && self.config.compare_mode.is_none() {
-            let check_patterns =
-                should_run == WillExecute::No && !self.props.error_patterns.is_empty();
+            let check_patterns = should_run == WillExecute::No
+                && (!self.props.error_patterns.is_empty()
+                    || !self.props.regex_error_patterns.is_empty());
 
             let check_annotations = !check_patterns || !expected_errors.is_empty();
 
             if check_patterns {
                 // "// error-pattern" comments
-                self.check_error_patterns(&proc_res.stderr, &proc_res, pm);
+                let output_to_check = self.get_output(&proc_res);
+                self.check_all_error_patterns(&output_to_check, &proc_res, pm);
             }
 
             if check_annotations {
@@ -3259,13 +3960,14 @@ impl<'test> TestCx<'test> {
         if self.props.run_rustfix && self.config.compare_mode.is_none() {
             // And finally, compile the fixed code and make sure it both
             // succeeds and has no diagnostics.
-            let mut rustc = self.make_compile_args(
+            let rustc = self.make_compile_args(
                 &self.testpaths.file.with_extension(UI_FIXED),
                 TargetLocation::ThisFile(self.make_exe_name()),
                 emit_metadata,
                 AllowUnused::No,
+                LinkToAux::Yes,
+                Vec::new(),
             );
-            rustc.arg("-L").arg(&self.aux_output_dir_name());
             let res = self.compose_and_run_compiler(rustc, None);
             if !res.status.success() {
                 self.fatal_proc_rec("failed to compile fixed code", &res);
@@ -3283,13 +3985,13 @@ impl<'test> TestCx<'test> {
         let pm = self.pass_mode();
         let should_run = self.should_run(pm);
         let emit_metadata = self.should_emit_metadata(pm);
-        let proc_res = self.compile_test(should_run, emit_metadata);
+        let passes = self.get_passes();
 
+        let proc_res = self.compile_test_with_passes(should_run, emit_metadata, passes);
+        self.check_mir_dump();
         if !proc_res.status.success() {
             self.fatal_proc_rec("compilation failed!", &proc_res);
         }
-
-        self.check_mir_dump();
 
         if let WillExecute::Yes = should_run {
             let proc_res = self.exec_compiled_test();
@@ -3300,128 +4002,96 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn check_mir_dump(&self) {
-        let test_file_contents = fs::read_to_string(&self.testpaths.file).unwrap();
+    fn get_passes(&self) -> Vec<String> {
+        let files = miropt_test_tools::files_for_miropt_test(
+            &self.testpaths.file,
+            self.config.get_pointer_width(),
+            self.config.target_cfg().panic.for_miropt_test_tools(),
+        );
 
+        let mut out = Vec::new();
+
+        for miropt_test_tools::MiroptTestFiles {
+            from_file: _,
+            to_file: _,
+            expected_file: _,
+            passes,
+        } in files
+        {
+            out.extend(passes);
+        }
+        out
+    }
+
+    fn check_mir_dump(&self) {
         let test_dir = self.testpaths.file.parent().unwrap();
         let test_crate =
             self.testpaths.file.file_stem().unwrap().to_str().unwrap().replace("-", "_");
 
-        let mut bit_width = String::new();
-        if test_file_contents.lines().any(|l| l == "// EMIT_MIR_FOR_EACH_BIT_WIDTH") {
-            bit_width = format!(".{}", get_pointer_width(&self.config.target));
-        }
+        let suffix = miropt_test_tools::output_file_suffix(
+            &self.testpaths.file,
+            self.config.get_pointer_width(),
+            self.config.target_cfg().panic.for_miropt_test_tools(),
+        );
 
         if self.config.bless {
             for e in
-                glob(&format!("{}/{}.*{}.mir", test_dir.display(), test_crate, bit_width)).unwrap()
+                glob(&format!("{}/{}.*{}.mir", test_dir.display(), test_crate, suffix)).unwrap()
             {
                 std::fs::remove_file(e.unwrap()).unwrap();
             }
             for e in
-                glob(&format!("{}/{}.*{}.diff", test_dir.display(), test_crate, bit_width)).unwrap()
+                glob(&format!("{}/{}.*{}.diff", test_dir.display(), test_crate, suffix)).unwrap()
             {
                 std::fs::remove_file(e.unwrap()).unwrap();
             }
         }
 
-        for l in test_file_contents.lines() {
-            if l.starts_with("// EMIT_MIR ") {
-                let test_name = l.trim_start_matches("// EMIT_MIR ").trim();
-                let mut test_names = test_name.split(' ');
-                // sometimes we specify two files so that we get a diff between the two files
-                let test_name = test_names.next().unwrap();
-                let mut expected_file;
-                let from_file;
-                let to_file;
-
-                if test_name.ends_with(".diff") {
-                    let trimmed = test_name.trim_end_matches(".diff");
-                    let test_against = format!("{}.after.mir", trimmed);
-                    from_file = format!("{}.before.mir", trimmed);
-                    expected_file = format!("{}{}.diff", trimmed, bit_width);
-                    assert!(
-                        test_names.next().is_none(),
-                        "two mir pass names specified for MIR diff"
-                    );
-                    to_file = Some(test_against);
-                } else if let Some(first_pass) = test_names.next() {
-                    let second_pass = test_names.next().unwrap();
-                    assert!(
-                        test_names.next().is_none(),
-                        "three mir pass names specified for MIR diff"
-                    );
-                    expected_file =
-                        format!("{}{}.{}-{}.diff", test_name, bit_width, first_pass, second_pass);
-                    let second_file = format!("{}.{}.mir", test_name, second_pass);
-                    from_file = format!("{}.{}.mir", test_name, first_pass);
-                    to_file = Some(second_file);
-                } else {
-                    let ext_re = Regex::new(r#"(\.(mir|dot|html))$"#).unwrap();
-                    let cap = ext_re
-                        .captures_iter(test_name)
-                        .next()
-                        .expect("test_name has an invalid extension");
-                    let extension = cap.get(1).unwrap().as_str();
-                    expected_file = format!(
-                        "{}{}{}",
-                        test_name.trim_end_matches(extension),
-                        bit_width,
-                        extension,
-                    );
-                    from_file = test_name.to_string();
-                    assert!(
-                        test_names.next().is_none(),
-                        "two mir pass names specified for MIR dump"
-                    );
-                    to_file = None;
-                };
-                if !expected_file.starts_with(&test_crate) {
-                    expected_file = format!("{}.{}", test_crate, expected_file);
-                }
-                let expected_file = test_dir.join(expected_file);
-
-                let dumped_string = if let Some(after) = to_file {
-                    self.diff_mir_files(from_file.into(), after.into())
-                } else {
-                    let mut output_file = PathBuf::new();
-                    output_file.push(self.get_mir_dump_dir());
-                    output_file.push(&from_file);
-                    debug!(
-                        "comparing the contents of: {} with {}",
+        let files = miropt_test_tools::files_for_miropt_test(
+            &self.testpaths.file,
+            self.config.get_pointer_width(),
+            self.config.target_cfg().panic.for_miropt_test_tools(),
+        );
+        for miropt_test_tools::MiroptTestFiles { from_file, to_file, expected_file, passes: _ } in
+            files
+        {
+            let dumped_string = if let Some(after) = to_file {
+                self.diff_mir_files(from_file.into(), after.into())
+            } else {
+                let mut output_file = PathBuf::new();
+                output_file.push(self.get_mir_dump_dir());
+                output_file.push(&from_file);
+                debug!(
+                    "comparing the contents of: {} with {}",
+                    output_file.display(),
+                    expected_file.display()
+                );
+                if !output_file.exists() {
+                    panic!(
+                        "Output file `{}` from test does not exist, available files are in `{}`",
                         output_file.display(),
+                        output_file.parent().unwrap().display()
+                    );
+                }
+                self.check_mir_test_timestamp(&from_file, &output_file);
+                let dumped_string = fs::read_to_string(&output_file).unwrap();
+                self.normalize_output(&dumped_string, &[])
+            };
+
+            if self.config.bless {
+                let _ = std::fs::remove_file(&expected_file);
+                std::fs::write(expected_file, dumped_string.as_bytes()).unwrap();
+            } else {
+                if !expected_file.exists() {
+                    panic!("Output file `{}` from test does not exist", expected_file.display());
+                }
+                let expected_string = fs::read_to_string(&expected_file).unwrap();
+                if dumped_string != expected_string {
+                    print!("{}", write_diff(&expected_string, &dumped_string, 3));
+                    panic!(
+                        "Actual MIR output differs from expected MIR output {}",
                         expected_file.display()
                     );
-                    if !output_file.exists() {
-                        panic!(
-                            "Output file `{}` from test does not exist, available files are in `{}`",
-                            output_file.display(),
-                            output_file.parent().unwrap().display()
-                        );
-                    }
-                    self.check_mir_test_timestamp(&from_file, &output_file);
-                    let dumped_string = fs::read_to_string(&output_file).unwrap();
-                    self.normalize_output(&dumped_string, &[])
-                };
-
-                if self.config.bless {
-                    let _ = std::fs::remove_file(&expected_file);
-                    std::fs::write(expected_file, dumped_string.as_bytes()).unwrap();
-                } else {
-                    if !expected_file.exists() {
-                        panic!(
-                            "Output file `{}` from test does not exist",
-                            expected_file.display()
-                        );
-                    }
-                    let expected_string = fs::read_to_string(&expected_file).unwrap();
-                    if dumped_string != expected_string {
-                        print!("{}", write_diff(&expected_string, &dumped_string, 3));
-                        panic!(
-                            "Actual MIR output differs from expected MIR output {}",
-                            expected_file.display()
-                        );
-                    }
                 }
             }
         }
@@ -3482,8 +4152,11 @@ impl<'test> TestCx<'test> {
     }
 
     fn normalize_output(&self, output: &str, custom_rules: &[(String, String)]) -> String {
+        let rflags = self.props.run_flags.as_ref();
         let cflags = self.props.compile_flags.join(" ");
-        let json = cflags.contains("--error-format json")
+        let json = rflags
+            .map_or(false, |s| s.contains("--format json") || s.contains("--format=json"))
+            || cflags.contains("--error-format json")
             || cflags.contains("--error-format pretty-json")
             || cflags.contains("--error-format=json")
             || cflags.contains("--error-format=pretty-json")
@@ -3503,23 +4176,21 @@ impl<'test> TestCx<'test> {
         let parent_dir = self.testpaths.file.parent().unwrap();
         normalize_path(parent_dir, "$DIR");
 
-        // Paths into the libstd/libcore
-        let base_dir = self.config.src_base.parent().unwrap().parent().unwrap().parent().unwrap();
-        let src_dir = base_dir.join("library");
-        normalize_path(&src_dir, "$SRC_DIR");
+        if self.props.remap_src_base {
+            let mut remapped_parent_dir = PathBuf::from(FAKE_SRC_BASE);
+            if self.testpaths.relative_dir != Path::new("") {
+                remapped_parent_dir.push(&self.testpaths.relative_dir);
+            }
+            normalize_path(&remapped_parent_dir, "$DIR");
+        }
 
+        let base_dir = Path::new("/rustc/FAKE_PREFIX");
+        // Paths into the libstd/libcore
+        normalize_path(&base_dir.join("library"), "$SRC_DIR");
         // `ui-fulldeps` tests can show paths to the compiler source when testing macros from
         // `rustc_macros`
         // eg. /home/user/rust/compiler
-        let compiler_src_dir = base_dir.join("compiler");
-        normalize_path(&compiler_src_dir, "$COMPILER_DIR");
-
-        if let Some(virtual_rust_source_base_dir) =
-            option_env!("CFG_VIRTUAL_RUST_SOURCE_BASE_DIR").map(PathBuf::from)
-        {
-            normalize_path(&virtual_rust_source_base_dir.join("library"), "$SRC_DIR");
-            normalize_path(&virtual_rust_source_base_dir.join("compiler"), "$COMPILER_DIR");
-        }
+        normalize_path(&base_dir.join("compiler"), "$COMPILER_DIR");
 
         // Paths into the build directory
         let test_build_dir = &self.config.build_base;
@@ -3545,10 +4216,8 @@ impl<'test> TestCx<'test> {
         // with placeholders as we do not want tests needing updated when compiler source code
         // changes.
         // eg. $SRC_DIR/libcore/mem.rs:323:14 becomes $SRC_DIR/libcore/mem.rs:LL:COL
-        lazy_static! {
-            static ref SRC_DIR_RE: Regex =
-                Regex::new("SRC_DIR(.+):\\d+:\\d+(: \\d+:\\d+)?").unwrap();
-        }
+        static SRC_DIR_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new("SRC_DIR(.+):\\d+:\\d+(: \\d+:\\d+)?").unwrap());
 
         normalized = SRC_DIR_RE.replace_all(&normalized, "SRC_DIR$1:LL:COL").into_owned();
 
@@ -3559,19 +4228,17 @@ impl<'test> TestCx<'test> {
         // since they duplicate actual errors and make the output hard to read.
         // This mirrors the regex in src/tools/tidy/src/style.rs, please update
         // both if either are changed.
-        lazy_static! {
-            static ref ANNOTATION_RE: Regex = Regex::new("\\s*//(\\[.*\\])?~.*").unwrap();
-        }
+        static ANNOTATION_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new("\\s*//(\\[.*\\])?~.*").unwrap());
 
         normalized = ANNOTATION_RE.replace_all(&normalized, "").into_owned();
 
         // This code normalizes various hashes in v0 symbol mangling that is
         // emitted in the ui and mir-opt tests.
-        lazy_static! {
-            static ref V0_CRATE_HASH_PREFIX_RE: Regex =
-                Regex::new(r"_R.*?Cs[0-9a-zA-Z]+_").unwrap();
-            static ref V0_CRATE_HASH_RE: Regex = Regex::new(r"Cs[0-9a-zA-Z]+_").unwrap();
-        }
+        static V0_CRATE_HASH_PREFIX_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"_R.*?Cs[0-9a-zA-Z]+_").unwrap());
+        static V0_CRATE_HASH_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"Cs[0-9a-zA-Z]+_").unwrap());
 
         const V0_CRATE_HASH_PLACEHOLDER: &str = r"CsCRATE_HASH_";
         if V0_CRATE_HASH_PREFIX_RE.is_match(&normalized) {
@@ -3580,10 +4247,9 @@ impl<'test> TestCx<'test> {
                 V0_CRATE_HASH_RE.replace_all(&normalized, V0_CRATE_HASH_PLACEHOLDER).into_owned();
         }
 
-        lazy_static! {
-            static ref V0_BACK_REF_PREFIX_RE: Regex = Regex::new(r"\(_R.*?B[0-9a-zA-Z]_").unwrap();
-            static ref V0_BACK_REF_RE: Regex = Regex::new(r"B[0-9a-zA-Z]_").unwrap();
-        }
+        static V0_BACK_REF_PREFIX_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"\(_R.*?B[0-9a-zA-Z]_").unwrap());
+        static V0_BACK_REF_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"B[0-9a-zA-Z]_").unwrap());
 
         const V0_BACK_REF_PLACEHOLDER: &str = r"B<REF>_";
         if V0_BACK_REF_PREFIX_RE.is_match(&normalized) {
@@ -3606,21 +4272,23 @@ impl<'test> TestCx<'test> {
     /// Replaces backslashes in paths with forward slashes, and replaces CRLF line endings
     /// with LF.
     fn normalize_platform_differences(output: &str) -> String {
-        lazy_static! {
-            /// Used to find Windows paths.
-            ///
-            /// It's not possible to detect paths in the error messages generally, but this is a
-            /// decent enough heuristic.
-            static ref PATH_BACKSLASH_RE: Regex = Regex::new(r#"(?x)
+        /// Used to find Windows paths.
+        ///
+        /// It's not possible to detect paths in the error messages generally, but this is a
+        /// decent enough heuristic.
+        static PATH_BACKSLASH_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(
+                r#"(?x)
                 (?:
                   # Match paths that don't include spaces.
                   (?:\\[\pL\pN\.\-_']+)+\.\pL+
                 |
-                  # If the path starts with a well-known root, then allow spaces.
-                  \$(?:DIR|SRC_DIR|TEST_BUILD_DIR|BUILD_DIR|LIB_DIR)(?:\\[\pL\pN\.\-_' ]+)+
-                )"#
-            ).unwrap();
-        }
+                  # If the path starts with a well-known root, then allow spaces and no file extension.
+                  \$(?:DIR|SRC_DIR|TEST_BUILD_DIR|BUILD_DIR|LIB_DIR)(?:\\[\pL\pN\.\-_'\ ]+)+
+                )"#,
+            )
+            .unwrap()
+        });
 
         let output = output.replace(r"\\", r"\");
 
@@ -3638,12 +4306,7 @@ impl<'test> TestCx<'test> {
 
         if !path.exists() {
             if let Some(CompareMode::Polonius) = self.config.compare_mode {
-                path = expected_output_path(
-                    &self.testpaths,
-                    self.revision,
-                    &Some(CompareMode::Nll),
-                    kind,
-                );
+                path = expected_output_path(&self.testpaths, self.revision, &None, kind);
             }
         }
 
@@ -3674,7 +4337,7 @@ impl<'test> TestCx<'test> {
 
     fn delete_file(&self, file: &PathBuf) {
         if !file.exists() {
-            // Deleting a nonexistant file would error.
+            // Deleting a nonexistent file would error.
             return;
         }
         if let Err(e) = fs::remove_file(file) {
@@ -3682,10 +4345,37 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn compare_output(&self, kind: &str, actual: &str, expected: &str) -> usize {
+    fn compare_output(
+        &self,
+        kind: &str,
+        actual: &str,
+        expected: &str,
+        compare_output_by_lines: bool,
+    ) -> usize {
         if actual == expected {
             return 0;
         }
+
+        let tmp;
+        let (expected, actual): (&str, &str) = if compare_output_by_lines {
+            let actual_lines: HashSet<_> = actual.lines().collect();
+            let expected_lines: Vec<_> = expected.lines().collect();
+            let mut used = expected_lines.clone();
+            used.retain(|line| actual_lines.contains(line));
+            // check if `expected` contains a subset of the lines of `actual`
+            if used.len() == expected_lines.len() && (expected.is_empty() == actual.is_empty()) {
+                return 0;
+            }
+            if expected_lines.is_empty() {
+                // if we have no lines to check, force a full overwite
+                ("", actual)
+            } else {
+                tmp = (expected_lines.join("\n"), used.join("\n"));
+                (&tmp.0, &tmp.1)
+            }
+        } else {
+            (expected, actual)
+        };
 
         if !self.config.bless {
             if expected.is_empty() {
@@ -3799,14 +4489,15 @@ impl<'test> TestCx<'test> {
 }
 
 struct ProcArgs {
-    prog: String,
-    args: Vec<String>,
+    prog: OsString,
+    args: Vec<OsString>,
 }
 
 pub struct ProcRes {
     status: ExitStatus,
     stdout: String,
     stderr: String,
+    truncated: Truncated,
     cmdline: String,
 }
 
@@ -3814,7 +4505,7 @@ impl ProcRes {
     pub fn print_info(&self) {
         fn render(name: &str, contents: &str) -> String {
             let contents = json::extract_rendered(contents);
-            let contents = contents.trim();
+            let contents = contents.trim_end();
             if contents.is_empty() {
                 format!("{name}: none")
             } else {
@@ -3855,6 +4546,11 @@ enum TargetLocation {
 }
 
 enum AllowUnused {
+    Yes,
+    No,
+}
+
+enum LinkToAux {
     Yes,
     No,
 }

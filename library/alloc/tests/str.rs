@@ -1,3 +1,5 @@
+#![allow(invalid_from_utf8)]
+
 use std::assert_matches::assert_matches;
 use std::borrow::Cow;
 use std::cmp::Ordering::{Equal, Greater, Less};
@@ -1010,11 +1012,11 @@ fn test_as_bytes_fail() {
 fn test_as_ptr() {
     let buf = "hello".as_ptr();
     unsafe {
-        assert_eq!(*buf.offset(0), b'h');
-        assert_eq!(*buf.offset(1), b'e');
-        assert_eq!(*buf.offset(2), b'l');
-        assert_eq!(*buf.offset(3), b'l');
-        assert_eq!(*buf.offset(4), b'o');
+        assert_eq!(*buf.add(0), b'h');
+        assert_eq!(*buf.add(1), b'e');
+        assert_eq!(*buf.add(2), b'l');
+        assert_eq!(*buf.add(3), b'l');
+        assert_eq!(*buf.add(4), b'o');
     }
 }
 
@@ -1499,13 +1501,25 @@ fn test_split_whitespace() {
 
 #[test]
 fn test_lines() {
-    let data = "\nMäry häd ä little lämb\n\r\nLittle lämb\n";
-    let lines: Vec<&str> = data.lines().collect();
-    assert_eq!(lines, ["", "Märy häd ä little lämb", "", "Little lämb"]);
-
-    let data = "\r\nMäry häd ä little lämb\n\nLittle lämb"; // no trailing \n
-    let lines: Vec<&str> = data.lines().collect();
-    assert_eq!(lines, ["", "Märy häd ä little lämb", "", "Little lämb"]);
+    fn t(data: &str, expected: &[&str]) {
+        let lines: Vec<&str> = data.lines().collect();
+        assert_eq!(lines, expected);
+    }
+    t("", &[]);
+    t("\n", &[""]);
+    t("\n2nd", &["", "2nd"]);
+    t("\r\n", &[""]);
+    t("bare\r", &["bare\r"]);
+    t("bare\rcr", &["bare\rcr"]);
+    t("Text\n\r", &["Text", "\r"]);
+    t(
+        "\nMäry häd ä little lämb\n\r\nLittle lämb\n",
+        &["", "Märy häd ä little lämb", "", "Little lämb"],
+    );
+    t(
+        "\r\nMäry häd ä little lämb\n\nLittle lämb",
+        &["", "Märy häd ä little lämb", "", "Little lämb"],
+    );
 }
 
 #[test]
@@ -1590,11 +1604,27 @@ fn test_bool_from_str() {
     assert_eq!("not even a boolean".parse::<bool>().ok(), None);
 }
 
-fn check_contains_all_substrings(s: &str) {
-    assert!(s.contains(""));
-    for i in 0..s.len() {
-        for j in i + 1..=s.len() {
-            assert!(s.contains(&s[i..j]));
+fn check_contains_all_substrings(haystack: &str) {
+    let mut modified_needle = String::new();
+
+    for i in 0..haystack.len() {
+        // check different haystack lengths since we special-case short haystacks.
+        let haystack = &haystack[0..i];
+        assert!(haystack.contains(""));
+        for j in 0..haystack.len() {
+            for k in j + 1..=haystack.len() {
+                let needle = &haystack[j..k];
+                assert!(haystack.contains(needle));
+                modified_needle.clear();
+                modified_needle.push_str(needle);
+                modified_needle.replace_range(0..1, "\0");
+                assert!(!haystack.contains(&modified_needle));
+
+                modified_needle.clear();
+                modified_needle.push_str(needle);
+                modified_needle.replace_range(needle.len() - 1..needle.len(), "\0");
+                assert!(!haystack.contains(&modified_needle));
+            }
         }
     }
 }
@@ -1613,6 +1643,18 @@ fn strslice_issue_16589() {
 fn strslice_issue_16878() {
     assert!(!"1234567ah012345678901ah".contains("hah"));
     assert!(!"00abc01234567890123456789abc".contains("bcabc"));
+}
+
+#[test]
+fn strslice_issue_104726() {
+    // Edge-case in the simd_contains impl.
+    // The first and last byte are the same so it backtracks by one byte
+    // which aligns with the end of the string. Previously incorrect offset calculations
+    // lead to out-of-bounds slicing.
+    #[rustfmt::skip]
+    let needle =                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaba";
+    let haystack = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab";
+    assert!(!haystack.contains(needle));
 }
 
 #[test]
@@ -1694,6 +1736,28 @@ fn test_rev_split_char_iterator_no_trailing() {
 #[test]
 fn test_utf16_code_units() {
     assert_eq!("é\u{1F4A9}".encode_utf16().collect::<Vec<u16>>(), [0xE9, 0xD83D, 0xDCA9])
+}
+
+#[test]
+fn test_utf16_size_hint() {
+    assert_eq!("".encode_utf16().size_hint(), (0, Some(0)));
+    assert_eq!("123".encode_utf16().size_hint(), (1, Some(3)));
+    assert_eq!("1234".encode_utf16().size_hint(), (2, Some(4)));
+    assert_eq!("12345678".encode_utf16().size_hint(), (3, Some(8)));
+
+    fn hint_vec(src: &str) -> Vec<(usize, Option<usize>)> {
+        let mut it = src.encode_utf16();
+        let mut result = Vec::new();
+        result.push(it.size_hint());
+        while it.next().is_some() {
+            result.push(it.size_hint())
+        }
+        result
+    }
+
+    assert_eq!(hint_vec("12"), [(1, Some(2)), (1, Some(1)), (0, Some(0))]);
+    assert_eq!(hint_vec("\u{101234}"), [(2, Some(4)), (1, Some(1)), (0, Some(0))]);
+    assert_eq!(hint_vec("\u{101234}a"), [(2, Some(5)), (2, Some(2)), (1, Some(1)), (0, Some(0))]);
 }
 
 #[test]
@@ -2374,10 +2438,7 @@ fn ceil_char_boundary() {
     check_many("🇯🇵", 0..=0, 0);
     check_many("🇯🇵", 1..=4, 4);
     check_many("🇯🇵", 5..=8, 8);
-}
 
-#[test]
-#[should_panic]
-fn ceil_char_boundary_above_len_panic() {
-    let _ = "x".ceil_char_boundary(2);
+    // above len
+    check_many("hello", 5..=10, 5);
 }

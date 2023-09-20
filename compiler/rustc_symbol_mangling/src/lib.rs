@@ -89,30 +89,36 @@
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(never_type)]
-#![feature(nll)]
 #![recursion_limit = "256"]
 #![allow(rustc::potential_query_instability)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate rustc_middle;
 
+#[macro_use]
+extern crate tracing;
+
+use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
+use rustc_fluent_macro::fluent_messages;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
 use rustc_middle::mir::mono::{InstantiationMode, MonoItem};
-use rustc_middle::ty::query::Providers;
-use rustc_middle::ty::subst::SubstsRef;
-use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
+use rustc_middle::query::Providers;
+use rustc_middle::ty::{self, Instance, TyCtxt};
 use rustc_session::config::SymbolManglingVersion;
-use rustc_target::abi::call::FnAbi;
-
-use tracing::debug;
 
 mod legacy;
 mod v0;
 
+pub mod errors;
 pub mod test;
+pub mod typeid;
+
+fluent_messages! { "../messages.ftl" }
 
 /// This function computes the symbol name for the given `instance` and the
 /// given instantiating crate. That is, if you know that instance X is
@@ -137,7 +143,7 @@ fn symbol_name_provider<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> ty
         // This closure determines the instantiating crate for instances that
         // need an instantiating-crate-suffix for their symbol name, in order
         // to differentiate between local copies.
-        if is_generic(instance.substs) {
+        if is_generic(instance, tcx) {
             // For generics we might find re-usable upstream instances. If there
             // is one, we rely on the symbol being instantiated locally.
             instance.upstream_monomorphization(tcx).unwrap_or(LOCAL_CRATE)
@@ -151,9 +157,11 @@ fn symbol_name_provider<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> ty
     ty::SymbolName::new(tcx, &symbol_name)
 }
 
-/// This function computes the typeid for the given function ABI.
-pub fn typeid_for_fnabi<'tcx>(tcx: TyCtxt<'tcx>, fn_abi: &FnAbi<'tcx, Ty<'tcx>>) -> String {
-    v0::mangle_typeid_for_fnabi(tcx, fn_abi)
+pub fn typeid_for_trait_ref<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    trait_ref: ty::PolyExistentialTraitRef<'tcx>,
+) -> String {
+    v0::mangle_typeid_for_trait_ref(tcx, trait_ref)
 }
 
 /// Computes the symbol name for the given instance. This function will call
@@ -165,13 +173,13 @@ fn compute_symbol_name<'tcx>(
     compute_instantiating_crate: impl FnOnce() -> CrateNum,
 ) -> String {
     let def_id = instance.def_id();
-    let substs = instance.substs;
+    let args = instance.args;
 
-    debug!("symbol_name(def_id={:?}, substs={:?})", def_id, substs);
+    debug!("symbol_name(def_id={:?}, args={:?})", def_id, args);
 
     if let Some(def_id) = def_id.as_local() {
         if tcx.proc_macro_decls_static(()) == Some(def_id) {
-            let stable_crate_id = tcx.sess.local_stable_crate_id();
+            let stable_crate_id = tcx.stable_crate_id(LOCAL_CRATE);
             return tcx.sess.generate_proc_macro_decls_symbol(stable_crate_id);
         }
     }
@@ -237,10 +245,9 @@ fn compute_symbol_name<'tcx>(
     // the ID of the instantiating crate. This avoids symbol conflicts
     // in case the same instances is emitted in two crates of the same
     // project.
-    let avoid_cross_crate_conflicts = is_generic(substs) || is_globally_shared_function;
+    let avoid_cross_crate_conflicts = is_generic(instance, tcx) || is_globally_shared_function;
 
-    let instantiating_crate =
-        if avoid_cross_crate_conflicts { Some(compute_instantiating_crate()) } else { None };
+    let instantiating_crate = avoid_cross_crate_conflicts.then(compute_instantiating_crate);
 
     // Pick the crate responsible for the symbol mangling version, which has to:
     // 1. be stable for each instance, whether it's being defined or imported
@@ -264,13 +271,12 @@ fn compute_symbol_name<'tcx>(
 
     debug_assert!(
         rustc_demangle::try_demangle(&symbol).is_ok(),
-        "compute_symbol_name: `{}` cannot be demangled",
-        symbol
+        "compute_symbol_name: `{symbol}` cannot be demangled"
     );
 
     symbol
 }
 
-fn is_generic(substs: SubstsRef<'_>) -> bool {
-    substs.non_erasable_generics().next().is_some()
+fn is_generic<'tcx>(instance: Instance<'tcx>, tcx: TyCtxt<'tcx>) -> bool {
+    instance.args.non_erasable_generics(tcx, instance.def_id()).next().is_some()
 }

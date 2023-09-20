@@ -40,16 +40,17 @@ pub mod stdio;
 pub mod thread;
 pub mod thread_local_dtor;
 pub mod thread_local_key;
-pub mod thread_parker;
+pub mod thread_parking;
 pub mod time;
 
 #[cfg(target_os = "espidf")]
-pub fn init(argc: isize, argv: *const *const u8) {}
+pub fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {}
 
 #[cfg(not(target_os = "espidf"))]
 // SAFETY: must be called only once during runtime initialization.
 // NOTE: this is not guaranteed to run, for example when Rust code is called externally.
-pub unsafe fn init(argc: isize, argv: *const *const u8) {
+// See `fn init()` in `library/std/src/rt.rs` for docs on `sigpipe`.
+pub unsafe fn init(argc: isize, argv: *const *const u8, sigpipe: u8) {
     // The standard streams might be closed on application startup. To prevent
     // std::io::{stdin, stdout,stderr} objects from using other unrelated file
     // resources opened later, we reopen standards streams when they are closed.
@@ -61,8 +62,9 @@ pub unsafe fn init(argc: isize, argv: *const *const u8) {
     // want!
     //
     // Hence, we set SIGPIPE to ignore when the program starts up in order
-    // to prevent this problem.
-    reset_sigpipe();
+    // to prevent this problem. Add `#[unix_sigpipe = "..."]` above `fn main()` to
+    // alter this behavior.
+    reset_sigpipe(sigpipe);
 
     stack_overflow::init();
     args::init(argc, argv);
@@ -77,36 +79,85 @@ pub unsafe fn init(argc: isize, argv: *const *const u8) {
     }
 
     unsafe fn sanitize_standard_fds() {
-        #[cfg(not(miri))]
-        // The standard fds are always available in Miri.
-        cfg_if::cfg_if! {
-            if #[cfg(not(any(
-                target_os = "emscripten",
-                target_os = "fuchsia",
-                target_os = "vxworks",
-                // The poll on Darwin doesn't set POLLNVAL for closed fds.
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "redox",
-                target_os = "l4re",
-            )))] {
-                use crate::sys::os::errno;
-                let pfds: &mut [_] = &mut [
-                    libc::pollfd { fd: 0, events: 0, revents: 0 },
-                    libc::pollfd { fd: 1, events: 0, revents: 0 },
-                    libc::pollfd { fd: 2, events: 0, revents: 0 },
-                ];
-                while libc::poll(pfds.as_mut_ptr(), 3, 0) == -1 {
-                    if errno() == libc::EINTR {
-                        continue;
+        // fast path with a single syscall for systems with poll()
+        #[cfg(not(any(
+            miri,
+            target_os = "emscripten",
+            target_os = "fuchsia",
+            target_os = "vxworks",
+            // The poll on Darwin doesn't set POLLNVAL for closed fds.
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "redox",
+            target_os = "l4re",
+            target_os = "horizon",
+            target_os = "vita",
+        )))]
+        'poll: {
+            use crate::sys::os::errno;
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            use libc::open as open64;
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            use libc::open64;
+            let pfds: &mut [_] = &mut [
+                libc::pollfd { fd: 0, events: 0, revents: 0 },
+                libc::pollfd { fd: 1, events: 0, revents: 0 },
+                libc::pollfd { fd: 2, events: 0, revents: 0 },
+            ];
+
+            while libc::poll(pfds.as_mut_ptr(), 3, 0) == -1 {
+                match errno() {
+                    libc::EINTR => continue,
+                    #[cfg(target_vendor = "unikraft")]
+                    libc::ENOSYS => {
+                        // Not all configurations of Unikraft enable `LIBPOSIX_EVENT`.
+                        break 'poll;
                     }
+                    libc::EINVAL | libc::EAGAIN | libc::ENOMEM => {
+                        // RLIMIT_NOFILE or temporary allocation failures
+                        // may be preventing use of poll(), fall back to fcntl
+                        break 'poll;
+                    }
+                    _ => libc::abort(),
+                }
+            }
+            for pfd in pfds {
+                if pfd.revents & libc::POLLNVAL == 0 {
+                    continue;
+                }
+                if open64("/dev/null\0".as_ptr().cast(), libc::O_RDWR, 0) == -1 {
+                    // If the stream is closed but we failed to reopen it, abort the
+                    // process. Otherwise we wouldn't preserve the safety of
+                    // operations on the corresponding Rust object Stdin, Stdout, or
+                    // Stderr.
                     libc::abort();
                 }
-                for pfd in pfds {
-                    if pfd.revents & libc::POLLNVAL == 0 {
-                        continue;
-                    }
-                    if libc::open("/dev/null\0".as_ptr().cast(), libc::O_RDWR, 0) == -1 {
+            }
+            return;
+        }
+
+        // fallback in case poll isn't available or limited by RLIMIT_NOFILE
+        #[cfg(not(any(
+            // The standard fds are always available in Miri.
+            miri,
+            target_os = "emscripten",
+            target_os = "fuchsia",
+            target_os = "vxworks",
+            target_os = "l4re",
+            target_os = "horizon",
+            target_os = "vita",
+        )))]
+        {
+            use crate::sys::os::errno;
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            use libc::open as open64;
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            use libc::open64;
+            for fd in 0..3 {
+                if libc::fcntl(fd, libc::F_GETFD) == -1 && errno() == libc::EBADF {
+                    if open64("/dev/null\0".as_ptr().cast(), libc::O_RDWR, 0) == -1 {
                         // If the stream is closed but we failed to reopen it, abort the
                         // process. Otherwise we wouldn't preserve the safety of
                         // operations on the corresponding Rust object Stdin, Stdout, or
@@ -114,23 +165,68 @@ pub unsafe fn init(argc: isize, argv: *const *const u8) {
                         libc::abort();
                     }
                 }
-            } else if #[cfg(any(target_os = "macos", target_os = "ios", target_os = "redox"))] {
-                use crate::sys::os::errno;
-                for fd in 0..3 {
-                    if libc::fcntl(fd, libc::F_GETFD) == -1 && errno() == libc::EBADF {
-                        if libc::open("/dev/null\0".as_ptr().cast(), libc::O_RDWR, 0) == -1 {
-                            libc::abort();
-                        }
-                    }
-                }
             }
         }
     }
 
-    unsafe fn reset_sigpipe() {
-        #[cfg(not(any(target_os = "emscripten", target_os = "fuchsia")))]
-        rtassert!(signal(libc::SIGPIPE, libc::SIG_IGN) != libc::SIG_ERR);
+    unsafe fn reset_sigpipe(#[allow(unused_variables)] sigpipe: u8) {
+        #[cfg(not(any(
+            target_os = "emscripten",
+            target_os = "fuchsia",
+            target_os = "horizon",
+            // Unikraft's `signal` implementation is currently broken:
+            // https://github.com/unikraft/lib-musl/issues/57
+            target_vendor = "unikraft",
+        )))]
+        {
+            // We don't want to add this as a public type to std, nor do we
+            // want to `include!` a file from the compiler (which would break
+            // Miri and xargo for example), so we choose to duplicate these
+            // constants from `compiler/rustc_session/src/config/sigpipe.rs`.
+            // See the other file for docs. NOTE: Make sure to keep them in
+            // sync!
+            mod sigpipe {
+                pub const DEFAULT: u8 = 0;
+                pub const INHERIT: u8 = 1;
+                pub const SIG_IGN: u8 = 2;
+                pub const SIG_DFL: u8 = 3;
+            }
+
+            let (sigpipe_attr_specified, handler) = match sigpipe {
+                sigpipe::DEFAULT => (false, Some(libc::SIG_IGN)),
+                sigpipe::INHERIT => (true, None),
+                sigpipe::SIG_IGN => (true, Some(libc::SIG_IGN)),
+                sigpipe::SIG_DFL => (true, Some(libc::SIG_DFL)),
+                _ => unreachable!(),
+            };
+            if sigpipe_attr_specified {
+                UNIX_SIGPIPE_ATTR_SPECIFIED.store(true, crate::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(handler) = handler {
+                rtassert!(signal(libc::SIGPIPE, handler) != libc::SIG_ERR);
+            }
+        }
     }
+}
+
+// This is set (up to once) in reset_sigpipe.
+#[cfg(not(any(
+    target_os = "espidf",
+    target_os = "emscripten",
+    target_os = "fuchsia",
+    target_os = "horizon",
+)))]
+static UNIX_SIGPIPE_ATTR_SPECIFIED: crate::sync::atomic::AtomicBool =
+    crate::sync::atomic::AtomicBool::new(false);
+
+#[cfg(not(any(
+    target_os = "espidf",
+    target_os = "emscripten",
+    target_os = "fuchsia",
+    target_os = "horizon",
+)))]
+pub(crate) fn unix_sigpipe_attr_specified() -> bool {
+    UNIX_SIGPIPE_ATTR_SPECIFIED.load(crate::sync::atomic::Ordering::Relaxed)
 }
 
 // SAFETY: must be called only once during runtime cleanup.
@@ -143,6 +239,11 @@ pub unsafe fn cleanup() {
 pub use crate::sys::android::signal;
 #[cfg(not(target_os = "android"))]
 pub use libc::signal;
+
+#[inline]
+pub(crate) fn is_interrupted(errno: i32) -> bool {
+    errno == libc::EINTR
+}
 
 pub fn decode_error_kind(errno: i32) -> ErrorKind {
     use ErrorKind::*;
@@ -219,7 +320,7 @@ where
 {
     loop {
         match cvt(f()) {
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(ref e) if e.is_interrupted() => {}
             other => return other,
         }
     }
@@ -248,7 +349,7 @@ pub fn cvt_nz(error: libc::c_int) -> crate::io::Result<()> {
 // do so.  In 1003.1-2004 this was fixed.
 //
 // glibc's implementation did the flush, unsafely, before glibc commit
-// 91e7cf982d01 `abort: Do not flush stdio streams [BZ #15436]' by Florian
+// 91e7cf982d01 `abort: Do not flush stdio streams [BZ #15436]` by Florian
 // Weimer.  According to glibc's NEWS:
 //
 //    The abort function terminates the process immediately, without flushing
@@ -271,8 +372,10 @@ pub fn abort_internal() -> ! {
 
 cfg_if::cfg_if! {
     if #[cfg(target_os = "android")] {
-        #[link(name = "dl")]
-        #[link(name = "log")]
+        #[link(name = "dl", kind = "static", modifiers = "-bundle",
+            cfg(target_feature = "crt-static"))]
+        #[link(name = "dl", cfg(not(target_feature = "crt-static")))]
+        #[link(name = "log", cfg(not(target_feature = "crt-static")))]
         extern "C" {}
     } else if #[cfg(target_os = "freebsd")] {
         #[link(name = "execinfo")]
@@ -302,16 +405,12 @@ cfg_if::cfg_if! {
         extern "C" {}
     } else if #[cfg(target_os = "macos")] {
         #[link(name = "System")]
-        // res_init and friends require -lresolv on macOS/iOS.
-        // See #41582 and https://blog.achernya.com/2013/03/os-x-has-silly-libsystem.html
-        #[link(name = "resolv")]
         extern "C" {}
-    } else if #[cfg(target_os = "ios")] {
+    } else if #[cfg(any(target_os = "ios", target_os = "tvos", target_os = "watchos"))] {
         #[link(name = "System")]
         #[link(name = "objc")]
         #[link(name = "Security", kind = "framework")]
         #[link(name = "Foundation", kind = "framework")]
-        #[link(name = "resolv")]
         extern "C" {}
     } else if #[cfg(target_os = "fuchsia")] {
         #[link(name = "zircon")]
@@ -320,10 +419,13 @@ cfg_if::cfg_if! {
     } else if #[cfg(all(target_os = "linux", target_env = "uclibc"))] {
         #[link(name = "dl")]
         extern "C" {}
+    } else if #[cfg(target_os = "vita")] {
+        #[link(name = "pthread", kind = "static", modifiers = "-bundle")]
+        extern "C" {}
     }
 }
 
-#[cfg(target_os = "espidf")]
+#[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita"))]
 mod unsupported {
     use crate::io;
 

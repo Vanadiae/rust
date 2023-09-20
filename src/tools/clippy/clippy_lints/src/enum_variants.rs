@@ -1,9 +1,9 @@
 //! lint on enum variants that are prefixed or suffixed by the same characters
 
-use clippy_utils::diagnostics::{span_lint, span_lint_and_help};
+use clippy_utils::diagnostics::{span_lint, span_lint_and_help, span_lint_hir};
 use clippy_utils::source::is_present_in_source;
 use clippy_utils::str_utils::{camel_case_split, count_match_end, count_match_start};
-use rustc_hir::{EnumDef, Item, ItemKind, Variant};
+use rustc_hir::{EnumDef, Item, ItemKind, OwnerId, Variant};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::source_map::Span;
@@ -32,7 +32,7 @@ declare_clippy_lint! {
     ///     BattenbergCake,
     /// }
     /// ```
-    /// Could be written as:
+    /// Use instead:
     /// ```rust
     /// enum Cake {
     ///     BlackForest,
@@ -60,7 +60,8 @@ declare_clippy_lint! {
     ///     struct BlackForestCake;
     /// }
     /// ```
-    /// Could be written as:
+    ///
+    /// Use instead:
     /// ```rust
     /// mod cake {
     ///     struct BlackForest;
@@ -104,18 +105,20 @@ declare_clippy_lint! {
 }
 
 pub struct EnumVariantNames {
-    modules: Vec<(Symbol, String)>,
+    modules: Vec<(Symbol, String, OwnerId)>,
     threshold: u64,
     avoid_breaking_exported_api: bool,
+    allow_private_module_inception: bool,
 }
 
 impl EnumVariantNames {
     #[must_use]
-    pub fn new(threshold: u64, avoid_breaking_exported_api: bool) -> Self {
+    pub fn new(threshold: u64, avoid_breaking_exported_api: bool, allow_private_module_inception: bool) -> Self {
         Self {
             modules: Vec::new(),
             threshold,
             avoid_breaking_exported_api,
+            allow_private_module_inception,
         }
     }
 }
@@ -134,9 +137,10 @@ fn check_enum_start(cx: &LateContext<'_>, item_name: &str, variant: &Variant<'_>
         && name.chars().nth(item_name_chars).map_or(false, |c| !c.is_lowercase())
         && name.chars().nth(item_name_chars + 1).map_or(false, |c| !c.is_numeric())
     {
-        span_lint(
+        span_lint_hir(
             cx,
             ENUM_VARIANT_NAMES,
+            variant.hir_id,
             variant.span,
             "variant name starts with the enum's name",
         );
@@ -148,9 +152,10 @@ fn check_enum_end(cx: &LateContext<'_>, item_name: &str, variant: &Variant<'_>) 
     let item_name_chars = item_name.chars().count();
 
     if count_match_end(item_name, name).char_count == item_name_chars {
-        span_lint(
+        span_lint_hir(
             cx,
             ENUM_VARIANT_NAMES,
+            variant.hir_id,
             variant.span,
             "variant name ends with the enum's name",
         );
@@ -189,7 +194,7 @@ fn check_variant(cx: &LateContext<'_>, threshold: u64, def: &EnumDef<'_>, item_n
             .map(|e| *e.0)
             .collect();
     }
-    let (what, value) = match (pre.is_empty(), post.is_empty()) {
+    let (what, value) = match (have_no_extra_prefix(&pre), post.is_empty()) {
         (true, true) => return,
         (false, _) => ("pre", pre.join("")),
         (true, false) => {
@@ -201,14 +206,18 @@ fn check_variant(cx: &LateContext<'_>, threshold: u64, def: &EnumDef<'_>, item_n
         cx,
         ENUM_VARIANT_NAMES,
         span,
-        &format!("all variants have the same {}fix: `{}`", what, value),
+        &format!("all variants have the same {what}fix: `{value}`"),
         None,
         &format!(
-            "remove the {}fixes and use full paths to \
-             the variants instead of glob imports",
-            what
+            "remove the {what}fixes and use full paths to \
+             the variants instead of glob imports"
         ),
     );
+}
+
+#[must_use]
+fn have_no_extra_prefix(prefixes: &[&str]) -> bool {
+    prefixes.iter().all(|p| p == &"" || p == &"_")
 }
 
 #[must_use]
@@ -245,22 +254,23 @@ impl LateLintPass<'_> for EnumVariantNames {
         let item_name = item.ident.name.as_str();
         let item_camel = to_camel_case(item_name);
         if !item.span.from_expansion() && is_present_in_source(cx, item.span) {
-            if let Some(&(ref mod_name, ref mod_camel)) = self.modules.last() {
+            if let [.., (mod_name, mod_camel, owner_id)] = &*self.modules {
                 // constants don't have surrounding modules
                 if !mod_camel.is_empty() {
-                    if mod_name == &item.ident.name {
-                        if let ItemKind::Mod(..) = item.kind {
-                            span_lint(
-                                cx,
-                                MODULE_INCEPTION,
-                                item.span,
-                                "module has the same name as its containing module",
-                            );
-                        }
+                    if mod_name == &item.ident.name
+                        && let ItemKind::Mod(..) = item.kind
+                        && (!self.allow_private_module_inception || cx.tcx.visibility(owner_id.def_id).is_public())
+                    {
+                        span_lint(
+                            cx,
+                            MODULE_INCEPTION,
+                            item.span,
+                            "module has the same name as its containing module",
+                        );
                     }
                     // The `module_name_repetitions` lint should only trigger if the item has the module in its
                     // name. Having the same name is accepted.
-                    if cx.tcx.visibility(item.def_id).is_public() && item_camel.len() > mod_camel.len() {
+                    if cx.tcx.visibility(item.owner_id).is_public() && item_camel.len() > mod_camel.len() {
                         let matching = count_match_start(mod_camel, &item_camel);
                         let rmatching = count_match_end(mod_camel, &item_camel);
                         let nchars = mod_camel.chars().count();
@@ -272,7 +282,7 @@ impl LateLintPass<'_> for EnumVariantNames {
                                 Some(c) if is_word_beginning(c) => span_lint(
                                     cx,
                                     MODULE_NAME_REPETITIONS,
-                                    item.span,
+                                    item.ident.span,
                                     "item name starts with its containing module's name",
                                 ),
                                 _ => (),
@@ -282,7 +292,7 @@ impl LateLintPass<'_> for EnumVariantNames {
                             span_lint(
                                 cx,
                                 MODULE_NAME_REPETITIONS,
-                                item.span,
+                                item.ident.span,
                                 "item name ends with its containing module's name",
                             );
                         }
@@ -291,10 +301,10 @@ impl LateLintPass<'_> for EnumVariantNames {
             }
         }
         if let ItemKind::Enum(ref def, _) = item.kind {
-            if !(self.avoid_breaking_exported_api && cx.access_levels.is_exported(item.def_id)) {
+            if !(self.avoid_breaking_exported_api && cx.effective_visibilities.is_exported(item.owner_id.def_id)) {
                 check_variant(cx, self.threshold, def, item_name, item.span);
             }
         }
-        self.modules.push((item.ident.name, item_camel));
+        self.modules.push((item.ident.name, item_camel, item.owner_id));
     }
 }

@@ -12,13 +12,6 @@ use crate::ops::{BitAnd, BitOr, BitXor, Sub};
 
 use super::map::{map_try_reserve_error, RandomState};
 
-// Future Optimization (FIXME!)
-// ============================
-//
-// Iteration over zero sized values is a noop. There is no need
-// for `bucket.val` in the case of HashSet. I suppose we would need HKT
-// to get rid of it properly.
-
 /// A [hash set] implemented as a `HashMap` where the value is `()`.
 ///
 /// As with the [`HashMap`] type, a `HashSet` requires that the elements
@@ -31,13 +24,14 @@ use super::map::{map_try_reserve_error, RandomState};
 /// ```
 ///
 /// In other words, if two keys are equal, their hashes must be equal.
+/// Violating this property is a logic error.
 ///
-///
-/// It is a logic error for a key to be modified in such a way that the key's
+/// It is also a logic error for a key to be modified in such a way that the key's
 /// hash, as determined by the [`Hash`] trait, or its equality, as determined by
 /// the [`Eq`] trait, changes while it is in the map. This is normally only
 /// possible through [`Cell`], [`RefCell`], global state, I/O, or unsafe code.
-/// The behavior resulting from such a logic error is not specified, but will
+///
+/// The behavior resulting from either logic error is not specified, but will
 /// be encapsulated to the `HashSet` that observed the logic error and not
 /// result in undefined behavior. This could include panics, incorrect results,
 /// aborts, memory leaks, and non-termination.
@@ -72,8 +66,8 @@ use super::map::{map_try_reserve_error, RandomState};
 /// ```
 ///
 /// The easiest way to use `HashSet` with a custom type is to derive
-/// [`Eq`] and [`Hash`]. We must also derive [`PartialEq`], this will in the
-/// future be implied by [`Eq`].
+/// [`Eq`] and [`Hash`]. We must also derive [`PartialEq`],
+/// which is required if [`Eq`] is derived.
 ///
 /// ```
 /// use std::collections::HashSet;
@@ -133,10 +127,11 @@ impl<T> HashSet<T, RandomState> {
         Default::default()
     }
 
-    /// Creates an empty `HashSet` with the specified capacity.
+    /// Creates an empty `HashSet` with at least the specified capacity.
     ///
     /// The hash set will be able to hold at least `capacity` elements without
-    /// reallocating. If `capacity` is 0, the hash set will not allocate.
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is 0, the hash set will not allocate.
     ///
     /// # Examples
     ///
@@ -238,7 +233,7 @@ impl<T, S> HashSet<T, S> {
     ///
     /// If the returned iterator is dropped before being fully consumed, it
     /// drops the remaining elements. The returned iterator keeps a mutable
-    /// borrow on the vector to optimize its implementation.
+    /// borrow on the set to optimize its implementation.
     ///
     /// # Examples
     ///
@@ -268,25 +263,24 @@ impl<T, S> HashSet<T, S> {
     /// If the closure returns false, the value will remain in the list and will not be yielded
     /// by the iterator.
     ///
-    /// If the iterator is only partially consumed or not consumed at all, each of the remaining
-    /// values will still be subjected to the closure and removed and dropped if it returns true.
+    /// If the returned `ExtractIf` is not exhausted, e.g. because it is dropped without iterating
+    /// or the iteration short-circuits, then the remaining elements will be retained.
+    /// Use [`retain`] with a negated predicate if you do not need the returned iterator.
     ///
-    /// It is unspecified how many more values will be subjected to the closure
-    /// if a panic occurs in the closure, or if a panic occurs while dropping a value, or if the
-    /// `DrainFilter` itself is leaked.
+    /// [`retain`]: HashSet::retain
     ///
     /// # Examples
     ///
     /// Splitting a set into even and odd values, reusing the original set:
     ///
     /// ```
-    /// #![feature(hash_drain_filter)]
+    /// #![feature(hash_extract_if)]
     /// use std::collections::HashSet;
     ///
     /// let mut set: HashSet<i32> = (0..8).collect();
-    /// let drained: HashSet<i32> = set.drain_filter(|v| v % 2 == 0).collect();
+    /// let extracted: HashSet<i32> = set.extract_if(|v| v % 2 == 0).collect();
     ///
-    /// let mut evens = drained.into_iter().collect::<Vec<_>>();
+    /// let mut evens = extracted.into_iter().collect::<Vec<_>>();
     /// let mut odds = set.into_iter().collect::<Vec<_>>();
     /// evens.sort();
     /// odds.sort();
@@ -296,12 +290,12 @@ impl<T, S> HashSet<T, S> {
     /// ```
     #[inline]
     #[rustc_lint_query_instability]
-    #[unstable(feature = "hash_drain_filter", issue = "59618")]
-    pub fn drain_filter<F>(&mut self, pred: F) -> DrainFilter<'_, T, F>
+    #[unstable(feature = "hash_extract_if", issue = "59618")]
+    pub fn extract_if<F>(&mut self, pred: F) -> ExtractIf<'_, T, F>
     where
         F: FnMut(&T) -> bool,
     {
-        DrainFilter { base: self.base.drain_filter(pred) }
+        ExtractIf { base: self.base.extract_if(pred) }
     }
 
     /// Retains only the elements specified by the predicate.
@@ -316,7 +310,7 @@ impl<T, S> HashSet<T, S> {
     ///
     /// let mut set = HashSet::from([1, 2, 3, 4, 5, 6]);
     /// set.retain(|&k| k % 2 == 0);
-    /// assert_eq!(set.len(), 3);
+    /// assert_eq!(set, HashSet::from([2, 4, 6]));
     /// ```
     ///
     /// # Performance
@@ -375,15 +369,17 @@ impl<T, S> HashSet<T, S> {
     /// ```
     #[inline]
     #[stable(feature = "hashmap_build_hasher", since = "1.7.0")]
-    pub fn with_hasher(hasher: S) -> HashSet<T, S> {
+    #[rustc_const_unstable(feature = "const_collections_with_hasher", issue = "102575")]
+    pub const fn with_hasher(hasher: S) -> HashSet<T, S> {
         HashSet { base: base::HashSet::with_hasher(hasher) }
     }
 
-    /// Creates an empty `HashSet` with the specified capacity, using
+    /// Creates an empty `HashSet` with at least the specified capacity, using
     /// `hasher` to hash the keys.
     ///
     /// The hash set will be able to hold at least `capacity` elements without
-    /// reallocating. If `capacity` is 0, the hash set will not allocate.
+    /// reallocating. This method is allowed to allocate for more elements than
+    /// `capacity`. If `capacity` is 0, the hash set will not allocate.
     ///
     /// Warning: `hasher` is normally randomly generated, and
     /// is designed to allow `HashSet`s to be resistant to attacks that
@@ -434,8 +430,10 @@ where
     S: BuildHasher,
 {
     /// Reserves capacity for at least `additional` more elements to be inserted
-    /// in the `HashSet`. The collection may reserve more space to avoid
-    /// frequent reallocations.
+    /// in the `HashSet`. The collection may reserve more space to speculatively
+    /// avoid frequent reallocations. After calling `reserve`,
+    /// capacity will be greater than or equal to `self.len() + additional`.
+    /// Does nothing if capacity is already sufficient.
     ///
     /// # Panics
     ///
@@ -456,8 +454,11 @@ where
     }
 
     /// Tries to reserve capacity for at least `additional` more elements to be inserted
-    /// in the given `HashSet<K, V>`. The collection may reserve more space to avoid
-    /// frequent reallocations.
+    /// in the `HashSet`. The collection may reserve more space to speculatively
+    /// avoid frequent reallocations. After calling `try_reserve`,
+    /// capacity will be greater than or equal to `self.len() + additional` if
+    /// it returns `Ok(())`.
+    /// Does nothing if capacity is already sufficient.
     ///
     /// # Errors
     ///
@@ -469,7 +470,7 @@ where
     /// ```
     /// use std::collections::HashSet;
     /// let mut set: HashSet<i32> = HashSet::new();
-    /// set.try_reserve(10).expect("why is the test harness OOMing on 10 bytes?");
+    /// set.try_reserve(10).expect("why is the test harness OOMing on a handful of bytes?");
     /// ```
     #[inline]
     #[stable(feature = "try_reserve", since = "1.57.0")]
@@ -587,6 +588,12 @@ where
 
     /// Visits the values representing the intersection,
     /// i.e., the values that are both in `self` and `other`.
+    ///
+    /// When an equal element is present in `self` and `other`
+    /// then the resulting `Intersection` may yield references to
+    /// one or the other. This can be relevant if `T` contains fields which
+    /// are not compared by its `Eq` implementation, and may hold different
+    /// value between the two equal copies of `T` in the two sets.
     ///
     /// # Examples
     ///
@@ -861,7 +868,9 @@ where
     /// Returns whether the value was newly inserted. That is:
     ///
     /// - If the set did not previously contain this value, `true` is returned.
-    /// - If the set already contained this value, `false` is returned.
+    /// - If the set already contained this value, `false` is returned,
+    ///   and the set is not modified: original value is not replaced,
+    ///   and the value passed as argument is dropped.
     ///
     /// # Examples
     ///
@@ -1265,7 +1274,6 @@ pub struct Iter<'a, K: 'a> {
 /// (provided by the [`IntoIterator`] trait). See its documentation for more.
 ///
 /// [`into_iter`]: IntoIterator::into_iter
-/// [`IntoIterator`]: crate::iter::IntoIterator
 ///
 /// # Examples
 ///
@@ -1304,27 +1312,27 @@ pub struct Drain<'a, K: 'a> {
 
 /// A draining, filtering iterator over the items of a `HashSet`.
 ///
-/// This `struct` is created by the [`drain_filter`] method on [`HashSet`].
+/// This `struct` is created by the [`extract_if`] method on [`HashSet`].
 ///
-/// [`drain_filter`]: HashSet::drain_filter
+/// [`extract_if`]: HashSet::extract_if
 ///
 /// # Examples
 ///
 /// ```
-/// #![feature(hash_drain_filter)]
+/// #![feature(hash_extract_if)]
 ///
 /// use std::collections::HashSet;
 ///
 /// let mut a = HashSet::from([1, 2, 3]);
 ///
-/// let mut drain_filtered = a.drain_filter(|v| v % 2 == 0);
+/// let mut extract_ifed = a.extract_if(|v| v % 2 == 0);
 /// ```
-#[unstable(feature = "hash_drain_filter", issue = "59618")]
-pub struct DrainFilter<'a, K, F>
+#[unstable(feature = "hash_extract_if", issue = "59618")]
+pub struct ExtractIf<'a, K, F>
 where
     F: FnMut(&K) -> bool,
 {
-    base: base::DrainFilter<'a, K, F>,
+    base: base::ExtractIf<'a, K, F>,
 }
 
 /// A lazy iterator producing elements in the intersection of `HashSet`s.
@@ -1570,8 +1578,8 @@ impl<K: fmt::Debug> fmt::Debug for Drain<'_, K> {
     }
 }
 
-#[unstable(feature = "hash_drain_filter", issue = "59618")]
-impl<K, F> Iterator for DrainFilter<'_, K, F>
+#[unstable(feature = "hash_extract_if", issue = "59618")]
+impl<K, F> Iterator for ExtractIf<'_, K, F>
 where
     F: FnMut(&K) -> bool,
 {
@@ -1587,16 +1595,16 @@ where
     }
 }
 
-#[unstable(feature = "hash_drain_filter", issue = "59618")]
-impl<K, F> FusedIterator for DrainFilter<'_, K, F> where F: FnMut(&K) -> bool {}
+#[unstable(feature = "hash_extract_if", issue = "59618")]
+impl<K, F> FusedIterator for ExtractIf<'_, K, F> where F: FnMut(&K) -> bool {}
 
-#[unstable(feature = "hash_drain_filter", issue = "59618")]
-impl<'a, K, F> fmt::Debug for DrainFilter<'a, K, F>
+#[unstable(feature = "hash_extract_if", issue = "59618")]
+impl<'a, K, F> fmt::Debug for ExtractIf<'a, K, F>
 where
     F: FnMut(&K) -> bool,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DrainFilter").finish_non_exhaustive()
+        f.debug_struct("ExtractIf").finish_non_exhaustive()
     }
 }
 

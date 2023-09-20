@@ -58,7 +58,7 @@ pub(crate) fn run_format<'tcx, T: FormatRenderer<'tcx>>(
 
     let emit_crate = options.should_emit_crate();
     let (mut format_renderer, krate) = prof
-        .extra_verbose_generic_activity("create_renderer", T::descr())
+        .verbose_generic_activity_with_arg("create_renderer", T::descr())
         .run(|| T::init(krate, options, cache, tcx))?;
 
     if !emit_crate {
@@ -77,8 +77,11 @@ pub(crate) fn run_format<'tcx, T: FormatRenderer<'tcx>>(
                 prof.generic_activity_with_arg("render_mod_item", item.name.unwrap().to_string());
 
             cx.mod_item_in(&item)?;
-            let (clean::StrippedItem(box clean::ModuleItem(module)) | clean::ModuleItem(module)) = *item.kind
-            else { unreachable!() };
+            let (clean::StrippedItem(box clean::ModuleItem(module)) | clean::ModuleItem(module)) =
+                *item.kind
+            else {
+                unreachable!()
+            };
             for it in module.items {
                 debug!("Adding {:?} to worklist", it.name);
                 work.push((cx.make_child_renderer(), it));
@@ -92,6 +95,6 @@ pub(crate) fn run_format<'tcx, T: FormatRenderer<'tcx>>(
                 .run(|| cx.item(item))?;
         }
     }
-    prof.extra_verbose_generic_activity("renderer_after_krate", T::descr())
+    prof.verbose_generic_activity_with_arg("renderer_after_krate", T::descr())
         .run(|| format_renderer.after_krate())
 }

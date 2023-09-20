@@ -12,29 +12,62 @@
 //!     will still not cause any further changes.
 //!
 
+use crate::util::is_within_packed;
 use rustc_index::bit_set::BitSet;
-use rustc_middle::{
-    mir::{visit::Visitor, *},
-    ty::TyCtxt,
+use rustc_middle::mir::visit::Visitor;
+use rustc_middle::mir::*;
+use rustc_middle::ty::TyCtxt;
+use rustc_mir_dataflow::impls::{
+    borrowed_locals, LivenessTransferFunction, MaybeTransitiveLiveLocals,
 };
-use rustc_mir_dataflow::{impls::MaybeTransitiveLiveLocals, Analysis};
+use rustc_mir_dataflow::Analysis;
 
 /// Performs the optimization on the body
 ///
 /// The `borrowed` set must be a `BitSet` of all the locals that are ever borrowed in this body. It
-/// can be generated via the [`get_borrowed_locals`] function.
+/// can be generated via the [`borrowed_locals`] function.
 pub fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, borrowed: &BitSet<Local>) {
     let mut live = MaybeTransitiveLiveLocals::new(borrowed)
         .into_engine(tcx, body)
         .iterate_to_fixpoint()
         .into_results_cursor(body);
 
+    // For blocks with a call terminator, if an argument copy can be turned into a move,
+    // record it as (block, argument index).
+    let mut call_operands_to_move = Vec::new();
     let mut patch = Vec::new();
+
     for (bb, bb_data) in traversal::preorder(body) {
+        if let TerminatorKind::Call { ref args, .. } = bb_data.terminator().kind {
+            let loc = Location { block: bb, statement_index: bb_data.statements.len() };
+
+            // Position ourselves between the evaluation of `args` and the write to `destination`.
+            live.seek_to_block_end(bb);
+            let mut state = live.get().clone();
+
+            for (index, arg) in args.iter().enumerate().rev() {
+                if let Operand::Copy(place) = *arg
+                    && !place.is_indirect()
+                    && !borrowed.contains(place.local)
+                    && !state.contains(place.local)
+                    // If `place` is a projection of a disaligned field in a packed ADT,
+                    // the move may be codegened as a pointer to that field.
+                    // Using that disaligned pointer may trigger UB in the callee,
+                    // so do nothing.
+                    && is_within_packed(tcx, body, place).is_none()
+                {
+                    call_operands_to_move.push((bb, index));
+                }
+
+                // Account that `arg` is read from, so we don't promote another argument to a move.
+                LivenessTransferFunction(&mut state).visit_operand(arg, loc);
+            }
+        }
+
         for (statement_index, statement) in bb_data.statements.iter().enumerate().rev() {
             let loc = Location { block: bb, statement_index };
             if let StatementKind::Assign(assign) = &statement.kind {
-                if assign.1.is_pointer_int_cast() {
+                if !assign.1.is_safe_to_remove() {
                     continue;
                 }
             }
@@ -53,7 +86,9 @@ pub fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, borrowed: &BitS
                 | StatementKind::StorageLive(_)
                 | StatementKind::StorageDead(_)
                 | StatementKind::Coverage(_)
-                | StatementKind::CopyNonOverlapping(_)
+                | StatementKind::Intrinsic(_)
+                | StatementKind::ConstEvalCounter
+                | StatementKind::PlaceMention(_)
                 | StatementKind::Nop => (),
 
                 StatementKind::FakeRead(_) | StatementKind::AscribeUserType(_, _) => {
@@ -63,75 +98,24 @@ pub fn eliminate<'tcx>(tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>, borrowed: &BitS
         }
     }
 
-    if patch.is_empty() {
+    if patch.is_empty() && call_operands_to_move.is_empty() {
         return;
     }
 
-    let bbs = body.basic_blocks_mut();
+    let bbs = body.basic_blocks.as_mut_preserves_cfg();
     for Location { block, statement_index } in patch {
         bbs[block].statements[statement_index].make_nop();
     }
-}
-
-pub fn get_borrowed_locals(body: &Body<'_>) -> BitSet<Local> {
-    let mut b = BorrowedLocals(BitSet::new_empty(body.local_decls.len()));
-    b.visit_body(body);
-    b.0
-}
-
-struct BorrowedLocals(BitSet<Local>);
-
-impl<'tcx> Visitor<'tcx> for BorrowedLocals {
-    fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, loc: Location) {
-        self.super_rvalue(rvalue, loc);
-        match rvalue {
-            Rvalue::AddressOf(_, borrowed_place) | Rvalue::Ref(_, _, borrowed_place) => {
-                if !borrowed_place.is_indirect() {
-                    self.0.insert(borrowed_place.local);
-                }
-            }
-
-            Rvalue::Cast(..)
-            | Rvalue::ShallowInitBox(..)
-            | Rvalue::Use(..)
-            | Rvalue::Repeat(..)
-            | Rvalue::Len(..)
-            | Rvalue::BinaryOp(..)
-            | Rvalue::CheckedBinaryOp(..)
-            | Rvalue::NullaryOp(..)
-            | Rvalue::UnaryOp(..)
-            | Rvalue::Discriminant(..)
-            | Rvalue::Aggregate(..)
-            | Rvalue::ThreadLocalRef(..) => {}
-        }
+    for (block, argument_index) in call_operands_to_move {
+        let TerminatorKind::Call { ref mut args, .. } = bbs[block].terminator_mut().kind else {
+            bug!()
+        };
+        let arg = &mut args[argument_index];
+        let Operand::Copy(place) = *arg else { bug!() };
+        *arg = Operand::Move(place);
     }
 
-    fn visit_terminator(&mut self, terminator: &Terminator<'tcx>, location: Location) {
-        self.super_terminator(terminator, location);
-
-        match terminator.kind {
-            TerminatorKind::Drop { place: dropped_place, .. } => {
-                if !dropped_place.is_indirect() {
-                    self.0.insert(dropped_place.local);
-                }
-            }
-
-            TerminatorKind::Abort
-            | TerminatorKind::DropAndReplace { .. }
-            | TerminatorKind::Assert { .. }
-            | TerminatorKind::Call { .. }
-            | TerminatorKind::FalseEdge { .. }
-            | TerminatorKind::FalseUnwind { .. }
-            | TerminatorKind::GeneratorDrop
-            | TerminatorKind::Goto { .. }
-            | TerminatorKind::Resume
-            | TerminatorKind::Return
-            | TerminatorKind::SwitchInt { .. }
-            | TerminatorKind::Unreachable
-            | TerminatorKind::Yield { .. }
-            | TerminatorKind::InlineAsm { .. } => {}
-        }
-    }
+    crate::simplify::simplify_locals(body, tcx)
 }
 
 pub struct DeadStoreElimination;
@@ -142,7 +126,7 @@ impl<'tcx> MirPass<'tcx> for DeadStoreElimination {
     }
 
     fn run_pass(&self, tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
-        let borrowed = get_borrowed_locals(body);
+        let borrowed = borrowed_locals(body);
         eliminate(tcx, body, &borrowed);
     }
 }

@@ -1,11 +1,8 @@
 #![allow(non_camel_case_types)]
 
-use rustc_errors::struct_span_err;
-use rustc_hir as hir;
 use rustc_hir::LangItem;
-use rustc_middle::mir::interpret::ConstValue;
+use rustc_middle::mir;
 use rustc_middle::ty::{self, layout::TyAndLayout, Ty, TyCtxt};
-use rustc_session::Session;
 use rustc_span::Span;
 
 use crate::base;
@@ -135,24 +132,24 @@ pub fn build_langcall<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 // all shifts). For 32- and 64-bit types, this matches the semantics
 // of Java. (See related discussion on #1877 and #10183.)
 
-pub fn build_unchecked_lshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+pub fn build_masked_lshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     bx: &mut Bx,
     lhs: Bx::Value,
     rhs: Bx::Value,
 ) -> Bx::Value {
-    let rhs = base::cast_shift_expr_rhs(bx, hir::BinOpKind::Shl, lhs, rhs);
+    let rhs = base::cast_shift_expr_rhs(bx, lhs, rhs);
     // #1877, #10183: Ensure that input is always valid
     let rhs = shift_mask_rhs(bx, rhs);
     bx.shl(lhs, rhs)
 }
 
-pub fn build_unchecked_rshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
+pub fn build_masked_rshift<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     bx: &mut Bx,
     lhs_t: Ty<'tcx>,
     lhs: Bx::Value,
     rhs: Bx::Value,
 ) -> Bx::Value {
-    let rhs = base::cast_shift_expr_rhs(bx, hir::BinOpKind::Shr, lhs, rhs);
+    let rhs = base::cast_shift_expr_rhs(bx, lhs, rhs);
     // #1877, #10183: Ensure that input is always valid
     let rhs = shift_mask_rhs(bx, rhs);
     let is_signed = lhs_t.is_signed();
@@ -194,17 +191,13 @@ pub fn shift_mask_val<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     }
 }
 
-pub fn span_invalid_monomorphization_error(a: &Session, b: Span, c: &str) {
-    struct_span_err!(a, b, E0511, "{}", c).emit();
-}
-
 pub fn asm_const_to_str<'tcx>(
     tcx: TyCtxt<'tcx>,
     sp: Span,
-    const_value: ConstValue<'tcx>,
+    const_value: mir::ConstValue<'tcx>,
     ty_and_layout: TyAndLayout<'tcx>,
 ) -> String {
-    let ConstValue::Scalar(scalar) = const_value else {
+    let mir::ConstValue::Scalar(scalar) = const_value else {
         span_bug!(sp, "expected Scalar for promoted asm const, but got {:#?}", const_value)
     };
     let value = scalar.assert_bits(ty_and_layout.size);

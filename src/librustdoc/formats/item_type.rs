@@ -21,6 +21,7 @@ use crate::clean;
 /// a heading, edit the listing in `html/render.rs`, function `sidebar_module`. This uses an
 /// ordering based on a helper function inside `item_module`, in the same file.
 #[derive(Copy, PartialEq, Eq, Hash, Clone, Debug, PartialOrd, Ord)]
+#[repr(u8)]
 pub(crate) enum ItemType {
     Module = 0,
     ExternCrate = 1,
@@ -28,7 +29,7 @@ pub(crate) enum ItemType {
     Struct = 3,
     Enum = 4,
     Function = 5,
-    Typedef = 6,
+    TypeAlias = 6,
     Static = 7,
     Trait = 8,
     Impl = 9,
@@ -48,7 +49,6 @@ pub(crate) enum ItemType {
     ProcAttribute = 23,
     ProcDerive = 24,
     TraitAlias = 25,
-    Generic = 26,
 }
 
 impl Serialize for ItemType {
@@ -75,7 +75,7 @@ impl<'a> From<&'a clean::Item> for ItemType {
             clean::UnionItem(..) => ItemType::Union,
             clean::EnumItem(..) => ItemType::Enum,
             clean::FunctionItem(..) => ItemType::Function,
-            clean::TypedefItem(..) => ItemType::Typedef,
+            clean::TypeAliasItem(..) => ItemType::TypeAlias,
             clean::OpaqueTyItem(..) => ItemType::OpaqueTy,
             clean::StaticItem(..) => ItemType::Static,
             clean::ConstantItem(..) => ItemType::Constant,
@@ -92,7 +92,7 @@ impl<'a> From<&'a clean::Item> for ItemType {
             clean::TyAssocConstItem(..) | clean::AssocConstItem(..) => ItemType::AssocConst,
             clean::TyAssocTypeItem(..) | clean::AssocTypeItem(..) => ItemType::AssocType,
             clean::ForeignTypeItem => ItemType::ForeignType,
-            clean::KeywordItem(..) => ItemType::Keyword,
+            clean::KeywordItem => ItemType::Keyword,
             clean::TraitAliasItem(..) => ItemType::TraitAlias,
             clean::ProcMacroItem(ref mac) => match mac.kind {
                 MacroKind::Bang => ItemType::Macro,
@@ -115,7 +115,7 @@ impl From<DefKind> for ItemType {
             DefKind::Struct => Self::Struct,
             DefKind::Union => Self::Union,
             DefKind::Trait => Self::Trait,
-            DefKind::TyAlias => Self::Typedef,
+            DefKind::TyAlias { .. } => Self::TypeAlias,
             DefKind::TraitAlias => Self::TraitAlias,
             DefKind::Macro(kind) => match kind {
                 MacroKind::Bang => ItemType::Macro,
@@ -139,7 +139,7 @@ impl From<DefKind> for ItemType {
             | DefKind::Field
             | DefKind::LifetimeParam
             | DefKind::GlobalAsm
-            | DefKind::Impl
+            | DefKind::Impl { .. }
             | DefKind::Closure
             | DefKind::Generator => Self::ForeignType,
         }
@@ -156,7 +156,7 @@ impl ItemType {
             ItemType::Union => "union",
             ItemType::Enum => "enum",
             ItemType::Function => "fn",
-            ItemType::Typedef => "type",
+            ItemType::TypeAlias => "type",
             ItemType::Static => "static",
             ItemType::Trait => "trait",
             ItemType::Impl => "impl",
@@ -175,8 +175,10 @@ impl ItemType {
             ItemType::ProcAttribute => "attr",
             ItemType::ProcDerive => "derive",
             ItemType::TraitAlias => "traitalias",
-            ItemType::Generic => "generic",
         }
+    }
+    pub(crate) fn is_method(&self) -> bool {
+        matches!(*self, ItemType::Method | ItemType::TyMethod)
     }
 }
 

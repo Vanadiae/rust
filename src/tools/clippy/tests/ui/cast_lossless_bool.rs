@@ -1,5 +1,3 @@
-// run-rustfix
-
 #![allow(dead_code)]
 #![warn(clippy::cast_lossless)]
 
@@ -39,4 +37,14 @@ mod cast_lossless_in_impl {
             x as u64
         }
     }
+}
+
+#[clippy::msrv = "1.27"]
+fn msrv_1_27() {
+    let _ = true as u8;
+}
+
+#[clippy::msrv = "1.28"]
+fn msrv_1_28() {
+    let _ = true as u8;
 }

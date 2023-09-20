@@ -89,3 +89,35 @@ impl<A: ToJson> ToJson for Option<A> {
         }
     }
 }
+
+impl ToJson for crate::abi::call::Conv {
+    fn to_json(&self) -> Json {
+        let buf: String;
+        let s = match self {
+            Self::C => "C",
+            Self::Rust => "Rust",
+            Self::Cold => "Cold",
+            Self::PreserveMost => "PreserveMost",
+            Self::PreserveAll => "PreserveAll",
+            Self::ArmAapcs => "ArmAapcs",
+            Self::CCmseNonSecureCall => "CCmseNonSecureCall",
+            Self::Msp430Intr => "Msp430Intr",
+            Self::PtxKernel => "PtxKernel",
+            Self::X86Fastcall => "X86Fastcall",
+            Self::X86Intr => "X86Intr",
+            Self::X86Stdcall => "X86Stdcall",
+            Self::X86ThisCall => "X86ThisCall",
+            Self::X86VectorCall => "X86VectorCall",
+            Self::X86_64SysV => "X86_64SysV",
+            Self::X86_64Win64 => "X86_64Win64",
+            Self::AmdGpuKernel => "AmdGpuKernel",
+            Self::AvrInterrupt => "AvrInterrupt",
+            Self::AvrNonBlockingInterrupt => "AvrNonBlockingInterrupt",
+            Self::RiscvInterrupt { kind } => {
+                buf = format!("RiscvInterrupt({})", kind.as_str());
+                &buf
+            }
+        };
+        Json::String(s.to_owned())
+    }
+}

@@ -8,7 +8,6 @@ use crate::visit::DocVisitor;
 use rustc_hir as hir;
 use rustc_lint::builtin::MISSING_DOCS;
 use rustc_middle::lint::LintLevelSource;
-use rustc_middle::ty::DefIdTree;
 use rustc_session::lint;
 use rustc_span::FileName;
 use serde::Serialize;
@@ -147,8 +146,10 @@ impl<'a, 'b> CoverageCalculator<'a, 'b> {
             examples_percentage: f64,
         ) {
             println!(
-                "| {:<35} | {:>10} | {:>9.1}% | {:>10} | {:>9.1}% |",
-                name, count.with_docs, percentage, count.with_examples, examples_percentage,
+                "| {name:<35} | {with_docs:>10} | {percentage:>9.1}% | {with_examples:>10} | \
+                {examples_percentage:>9.1}% |",
+                with_docs = count.with_docs,
+                with_examples = count.with_examples,
             );
         }
 
@@ -208,22 +209,16 @@ impl<'a, 'b> DocVisitor for CoverageCalculator<'a, 'b> {
                 let mut tests = Tests { found_tests: 0 };
 
                 find_testable_code(
-                    &i.attrs.collapsed_doc_value().unwrap_or_default(),
+                    &i.doc_value(),
                     &mut tests,
                     ErrorCodes::No,
                     false,
                     None,
+                    self.ctx.tcx.features().custom_code_classes_in_docs,
                 );
 
-                let filename = i.span(self.ctx.tcx).filename(self.ctx.sess());
                 let has_doc_example = tests.found_tests != 0;
-                // The `expect_def_id()` should be okay because `local_def_id_to_hir_id`
-                // would presumably panic if a fake `DefIndex` were passed.
-                let hir_id = self
-                    .ctx
-                    .tcx
-                    .hir()
-                    .local_def_id_to_hir_id(i.item_id.expect_def_id().expect_local());
+                let hir_id = DocContext::as_local_hir_id(self.ctx.tcx, i.item_id).unwrap();
                 let (level, source) = self.ctx.tcx.lint_level_at_node(MISSING_DOCS, hir_id);
 
                 // In case we have:
@@ -245,10 +240,10 @@ impl<'a, 'b> DocVisitor for CoverageCalculator<'a, 'b> {
                         matches!(
                             node,
                             hir::Node::Variant(hir::Variant {
-                                data: hir::VariantData::Tuple(_, _),
+                                data: hir::VariantData::Tuple(_, _, _),
                                 ..
                             }) | hir::Node::Item(hir::Item {
-                                kind: hir::ItemKind::Struct(hir::VariantData::Tuple(_, _), _),
+                                kind: hir::ItemKind::Struct(hir::VariantData::Tuple(_, _, _), _),
                                 ..
                             })
                         )
@@ -261,13 +256,16 @@ impl<'a, 'b> DocVisitor for CoverageCalculator<'a, 'b> {
                 let should_have_docs = !should_be_ignored
                     && (level != lint::Level::Allow || matches!(source, LintLevelSource::Default));
 
-                debug!("counting {:?} {:?} in {:?}", i.type_(), i.name, filename);
-                self.items.entry(filename).or_default().count_item(
-                    has_docs,
-                    has_doc_example,
-                    should_have_doc_example(self.ctx, i),
-                    should_have_docs,
-                );
+                if let Some(span) = i.span(self.ctx.tcx) {
+                    let filename = span.filename(self.ctx.sess());
+                    debug!("counting {:?} {:?} in {filename:?}", i.type_(), i.name);
+                    self.items.entry(filename).or_default().count_item(
+                        has_docs,
+                        has_doc_example,
+                        should_have_doc_example(self.ctx, i),
+                        should_have_docs,
+                    );
+                }
             }
         }
 
