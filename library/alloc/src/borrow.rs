@@ -78,6 +78,30 @@ pub trait ToOwned {
     }
 }
 
+#[stable(feature = "toowned_option", since = "1.73.0")]
+impl<T: ToOwned> ToOwned for Option<T> {
+//impl ToOwned for Option<&str> {
+    type Owned = Option<T::Owned>;
+    //type Owned = Option<String>;
+
+    #[inline]
+    fn to_owned(&self) -> Self::Owned {
+        match self {
+            Some(x) => Some(x.to_owned()),
+            None => None,
+        }
+    }
+
+    #[inline]
+    // FIXME: I've no idea if that's how it's supposed to be implemented. Never used clone_into() myself.
+    fn clone_into(&self, target: &mut Self::Owned) {
+        match (self, target) {
+            (Some(source), Some(target)) => source.clone_into(target),
+            (source, target) => *target = source.to_owned(),
+        }
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<T> ToOwned for T
 where
